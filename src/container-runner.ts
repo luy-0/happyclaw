@@ -34,6 +34,7 @@ import {
   writeRunLog,
   type CloseHandlerContext,
 } from './agent-output-parser.js';
+import { getNormalUserSkillsDir } from './user-detection.js';
 
 /**
  * Required env flags for settings.json — 每次容器/进程启动时强制写入，不可被用户覆盖。
@@ -790,10 +791,13 @@ export async function runHostAgent(
       }
     };
 
-    // 项目级 skills
+    // 项目级 skills（最低优先级）
     const projectRoot = process.cwd();
     linkSkillEntries(path.join(projectRoot, 'container', 'skills'));
-    // 用户级 skills（覆盖同名项目级）
+    // 宿主机用户的 ~/.claude/skills/（中优先级，覆盖同名项目级）
+    const hostSkillsDir = getNormalUserSkillsDir();
+    linkSkillEntries(hostSkillsDir);
+    // 用户级 skills（最高优先级，HappyClaw 内部安装的，覆盖同名）
     const ownerId = group.created_by;
     if (ownerId) {
       linkSkillEntries(path.join(DATA_DIR, 'skills', ownerId));

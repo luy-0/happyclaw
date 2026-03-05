@@ -4,6 +4,7 @@ import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import { getNormalUserClaudeDir } from './user-detection.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const CURRENT_CONFIG_VERSION = 2;
@@ -1225,8 +1226,8 @@ export function updateAllSessionCredentials(config: ClaudeProviderConfig): void 
     logger.warn({ err }, 'Failed to update session credentials');
   }
 
-  // Host mode: update ~/.claude/.credentials.json
-  const homeClaudeDir = path.join(process.env.HOME || '/root', '.claude');
+  // Host mode: update ~/.claude/.credentials.json (使用检测到的普通用户目录)
+  const homeClaudeDir = getNormalUserClaudeDir();
   if (fs.existsSync(homeClaudeDir) && fs.statSync(homeClaudeDir).isDirectory()) {
     try {
       writeCredentialsFile(homeClaudeDir, config);
