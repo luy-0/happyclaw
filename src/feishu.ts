@@ -125,24 +125,64 @@ function extractMessageContent(
       // Extract text from post content (images in post messages are not supported)
       const lines: string[] = [];
       const post = parsed.post;
-      if (!post) return { text: '' };
+
+      // 飞书 post 消息可能有多种结构，添加调试日志
+      if (!post) {
+        logger.debug({ content, parsed }, 'Post message has no post field');
+        return { text: '' };
+      }
 
       // Try zh_cn first, then en_us, then other languages
       const contentData = post.zh_cn || post.en_us || Object.values(post)[0];
-      if (!contentData || !Array.isArray(contentData.content)) return { text: '' };
+      if (!contentData) {
+        logger.debug({ post }, 'Post message has no content data');
+        return { text: '' };
+      }
 
-      for (const paragraph of contentData.content) {
-        if (!Array.isArray(paragraph)) continue;
-        for (const segment of paragraph) {
+      // 提取标题（如果有）
+      if (contentData.title) {
+        lines.push(contentData.title);
+      }
+
+      // content 可能是数组的数组，也可能直接��对象数组
+      const contentArray = contentData.content;
+      if (!contentArray) {
+        logger.debug({ contentData }, 'Post message has no content array');
+        // 如果有标题但没有内容，仍然返回标题
+        return { text: lines.join('\n') };
+      }
+
+      // 处理 content 数组
+      const paragraphs = Array.isArray(contentArray) ? contentArray : [];
+      for (const paragraph of paragraphs) {
+        // paragraph 可能是数组（标准结构）或单个对象
+        const segments = Array.isArray(paragraph) ? paragraph : [paragraph];
+        for (const segment of segments) {
+          if (!segment || typeof segment !== 'object') continue;
+
+          // 支持更多标签类型
           if (segment.tag === 'text' && segment.text) {
             lines.push(segment.text);
           } else if (segment.tag === 'a' && segment.text) {
-            lines.push(segment.text);
+            // 链接：包含文本和 URL
+            const linkText = segment.href ? `${segment.text}(${segment.href})` : segment.text;
+            lines.push(linkText);
+          } else if (segment.tag === 'at' && segment.user_name) {
+            // @提及
+            lines.push(`@${segment.user_name}`);
+          } else if (segment.tag === 'emotion' && segment.emoji_type) {
+            // 表情
+            lines.push(`[${segment.emoji_type}]`);
           }
+          // img 标签暂不处理（post 中的图片），只提取文字
         }
       }
 
-      return { text: lines.join('\n') };
+      const result = lines.join('\n').trim();
+      if (!result) {
+        logger.debug({ post, contentData }, 'Post message extracted empty text');
+      }
+      return { text: result };
     }
 
     if (messageType === 'image') {
