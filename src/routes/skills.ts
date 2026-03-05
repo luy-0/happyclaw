@@ -10,6 +10,7 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
+import { getNormalUserSkillsDir } from '../user-detection.js';
 
 const execFileAsync = promisify(execFile);
 let skillInstallLock: Promise<void> = Promise.resolve();
@@ -67,7 +68,8 @@ function getUserSkillsDir(userId: string): string {
 }
 
 function getGlobalSkillsDir(): string {
-  return path.join(os.homedir(), '.claude', 'skills');
+  // 使用检测到的普通用户 home 目录，而非当前进程（可能是 root）的 home
+  return getNormalUserSkillsDir();
 }
 
 function getProjectSkillsDir(): string {

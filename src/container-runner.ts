@@ -34,6 +34,14 @@ import {
   writeRunLog,
   type CloseHandlerContext,
 } from './agent-output-parser.js';
+import {
+  getNormalUserSkillsDir,
+  getNormalUserRulesDir,
+  collectAllUserSkills,
+  collectAllUserRules,
+  type SkillSource,
+  type RuleSource,
+} from './user-detection.js';
 
 /**
  * Required env flags for settings.json — 每次容器/进程启动时强制写入，不可被用户覆盖。
@@ -251,7 +259,13 @@ function buildVolumeMounts(
   // Skills：以只读卷挂载宿主机目录（由 entrypoint 创建符号链接）
   // selectedSkills 为 null 时挂载整个目录（全部 skills）
   // selectedSkills 为数组时仅挂载选中的 skill 子目录
+  //
+  // 三层 Skills 优先级（从低到高）：
+  // 1. 项目级（container/skills/）
+  // 2. 宿主机级（真实用户 ~/.claude/skills/）
+  // 3. 用户级（data/skills/{userId}/，HappyClaw 内部安装的）
   const projectSkillsDir = path.join(projectRoot, 'container', 'skills');
+  const hostSkillsDir = getNormalUserSkillsDir();  // 真实用户的 ~/.claude/skills/
   const userSkillsDir = (mountUserSkills && ownerId) ? path.join(DATA_DIR, 'skills', ownerId) : null;
 
   // Ensure user skills directory exists so it can always be mounted.
@@ -267,6 +281,14 @@ function buildVolumeMounts(
       mounts.push({
         hostPath: projectSkillsDir,
         containerPath: '/workspace/project-skills',
+        readonly: true,
+      });
+    }
+    // 宿主机级 skills（真实用户的 ~/.claude/skills/）
+    if (fs.existsSync(hostSkillsDir)) {
+      mounts.push({
+        hostPath: hostSkillsDir,
+        containerPath: '/workspace/host-skills',
         readonly: true,
       });
     }
@@ -294,6 +316,20 @@ function buildVolumeMounts(
         }
       }
     }
+    // 宿主机级 skills
+    if (fs.existsSync(hostSkillsDir)) {
+      for (const name of selectedSet) {
+        if (!/^[\w\-]+$/.test(name)) continue;
+        const skillPath = path.join(hostSkillsDir, name);
+        if (fs.existsSync(skillPath) && fs.statSync(skillPath).isDirectory()) {
+          mounts.push({
+            hostPath: skillPath,
+            containerPath: `/workspace/host-skills/${name}`,
+            readonly: true,
+          });
+        }
+      }
+    }
     // 用户级 skills
     if (userSkillsDir) {
       for (const name of selectedSet) {
@@ -308,6 +344,16 @@ function buildVolumeMounts(
         }
       }
     }
+  }
+
+  // Rules：挂载真实用户的 ~/.claude/rules/（只读）
+  const hostRulesDir = getNormalUserRulesDir();
+  if (fs.existsSync(hostRulesDir)) {
+    mounts.push({
+      hostPath: hostRulesDir,
+      containerPath: '/workspace/host-rules',
+      readonly: true,
+    });
   }
 
   // Per-group IPC namespace: each group gets its own IPC directory
@@ -756,7 +802,8 @@ export async function runHostAgent(
   ensureSettingsJson(settingsFile, hostMcpServers);
 
   // 4. Skills 自动链接到 session 目录
-  // 链接顺序：项目级 → 宿主机级(admin only, 覆盖同名项目级) → 用户级(覆盖同名)
+  // 链接顺序：项目级 → 所有宿主机用户的 skills（多用户支持）→ 用户级(覆盖同名)
+  // 多用户重名时使用 "{username}-{skillname}" 格式
   // selected_skills 过滤：仅链接选中的 skills
   try {
     const skillsDir = path.join(groupSessionsDir, 'skills');
@@ -790,10 +837,25 @@ export async function runHostAgent(
       }
     };
 
-    // 项目级 skills
+    // 项目级 skills（最低优先级）
     const projectRoot = process.cwd();
     linkSkillEntries(path.join(projectRoot, 'container', 'skills'));
-    // 用户级 skills（覆盖同名项目级）
+
+    // 所有宿主机用户的 skills（多用户支持，自动处理重名冲突）
+    const allHostSkills = collectAllUserSkills();
+    for (const skill of allHostSkills) {
+      if (selectedSet && !selectedSet.has(skill.name) && !selectedSet.has(skill.linkName)) continue;
+      const linkPath = path.join(skillsDir, skill.linkName);
+      try {
+        // 高优先级覆盖低优先级
+        if (fs.existsSync(linkPath)) {
+          fs.rmSync(linkPath, { recursive: true, force: true });
+        }
+        fs.symlinkSync(skill.path, linkPath);
+      } catch { /* ignore */ }
+    }
+
+    // 用户级 skills（HappyClaw 内部安装的，最高优先级，覆盖同名）
     const ownerId = group.created_by;
     if (ownerId) {
       linkSkillEntries(path.join(DATA_DIR, 'skills', ownerId));
@@ -802,7 +864,34 @@ export async function runHostAgent(
     logger.warn({ folder: group.folder, err }, '宿主机模式 skills 符号链接失败');
   }
 
-  // 5. 构建环境变量
+  // 5. Rules 自动链接到 session 目录（多用户支持，自动处理重名冲突）
+  try {
+    const rulesDir = path.join(groupSessionsDir, 'rules');
+    fs.mkdirSync(rulesDir, { recursive: true });
+
+    // 清空已有符号链接
+    for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+      const entryPath = path.join(rulesDir, entry.name);
+      try {
+        if (entry.isSymbolicLink() || entry.isFile()) {
+          fs.rmSync(entryPath, { force: true });
+        }
+      } catch { /* ignore */ }
+    }
+
+    // 链接所有宿主机用户的 rules（多用户支持，自动处理重名冲突）
+    const allHostRules = collectAllUserRules();
+    for (const rule of allHostRules) {
+      const linkPath = path.join(rulesDir, rule.linkName);
+      try {
+        fs.symlinkSync(rule.path, linkPath);
+      } catch { /* ignore */ }
+    }
+  } catch (err) {
+    logger.warn({ folder: group.folder, err }, '宿主机模式 rules 符号链接失败');
+  }
+
+  // 6. 构建环境变量
   const hostEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
   };

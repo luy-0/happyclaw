@@ -3,11 +3,11 @@
 import { Hono } from 'hono';
 import fs from 'fs/promises';
 import path from 'path';
-import os from 'os';
 import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
+import { getNormalUserClaudeDir, getNormalUserHome } from '../user-detection.js';
 
 // --- Types ---
 
@@ -291,8 +291,8 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
   // Read MCP servers from both config file locations
   let hostServers: Record<string, any> = {};
 
-  // Source 1: ~/.claude/settings.json
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  // Source 1: ~/.claude/settings.json (使用检测到的普通用户目录)
+  const settingsPath = path.join(getNormalUserClaudeDir(), 'settings.json');
   try {
     const raw = await fs.readFile(settingsPath, 'utf-8');
     const settings = JSON.parse(raw);
@@ -306,7 +306,7 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
   // Source 2: ~/.claude.json (global Claude Code config, stores per-user MCP settings)
   // When both files define the same server ID, ~/.claude.json wins because it's
   // the primary user-facing config file where Claude Code persists MCP settings.
-  const globalConfigPath = path.join(os.homedir(), '.claude.json');
+  const globalConfigPath = path.join(getNormalUserHome(), '.claude.json');
   try {
     const raw = await fs.readFile(globalConfigPath, 'utf-8');
     const config = JSON.parse(raw);

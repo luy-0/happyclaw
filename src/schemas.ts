@@ -164,6 +164,7 @@ export const SystemSettingsSchema = z.object({
   loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
   maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
   scriptTimeout: z.number().int().min(5000).max(600000).optional(),
+  normalUserHome: z.string().min(1).optional(),
 });
 
 export const AppearanceConfigSchema = z.object({

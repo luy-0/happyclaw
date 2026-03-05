@@ -4,6 +4,8 @@ import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+// Note: getNormalUserClaudeDir uses lazy import of getSystemSettings to avoid circular dependency
+import { getNormalUserClaudeDir } from './user-detection.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const CURRENT_CONFIG_VERSION = 2;
@@ -1225,8 +1227,8 @@ export function updateAllSessionCredentials(config: ClaudeProviderConfig): void 
     logger.warn({ err }, 'Failed to update session credentials');
   }
 
-  // Host mode: update ~/.claude/.credentials.json
-  const homeClaudeDir = path.join(process.env.HOME || '/root', '.claude');
+  // Host mode: update ~/.claude/.credentials.json (使用检测到的普通用户目录)
+  const homeClaudeDir = getNormalUserClaudeDir();
   if (fs.existsSync(homeClaudeDir) && fs.statSync(homeClaudeDir).isDirectory()) {
     try {
       writeCredentialsFile(homeClaudeDir, config);
@@ -1507,6 +1509,12 @@ export interface SystemSettings {
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
   scriptTimeout: number;
+  /**
+   * 显式指定普通用户的 home 目录路径。
+   * 当 HappyClaw 以 root 运行时，自动检测可能无法正确识别用户目录，
+   * 此配置允许管理员手动指定，例如 "/home/ubuntu"。
+   */
+  normalUserHome?: string;
 }
 
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
@@ -1573,6 +1581,10 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.scriptTimeout === 'number' && raw.scriptTimeout > 0
         ? raw.scriptTimeout
         : DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
+    normalUserHome:
+      typeof raw.normalUserHome === 'string' && raw.normalUserHome.trim()
+        ? raw.normalUserHome.trim()
+        : undefined,
   };
 }
 
@@ -1587,6 +1599,7 @@ function buildEnvFallbackSettings(): SystemSettings {
     loginLockoutMinutes: parseIntEnv(process.env.LOGIN_LOCKOUT_MINUTES, DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes),
     maxConcurrentScripts: parseIntEnv(process.env.MAX_CONCURRENT_SCRIPTS, DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts),
     scriptTimeout: parseIntEnv(process.env.SCRIPT_TIMEOUT, DEFAULT_SYSTEM_SETTINGS.scriptTimeout),
+    normalUserHome: process.env.NORMAL_USER_HOME?.trim() || undefined,
   };
 }
 
