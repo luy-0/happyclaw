@@ -4,7 +4,7 @@ import { Loader2, Upload, Trash2 } from 'lucide-react';
 import { useAuthStore } from '../../stores/auth';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { Switch } from '@/components/ui/switch';
+import * as Switch from '@radix-ui/react-switch';
 import { EmojiAvatar } from '@/components/common/EmojiAvatar';
 import { EmojiPicker } from '@/components/common/EmojiPicker';
 import { ColorPicker } from '@/components/common/ColorPicker';
@@ -323,11 +323,14 @@ export function ProfileSection({ setNotice, setError }: ProfileSectionProps) {
               <div className="text-sm font-medium text-slate-700">任务完成提示音</div>
               <div className="text-xs text-slate-500">Agent 回复完成时播放提示音</div>
             </div>
-            <Switch
+            <Switch.Root
               checked={soundEnabled}
               onCheckedChange={handleSoundToggle}
               aria-label="任务完成提示音"
-            />
+              className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-2 focus-visible:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=unchecked]:bg-slate-200"
+            >
+              <Switch.Thumb className="block size-5 rounded-full bg-white shadow-lg transition-transform data-[state=checked]:translate-x-5 data-[state=unchecked]:translate-x-0.5" />
+            </Switch.Root>
           </div>
         </div>
       </div>
