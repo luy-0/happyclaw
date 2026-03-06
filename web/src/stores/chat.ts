@@ -4,6 +4,7 @@ import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
 import { showToast, notifyIfHidden, shouldEmitBackgroundTaskNotice } from '../utils/toast';
+import { playNotificationSound } from '../utils/sound';
 import type { GroupInfo, AgentInfo, AvailableImGroup } from '../types';
 
 export type { GroupInfo, AgentInfo };
@@ -1114,7 +1115,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         event.taskSummary,
       );
 
-      // Toast + 浏览器通知（仅限后台任务）
+      // Toast + 浏览器通知 + 提示音（仅限后台任务）
       // stream-processor 为前台 Task 合成的 task_notification 不带 isBackground 标记，
       // 仅 SDK 原生的后台完成事件携带 isBackground: true。
       if (event.isBackground && shouldEmitBackgroundTaskNotice(resolvedTaskId)) {
@@ -1125,6 +1126,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           showToast(`${desc} ${status}`, event.taskSummary);
         }
         notifyIfHidden(`HappyClaw: ${desc} ${status}`, event.taskSummary);
+        playNotificationSound();
       }
 
       // 不落入主对话 streaming
@@ -1287,6 +1289,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         delete nextStreaming[chatJid];
         const nextPending = { ...s.pendingThinking };
         delete nextPending[chatJid];
+
+        // 播放提示音（Agent 回复完成，非重复消息）
+        if (isAgentReply && !alreadyExists) {
+          playNotificationSound();
+        }
 
         return {
           messages: { ...s.messages, [chatJid]: updated },
