@@ -80,6 +80,7 @@ const BACKFILL_MAX_PAGES_PER_CHAT = 5;
 interface FeishuMentionLike {
   key?: string;
   name?: string;
+  id?: string; // open_id of the mentioned user/bot
 }
 
 interface IncomingMessagePayload {
@@ -431,6 +432,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
   let disconnectedChecks = 0;
   let disconnectedSince: number | null = null;
   let healthTimer: NodeJS.Timeout | null = null;
+  let botOpenId: string | null = null; // Bot's open_id for group mention filtering
 
   function rememberChatProgress(chatId: string, createTimeMs: number): void {
     knownChatIds.add(chatId);
@@ -483,6 +485,29 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       void checkConnectionHealth();
     }, WS_HEALTH_CHECK_INTERVAL_MS);
     healthTimer.unref?.();
+  }
+
+  /**
+   * Fetch the bot's open_id using the Feishu Bot Info API.
+   * Used to determine if the bot is mentioned in group messages.
+   */
+  async function fetchBotOpenId(): Promise<void> {
+    if (!client) return;
+    try {
+      const res = await client.request({
+        method: 'GET',
+        url: '/open-apis/bot/v3/info',
+        data: {},
+      }) as { data?: { bot?: { open_id?: string } } };
+      botOpenId = res.data?.bot?.open_id || null;
+      if (botOpenId) {
+        logger.info({ botOpenId }, 'Fetched bot open_id for group mention filtering');
+      } else {
+        logger.warn('Failed to get bot open_id from API response');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to fetch bot open_id, group mention filtering may not work');
+    }
   }
 
   function isDuplicate(msgId: string): boolean {
@@ -696,6 +721,27 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         if (mention.key) {
           text = text.replace(mention.key, `@${mention.name || ''}`);
         }
+      }
+    }
+
+    // Group chat: only respond when bot is mentioned
+    if (chatType !== 'p2p') {
+      if (botOpenId) {
+        const isBotMentioned = mentions?.some((m) => m.id === botOpenId);
+        if (!isBotMentioned) {
+          logger.debug(
+            { messageId, chatId, botOpenId },
+            'Group message without bot mention, skipping',
+          );
+          return;
+        }
+      } else {
+        // No bot open_id yet, skip group messages to be safe
+        logger.debug(
+          { messageId, chatId },
+          'Group message received but bot open_id not available, skipping',
+        );
+        return;
       }
     }
 
@@ -944,6 +990,8 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         loggerLevel: lark.LoggerLevel.info,
       });
       await wsClient.start({ eventDispatcher });
+      // Re-fetch bot's open_id after reconnect
+      await fetchBotOpenId();
 
       lastWsStateConnected = true;
       logger.info({ reason }, 'Feishu WebSocket reconnected');
@@ -1089,6 +1137,8 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         lastWsStateConnected = true;
         disconnectedSince = null;
         startHealthMonitor();
+        // Fetch bot's open_id for group mention filtering
+        await fetchBotOpenId();
         onReady();
         return true;
       } catch (err) {
