@@ -203,6 +203,97 @@ function extractMessageContent(
       }
     }
 
+    if (messageType === 'interactive') {
+      // 飞书卡片消息，提取标题和内容元素中的文本
+      const lines: string[] = [];
+      const card = parsed.card || parsed;
+
+      // 提取标题
+      if (card.header?.title) {
+        const title = card.header.title;
+        const titleText = title.content || title.text || '';
+        if (titleText) {
+          lines.push(`【${titleText}】`);
+        }
+      }
+
+      // 提取 elements 中的文本内容
+      const elements = card.elements || card.body?.elements || [];
+      for (const element of elements) {
+        if (!element || typeof element !== 'object') continue;
+
+        // markdown 元素
+        if (element.tag === 'markdown' && element.content) {
+          lines.push(element.content);
+        }
+        // div 元素（可能包含 text 子元素）
+        else if (element.tag === 'div') {
+          if (element.text?.content) {
+            lines.push(element.text.content);
+          } else if (element.text?.text) {
+            lines.push(element.text.text);
+          }
+          // 处理 fields 数组
+          if (Array.isArray(element.fields)) {
+            for (const field of element.fields) {
+              if (field.text?.content) {
+                lines.push(field.text.content);
+              }
+            }
+          }
+        }
+        // plain_text 或 lark_md 元素
+        else if (element.tag === 'plain_text' || element.tag === 'lark_md') {
+          if (element.content) {
+            lines.push(element.content);
+          }
+        }
+        // note 元素（底部备注）
+        else if (element.tag === 'note' && Array.isArray(element.elements)) {
+          for (const noteEl of element.elements) {
+            if (noteEl.content) {
+              lines.push(noteEl.content);
+            }
+          }
+        }
+        // action 元素（按钮组，提取按钮文本）
+        else if (element.tag === 'action' && Array.isArray(element.actions)) {
+          const buttonTexts = element.actions
+            .map((a: { text?: { content?: string } }) => a.text?.content)
+            .filter(Boolean);
+          if (buttonTexts.length > 0) {
+            lines.push(`[按钮: ${buttonTexts.join(' | ')}]`);
+          }
+        }
+        // column_set 元素（多列布局）
+        else if (element.tag === 'column_set' && Array.isArray(element.columns)) {
+          for (const column of element.columns) {
+            if (Array.isArray(column.elements)) {
+              for (const colEl of column.elements) {
+                if (colEl.tag === 'markdown' && colEl.content) {
+                  lines.push(colEl.content);
+                } else if (colEl.text?.content) {
+                  lines.push(colEl.text.content);
+                }
+              }
+            }
+          }
+        }
+        // hr 分隔线，添加分隔符
+        else if (element.tag === 'hr') {
+          lines.push('---');
+        }
+      }
+
+      const result = lines.join('\n').trim();
+      if (!result) {
+        logger.debug({ card }, 'Interactive card extracted empty text');
+      } else {
+        logger.debug({ cardTitle: card.header?.title?.content, elementCount: elements.length }, 'Interactive card parsed');
+      }
+      return { text: result };
+    }
+
     // Ignore other message types (audio, etc.)
     return { text: '' };
   } catch (err) {
