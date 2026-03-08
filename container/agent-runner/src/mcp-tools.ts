@@ -344,6 +344,41 @@ Use available_groups.json to find the JID for a group. The folder name should be
       },
     ),
 
+    // --- buffer_task_result ---
+    tool(
+      'buffer_task_result',
+      `Buffer a scheduled task result for daily summary report. Use this instead of send_message for routine task results.
+
+Priority levels:
+• "urgent": Send immediately (e.g., critical alerts, found valid promotions)
+• "important": Include in daily report with emphasis (e.g., new trends, significant updates)
+• "normal": Include in daily report as regular item (e.g., no changes, routine checks)
+
+The buffered results will be aggregated and sent in the daily summary report at 8:00 AM.`,
+      {
+        task_name: z.string().describe('Human-readable task name (e.g., "RedteaGO 50% off monitoring")'),
+        summary: z.string().describe('Brief summary of the task result (1-2 sentences)'),
+        details: z.record(z.string(), z.unknown()).optional().describe('Optional detailed information (JSON object)'),
+        priority: z.enum(['normal', 'important', 'urgent']).default('normal').describe('Priority level: normal (default) | important | urgent'),
+      },
+      async (args) => {
+        const data = {
+          type: 'buffer_task_result',
+          taskName: args.task_name,
+          summary: args.summary,
+          details: args.details || {},
+          priority: args.priority || 'normal',
+          groupFolder: ctx.groupFolder,
+          chatJid: ctx.chatJid,
+          timestamp: new Date().toISOString(),
+        };
+        writeIpcFile(TASKS_DIR, data);
+        return {
+          content: [{ type: 'text' as const, text: `Task result buffered (${args.priority}): ${args.task_name}` }],
+        };
+      },
+    ),
+
   ];
 
   // Skill 安装/卸载仅限主容器（与 memory_* 工具一致）

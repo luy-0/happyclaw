@@ -1480,6 +1480,12 @@ async function processTaskIpc(
     package?: string;
     requestId?: string;
     skillId?: string;
+    // For buffer_task_result
+    taskName?: string;
+    summary?: string;
+    details?: Record<string, unknown>;
+    priority?: 'normal' | 'important' | 'urgent';
+    timestamp?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -1814,6 +1820,39 @@ async function processTaskIpc(
         );
       } else {
         logger.warn({ data }, 'Invalid uninstall_skill request - missing required fields');
+      }
+      break;
+
+    case 'buffer_task_result':
+      if (data.taskName && data.summary) {
+        const date = new Date().toISOString().split('T')[0];
+        const bufferDir = path.join(DATA_DIR, 'task-buffer', date);
+        fs.mkdirSync(bufferDir, { recursive: true });
+
+        const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+        const filepath = path.join(bufferDir, filename);
+
+        const bufferedData = {
+          taskName: data.taskName,
+          summary: data.summary,
+          details: data.details || {},
+          priority: data.priority || 'normal',
+          groupFolder: data.groupFolder || sourceGroup,
+          chatJid: data.chatJid || '',
+          timestamp: data.timestamp || new Date().toISOString(),
+        };
+
+        // Atomic write
+        const tmpPath = `${filepath}.tmp`;
+        fs.writeFileSync(tmpPath, JSON.stringify(bufferedData, null, 2));
+        fs.renameSync(tmpPath, filepath);
+
+        logger.info(
+          { taskName: data.taskName, priority: data.priority, sourceGroup },
+          'Task result buffered for daily report',
+        );
+      } else {
+        logger.warn({ data }, 'Invalid buffer_task_result request - missing required fields');
       }
       break;
 
