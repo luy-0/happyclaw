@@ -10,11 +10,9 @@ if (typeof window !== 'undefined') {
   initNotificationSound();
 }
 
-if (typeof window !== 'undefined') {
-  window.__HAPPYCLAW_HASH_ROUTER__ = shouldUseHashRouter();
-}
+window.__HAPPYCLAW_HASH_ROUTER__ = shouldUseHashRouter();
 
-if (import.meta.env.DEV && typeof window !== 'undefined') {
+if (import.meta.env.DEV) {
   // Avoid stale PWA cache/service worker causing dev UI to hang after backend/API changes.
   window.addEventListener('load', () => {
     if ('serviceWorker' in navigator) {

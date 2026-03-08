@@ -162,8 +162,10 @@ interface ChatState {
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
-  bindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
+  bindImGroup: (jid: string, agentId: string, imJid: string, force?: boolean) => Promise<boolean>;
   unbindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
+  bindMainImGroup: (jid: string, imJid: string, force?: boolean) => Promise<boolean>;
+  unbindMainImGroup: (jid: string, imJid: string) => Promise<boolean>;
 }
 
 const DEFAULT_STREAMING_STATE: StreamingState = {
@@ -1116,6 +1118,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Toast + 浏览器通知 + 提示音（仅限后台任务）
       // stream-processor 为前台 Task 合成的 task_notification 不带 isBackground 标记，
       // 仅 SDK 原生的后台完成事件携带 isBackground: true。
+      // 提示音统一在 handleWsNewMessage 中播放，避免重复触发
       if (event.isBackground && shouldEmitBackgroundTaskNotice(resolvedTaskId)) {
         const taskInfo = get().sdkTasks[resolvedTaskId];
         const desc = (taskInfo?.description || event.taskSummary || '后台任务').slice(0, 60);
@@ -1262,14 +1265,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
-    set((s) => {
-      const existing = s.messages[chatJid] || [];
+    // 提取播放条件判断到 set() 外部（避免在 reducer 内执行副作用）
+    const existing = get().messages[chatJid] || [];
+    const alreadyExists = existing.some((m) => m.id === wsMsg.id);
+    const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
+    const shouldPlaySound = isAgentReply && !alreadyExists;
 
-      // 消息已存在时保留原顺序，仅执行状态收尾（清 waiting/streaming）
-      const alreadyExists = existing.some((m) => m.id === wsMsg.id);
+    set((s) => {
       const updated = alreadyExists ? existing : [...existing, msg];
 
-      const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
       const isSystemError =
         msg.sender === '__system__' &&
         (msg.content.startsWith('agent_error:') ||
@@ -1307,6 +1311,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages: { ...s.messages, [chatJid]: updated },
       };
     });
+
+    // 播放提示音（仅在页面不可见时，避免干扰用户正在查看的对话）
+    if (shouldPlaySound && typeof document !== 'undefined' && document.hidden) {
+      playNotificationSound();
+    }
   },
 
   // 处理子 Agent 状态变更事件
@@ -1630,11 +1639,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  bindImGroup: async (jid, agentId, imJid) => {
+  bindImGroup: async (jid, agentId, imJid, force) => {
     try {
       await api.put(
         `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding`,
-        { im_jid: imJid },
+        { im_jid: imJid, ...(force ? { force: true } : {}) },
       );
       // Refresh agents to get updated linked_im_groups
       get().loadAgents(jid);
@@ -1650,6 +1659,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
       );
       get().loadAgents(jid);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  bindMainImGroup: async (jid, imJid, force) => {
+    try {
+      await api.put(
+        `/api/groups/${encodeURIComponent(jid)}/im-binding`,
+        { im_jid: imJid, ...(force ? { force: true } : {}) },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  unbindMainImGroup: async (jid, imJid) => {
+    try {
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/im-binding/${encodeURIComponent(imJid)}`,
+      );
       return true;
     } catch {
       return false;
