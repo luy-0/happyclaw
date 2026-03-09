@@ -12,6 +12,7 @@ export type { GroupInfo, AgentInfo };
 export interface Message {
   id: string;
   chat_jid: string;
+  source_jid?: string;
   sender: string;
   sender_name: string;
   content: string;
@@ -138,10 +139,12 @@ interface ChatState {
   sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<void>;
   stopGroup: (jid: string) => Promise<boolean>;
   interruptQuery: (jid: string) => Promise<boolean>;
-  resetSession: (jid: string) => Promise<boolean>;
+  resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
+  deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
+  togglePin: (jid: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
   handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
   handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string) => void;
@@ -762,14 +765,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  resetSession: async (jid: string) => {
+  resetSession: async (jid: string, agentId?: string) => {
     try {
       await api.post<{ success: boolean; dividerMessageId: string }>(
         `/api/groups/${encodeURIComponent(jid)}/reset-session`,
+        agentId ? { agentId } : undefined,
       );
-      get().clearStreaming(jid, { preserveThinking: false });
-      // Refresh messages to pick up the divider message
-      await get().refreshMessages(jid);
+      if (agentId) {
+        // Agent-specific: clear agent streaming and refresh agent messages
+        set((s) => {
+          const nextStreaming = { ...s.agentStreaming };
+          delete nextStreaming[agentId];
+          const nextWaiting = { ...s.agentWaiting };
+          delete nextWaiting[agentId];
+          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
+        });
+        await get().loadAgentMessages(jid, agentId);
+      } else {
+        get().clearStreaming(jid, { preserveThinking: false });
+        // Refresh messages to pick up the divider message
+        await get().refreshMessages(jid);
+      }
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -825,6 +841,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  deleteMessage: async (jid: string, messageId: string) => {
+    try {
+      await api.delete(`/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`);
+      set((s) => ({
+        messages: {
+          ...s.messages,
+          [jid]: (s.messages[jid] || []).filter((m) => m.id !== messageId),
+        },
+      }));
+      return true;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+      return false;
+    }
+  },
+
   createFlow: async (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => {
     try {
       const body: Record<string, string> = { name };
@@ -868,6 +900,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
             },
           },
           error: null,
+        };
+      });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  togglePin: async (jid: string) => {
+    const group = get().groups[jid];
+    if (!group) return;
+    const willPin = !group.pinned_at;
+    try {
+      const data = await api.patch<{ success: boolean; pinned_at?: string }>(
+        `/api/groups/${encodeURIComponent(jid)}`,
+        { is_pinned: willPin },
+      );
+      set((s) => {
+        const g = s.groups[jid];
+        if (!g) return s;
+        return {
+          groups: {
+            ...s.groups,
+            [jid]: {
+              ...g,
+              pinned_at: willPin ? (data.pinned_at || new Date().toISOString()) : undefined,
+            },
+          },
         };
       });
     } catch (err) {
@@ -1214,6 +1273,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // ⑥ 主对话 streaming — 使用 applyStreamEvent 共享函数
     set((s) => {
+      // If streaming state was already cleared (final message received),
+      // ignore late-arriving stream events to prevent "thinking" from reappearing.
+      if (!s.streaming[chatJid] && s.waiting[chatJid] === false) {
+        return s;
+      }
       const MAX_STREAMING_TEXT = 8000;
       const prev = s.streaming[chatJid] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };

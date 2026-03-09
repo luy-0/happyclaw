@@ -55,6 +55,7 @@ import {
   setSession,
   deleteSession,
   storeMessageDirect,
+  updateLatestMessageTokenUsage,
   updateChatName,
   updateTask,
   createAgent,
@@ -66,10 +67,18 @@ import {
   markAllRunningTaskAgentsAsError,
   getSession,
   listAgentsByJid,
+  getGroupsByOwner,
+  getMessagesPage,
+  addGroupMember,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
 import { getChannelType } from './im-channel.js';
+import {
+  formatContextMessages,
+  formatWorkspaceList,
+  type WorkspaceInfo,
+} from './im-command-utils.js';
 import { analyzeIntent } from './intent-analyzer.js';
 import {
   getClaudeProviderConfig as getClaudeProviderConfigForRefresh,
@@ -128,6 +137,15 @@ const IM_SEND_FAIL_THRESHOLD = 3;
 // Track consecutive IM health check failures per JID for safe auto-unbind
 const imHealthCheckFailCounts = new Map<string, number>();
 const IM_HEALTH_CHECK_FAIL_THRESHOLD = 3;
+const RELATIVE_IMAGE_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.svg',
+]);
 
 /** Unbind an IM group from its conversation agent or main conversation, syncing DB + in-memory cache + failure counters. */
 function unbindImGroup(jid: string, reason: string): void {
@@ -135,7 +153,12 @@ function unbindImGroup(jid: string, reason: string): void {
   if (!group?.target_agent_id && !group?.target_main_jid) return;
   const agentId = group.target_agent_id;
   const targetMainJid = group.target_main_jid;
-  const updated = { ...group, target_agent_id: undefined, target_main_jid: undefined };
+  const updated = {
+    ...group,
+    target_agent_id: undefined,
+    target_main_jid: undefined,
+    reply_policy: 'source_only' as const,
+  };
   setRegisteredGroup(jid, updated);
   registeredGroups[jid] = updated;
   imSendFailCounts.delete(jid);
@@ -213,9 +236,61 @@ function resolveEffectiveGroup(group: RegisteredGroup): { effectiveGroup: Regist
   return { effectiveGroup: group, isHome: false };
 }
 
+/** Resolve the owner's home folder for memory mounting. Non-home groups read owner's home memory. */
+function resolveOwnerHomeFolder(group: RegisteredGroup): string {
+  if (group.created_by) {
+    return getUserHomeGroup(group.created_by)?.folder || group.folder;
+  }
+  return group.folder;
+}
+
 /** Send a message to an IM channel with automatic fail-count tracking and auto-unbind. */
-function sendImWithFailTracking(imJid: string, text: string): void {
-  imManager.sendMessage(imJid, text).then(() => {
+function extractLocalImImagePaths(text: string, groupFolder?: string): string[] {
+  if (!groupFolder || !text) return [];
+
+  const workspaceRoot = path.resolve(GROUPS_DIR, groupFolder);
+  const seen = new Set<string>();
+  const imagePaths: string[] = [];
+  const candidates: string[] = [];
+  const markdownImageRe = /!\[[^\]]*]\(([^)]+)\)/g;
+  const taggedImageRe = /\[图片:\s*([^\]\n]+)\]/g;
+
+  const pushCandidate = (raw: string): void => {
+    const trimmed = raw.trim().replace(/^<|>$/g, '');
+    const pathToken = trimmed.split(/\s+/)[0]?.trim().replace(/^['"]|['"]$/g, '');
+    if (!pathToken || pathToken.startsWith('/') || pathToken.startsWith('data:') || /^[a-z]+:\/\//i.test(pathToken)) {
+      return;
+    }
+    candidates.push(pathToken);
+  };
+
+  for (const match of text.matchAll(markdownImageRe)) {
+    pushCandidate(match[1] || '');
+  }
+  for (const match of text.matchAll(taggedImageRe)) {
+    pushCandidate(match[1] || '');
+  }
+
+  for (const candidate of candidates) {
+    const resolved = path.resolve(workspaceRoot, candidate);
+    const ext = path.extname(resolved).toLowerCase();
+    if (!RELATIVE_IMAGE_EXTENSIONS.has(ext)) continue;
+    if (resolved !== workspaceRoot && !resolved.startsWith(workspaceRoot + path.sep)) continue;
+    if (seen.has(resolved)) continue;
+    try {
+      if (!fs.statSync(resolved).isFile()) continue;
+      seen.add(resolved);
+      imagePaths.push(resolved);
+    } catch {
+      continue;
+    }
+  }
+
+  return imagePaths;
+}
+
+function sendImWithFailTracking(imJid: string, text: string, localImagePaths: string[]): void {
+  imManager.sendMessage(imJid, text, localImagePaths).then(() => {
     imSendFailCounts.delete(imJid);
   }).catch((err) => {
     logger.warn({ imJid, err }, 'Failed to relay message to IM');
@@ -318,22 +393,474 @@ async function clearSessionRuntimeFiles(folder: string, agentId?: string): Promi
  * Returns a reply string on success, or null if command not recognized.
  */
 async function handleCommand(chatJid: string, command: string): Promise<string | null> {
-  if (command !== 'clear') return null;
+  const parts = command.split(/\s+/);
+  const cmd = parts[0];
+  const rawArgs = command.slice(cmd.length).trim();
 
+  switch (cmd) {
+    case 'clear':
+      return handleClearCommand(chatJid);
+    case 'list':
+    case 'ls':
+      return handleListCommand(chatJid);
+    case 'status':
+      return handleStatusCommand(chatJid);
+    case 'recall':
+    case 'rc':
+      return handleRecallCommand(chatJid);
+    case 'where':
+      return handleWhereCommand(chatJid);
+    case 'unbind':
+      return handleUnbindCommand(chatJid);
+    case 'bind':
+      return handleBindCommand(chatJid, rawArgs);
+    case 'new':
+      return handleNewCommand(chatJid, rawArgs);
+    case 'activation':
+      return handleActivationCommand(chatJid, rawArgs);
+    default:
+      return null;
+  }
+}
+
+async function handleClearCommand(chatJid: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-  if (!group) return null;
+  if (!group) return '未找到当前工作区';
+
+  // Only agent-bound IM groups support /clear (clears that agent's context).
+  // Main-conversation-bound groups (target_main_jid) should be cleared from Web.
+  if (group.target_main_jid && !group.target_agent_id) {
+    return '当前群组未绑定子对话，请在 Web 端清除上下文';
+  }
+
+  const agentId = group.target_agent_id || undefined;
 
   try {
     await executeSessionReset(chatJid, group.folder, {
       queue,
       sessions,
       broadcast: broadcastNewMessage,
-    });
+      setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
+        lastAgentTimestamp[jid] = cursor;
+        saveState();
+      },
+    }, agentId);
     return '已清除对话上下文 ✓';
   } catch (err) {
-    logger.error({ chatJid, err }, 'handleCommand /clear failed');
+    logger.error({ chatJid, agentId, err }, 'handleCommand /clear failed');
     return '清除上下文失败，请稍后重试';
   }
+}
+
+/**
+ * Collect all accessible workspaces for a user as pure WorkspaceInfo[].
+ */
+function collectWorkspaces(userId: string): WorkspaceInfo[] {
+  const ownedGroups = getGroupsByOwner(userId);
+  const user = getUserById(userId);
+  const isAdmin = user?.role === 'admin';
+
+  const seen = new Set<string>();
+  const workspaces: WorkspaceInfo[] = [];
+
+  for (const g of ownedGroups) {
+    if (!g.jid.startsWith('web:')) continue;
+    if (seen.has(g.folder)) continue;
+    seen.add(g.folder);
+
+    const agents = listAgentsByJid(g.jid)
+      .filter((a) => a.kind === 'conversation')
+      .map((a) => ({ id: a.id, name: a.name, status: a.status }));
+
+    workspaces.push({ folder: g.folder, name: g.name, agents });
+  }
+
+  if (isAdmin && !seen.has(MAIN_GROUP_FOLDER)) {
+    const agents = listAgentsByJid(DEFAULT_MAIN_JID)
+      .filter((a) => a.kind === 'conversation')
+      .map((a) => ({ id: a.id, name: a.name, status: a.status }));
+    workspaces.push({ folder: MAIN_GROUP_FOLDER, name: DEFAULT_MAIN_NAME, agents });
+  }
+
+  return workspaces;
+}
+
+function resolveBindingTarget(
+  userId: string,
+  rawSpec: string,
+): { target_agent_id?: string; target_main_jid?: string; display: string } | null {
+  const spec = rawSpec.trim();
+  if (!spec) return null;
+
+  const [workspaceSpecRaw, agentSpecRaw] = spec.split('/', 2);
+  const workspaceSpec = workspaceSpecRaw.trim().toLowerCase();
+  const agentSpec = agentSpecRaw?.trim().toLowerCase();
+  const workspaces = collectWorkspaces(userId);
+  const workspace = workspaces.find((ws) =>
+    ws.folder.toLowerCase() === workspaceSpec || ws.name.trim().toLowerCase() === workspaceSpec,
+  );
+  if (!workspace) return null;
+
+  if (!agentSpec || agentSpec === 'main' || agentSpec === '主对话') {
+    const mainJid = findWebJidForFolder(workspace.folder);
+    if (!mainJid) return null;
+    return {
+      target_main_jid: mainJid,
+      display: `${workspace.name} / 主对话`,
+    };
+  }
+
+  const agent = workspace.agents.find((item) =>
+    item.id.toLowerCase().startsWith(agentSpec) || item.name.trim().toLowerCase() === agentSpec,
+  );
+  if (!agent) return null;
+
+  return {
+    target_agent_id: agent.id,
+    display: `${workspace.name} / ${agent.name}`,
+  };
+}
+
+/**
+ * Find the primary web JID for a folder (the one used for web:xxx groups).
+ */
+function findWebJidForFolder(folder: string): string | null {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder === folder && jid.startsWith('web:')) return jid;
+  }
+  const jids = getJidsByFolder(folder);
+  for (const jid of jids) {
+    if (jid.startsWith('web:')) return jid;
+  }
+  return null;
+}
+
+/**
+ * Find the display name for a folder by looking up its web group.
+ */
+function findGroupNameByFolder(folder: string): string {
+  const webJid = findWebJidForFolder(folder);
+  if (webJid) {
+    const group = registeredGroups[webJid] ?? getRegisteredGroup(webJid);
+    if (group) return group.name;
+  }
+  return folder;
+}
+
+/**
+ * Fetch recent messages and format a context summary.
+ */
+function getConversationContext(
+  folder: string,
+  agentId: string | null,
+  count = 5,
+  maxLen = 80,
+): string {
+  const webJid = findWebJidForFolder(folder);
+  if (!webJid) return '';
+
+  const chatJidForMsg = agentId ? `${webJid}#agent:${agentId}` : webJid;
+  const messages = getMessagesPage(chatJidForMsg, undefined, count);
+
+  if (messages.length === 0) return '\n\n📭 该对话暂无消息记录';
+
+  const formatted = formatContextMessages(messages.reverse(), maxLen);
+  return formatted || '\n\n📭 该对话暂无消息记录';
+}
+
+function handleListCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+
+  const userId = group.created_by;
+  if (!userId) return '无法确定用户身份';
+
+  const workspaces = collectWorkspaces(userId);
+  if (workspaces.length === 0) return '没有可用的工作区';
+
+  return formatWorkspaceList(workspaces, group.folder, null) + '\n💡 使用 /bind <workspace> 或 /bind <workspace>/<agent短ID>';
+}
+
+function handleStatusCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+
+  // Show binding-aware status
+  let locationLine: string;
+  let folderLine: string;
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    const parent = agent ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid)) : null;
+    const workspaceName = parent?.name || parent?.folder || group.folder;
+    locationLine = `📍 当前位置: ${workspaceName} / ${agent?.name || group.target_agent_id}`;
+    folderLine = `📁 工作区: ${parent?.folder || group.folder}`;
+  } else if (group.target_main_jid) {
+    const target = registeredGroups[group.target_main_jid] ?? getRegisteredGroup(group.target_main_jid);
+    locationLine = `📍 当前位置: ${target?.name || group.target_main_jid} / 主对话`;
+    folderLine = `📁 工作区: ${target?.folder || group.folder}`;
+  } else {
+    const folderName = findGroupNameByFolder(group.folder);
+    locationLine = `📍 当前位置: ${folderName} / 主对话`;
+    folderLine = `📁 工作区: ${group.folder}`;
+  }
+
+  const policyLine = (group.target_main_jid || group.target_agent_id)
+    ? `🔁 回复策略: ${group.reply_policy || 'source_only'}`
+    : null;
+
+  const lines = [
+    locationLine,
+    folderLine,
+    policyLine,
+    '',
+    '💡 /list 查看全部 · /recall 总结最近对话',
+  ].filter(Boolean);
+
+  return lines.join('\n');
+}
+
+function handleWhereCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+
+  const policySuffix = `\n🔁 回复策略: ${group.reply_policy || 'source_only'}`;
+
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    const parent = agent ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid)) : null;
+    const workspaceName = parent?.name || parent?.folder || group.folder;
+    return `📍 当前绑定: ${workspaceName} / ${agent?.name || group.target_agent_id}${policySuffix}`;
+  }
+
+  if (group.target_main_jid) {
+    const target = registeredGroups[group.target_main_jid] ?? getRegisteredGroup(group.target_main_jid);
+    return `📍 当前绑定: ${(target?.name || group.target_main_jid)} / 主对话${policySuffix}`;
+  }
+
+  return `📍 当前绑定: ${group.name} / 主对话${policySuffix}`;
+}
+
+function handleUnbindCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+  if (!group.target_agent_id && !group.target_main_jid) return '当前聊天没有额外绑定，已在默认工作区。';
+  unbindImGroup(chatJid, 'IM slash command unbind');
+  return '已解绑，后续消息将回到该聊天自己的默认工作区。';
+}
+
+function handleBindCommand(chatJid: string, rawSpec: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+  const userId = group.created_by;
+  if (!userId) return '无法确定当前聊天所属用户';
+  if (!rawSpec) return '用法: /bind <workspace> 或 /bind <workspace>/<agent短ID>';
+
+  const resolved = resolveBindingTarget(userId, rawSpec);
+  if (!resolved) {
+    return '未找到目标。先用 /list 查看工作区和 agent 短 ID，再执行 /bind <workspace>/<agent短ID>';
+  }
+
+  const updated: RegisteredGroup = {
+    ...group,
+    target_agent_id: resolved.target_agent_id,
+    target_main_jid: resolved.target_main_jid,
+    reply_policy: 'source_only',
+  };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  imSendFailCounts.delete(chatJid);
+  imHealthCheckFailCounts.delete(chatJid);
+  return `已切换到 ${resolved.display}\n🔁 回复策略: source_only`;
+}
+
+function handleNewCommand(chatJid: string, rawName: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+  const userId = group.created_by;
+  if (!userId) return '无法确定当前聊天所属用户';
+
+  const name = rawName.trim();
+  if (!name) return '用法: /new <工作区名称>';
+  if (name.length > 50) return '名称过长（最多 50 字符）';
+
+  // Create a new workspace (same pattern as routes/groups.ts POST)
+  const newJid = `web:${crypto.randomUUID()}`;
+  const folder = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const now = new Date().toISOString();
+
+  const newGroup: RegisteredGroup = {
+    name,
+    folder,
+    added_at: now,
+    executionMode: 'container',
+    created_by: userId,
+  };
+
+  // Register the workspace
+  registerGroup(newJid, newGroup);
+  ensureChatExists(newJid);
+  updateChatName(newJid, name);
+  addGroupMember(folder, userId, 'owner', userId);
+
+  // Bind the current IM group to the new workspace's main conversation
+  const updated: RegisteredGroup = {
+    ...group,
+    target_main_jid: newJid,
+    target_agent_id: undefined,
+    reply_policy: 'source_only',
+  };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  imSendFailCounts.delete(chatJid);
+  imHealthCheckFailCounts.delete(chatJid);
+
+  return `工作区「${name}」已创建并绑定\n📁 ${folder}\n🔁 回复策略: source_only\n\n发送 /unbind 可解绑回默认工作区`;
+}
+
+function handleActivationCommand(chatJid: string, rawArgs: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  const action = rawArgs.trim().toLowerCase();
+  if (action === 'always') {
+    const updated: RegisteredGroup = { ...group, require_mention: false };
+    setRegisteredGroup(chatJid, updated);
+    registeredGroups[chatJid] = updated;
+    return '已切换为「全量响应」模式：群聊中所有消息都会响应，无需 @机器人';
+  } else if (action === 'mention') {
+    const updated: RegisteredGroup = { ...group, require_mention: true };
+    setRegisteredGroup(chatJid, updated);
+    registeredGroups[chatJid] = updated;
+    return '已切换为「@提及」模式：群聊中需要 @机器人 才会响应';
+  } else if (!action) {
+    const mode = group.require_mention !== false ? '@提及' : '全量响应';
+    return `当前模式: ${mode}\n\n用法:\n/activation always — 全量响应（无需 @）\n/activation mention — 需要 @机器人`;
+  }
+  return '用法: /activation always|mention';
+}
+
+const recallCooldowns = new Map<string, number>();
+
+async function handleRecallCommand(chatJid: string): Promise<string> {
+  logger.info({ chatJid }, '/recall command received');
+
+  const now = Date.now();
+  const lastRecall = recallCooldowns.get(chatJid) || 0;
+  if (now - lastRecall < 10000) {
+    return '⏳ 请稍后再试（冷却中）';
+  }
+  recallCooldowns.set(chatJid, now);
+
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) {
+    logger.warn({ chatJid }, '/recall: no registered group found');
+    return '当前 IM 未绑定工作区';
+  }
+
+  // Resolve binding target — use bound workspace/agent if present
+  let targetJid: string | undefined;
+  let targetFolder: string;
+  let targetAgentId: string | null = null;
+  let headerName: string;
+
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    const parent = agent ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid)) : null;
+    const workspaceName = parent?.name || parent?.folder || group.folder;
+    headerName = `${workspaceName} / ${agent?.name || group.target_agent_id}`;
+    targetFolder = parent?.folder || group.folder;
+    targetAgentId = group.target_agent_id;
+    targetJid = agent ? `${agent.chat_jid}#agent:${group.target_agent_id}` : undefined;
+  } else if (group.target_main_jid) {
+    const target = registeredGroups[group.target_main_jid] ?? getRegisteredGroup(group.target_main_jid);
+    headerName = `${target?.name || group.target_main_jid} / 主对话`;
+    targetFolder = target?.folder || group.folder;
+    targetJid = group.target_main_jid;
+  } else {
+    headerName = `${findGroupNameByFolder(group.folder)} / 主对话`;
+    targetFolder = group.folder;
+    targetJid = findWebJidForFolder(group.folder) ?? undefined;
+  }
+
+  const header = `🧠 ${headerName}`;
+
+  if (!targetJid) {
+    logger.warn({ chatJid, targetFolder }, '/recall: no JID found for target');
+    return `${header}\n\n📭 该对话暂无消息记录`;
+  }
+
+  // Fetch recent messages for summarization
+  const messages = getMessagesPage(targetJid, undefined, 10);
+  logger.info({ chatJid, targetJid, messageCount: messages.length }, '/recall: fetched messages');
+
+  if (messages.length === 0) return `${header}\n\n📭 该对话暂无消息记录`;
+
+  // Build chronological transcript
+  const transcript = messages.reverse().map((msg) => {
+    const who = msg.is_from_me ? 'AI' : (msg.sender_name || '用户');
+    const text = (msg.content || '').slice(0, 300);
+    return `${who}: ${text}`;
+  }).join('\n');
+
+  logger.info({ chatJid, transcriptLen: transcript.length }, '/recall: built transcript, calling Claude CLI');
+
+  // Try to summarize via Claude CLI
+  const summary = await summarizeWithClaude(transcript);
+  if (summary) {
+    logger.info({ chatJid, summaryLen: summary.length }, '/recall: summary generated successfully');
+    return `${header}\n\n${summary}`;
+  }
+
+  logger.warn({ chatJid }, '/recall: summary failed, falling back to raw messages');
+
+  // Fallback: raw context if CLI unavailable
+  const context = getConversationContext(targetFolder, targetAgentId, 10, 200);
+  if (!context) return `${header}\n\n📭 该对话暂无消息记录`;
+  return header + context;
+}
+
+/**
+ * Call Claude CLI (`claude --print`) to summarize a conversation transcript.
+ * Uses the same auth mechanism (OAuth / API Key) as normal agent conversations.
+ * Returns null if CLI is unavailable or call fails.
+ */
+async function summarizeWithClaude(transcript: string): Promise<string | null> {
+  const prompt = `请用简洁的中文总结以下对话的要点和进展，重点说明讨论了什么、达成了什么结论、还有什么待办事项。不要逐条翻译，而是提炼核心信息。\n\n${transcript}`;
+
+  return new Promise((resolve) => {
+    logger.info({ promptLen: prompt.length }, 'summarizeWithClaude: invoking claude CLI via stdin');
+
+    const model = process.env.RECALL_MODEL || '';
+    const args = ['--print'];
+    if (model) {
+      args.push('--model', model);
+    }
+
+    const child = execFile('claude', args, {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, CLAUDECODE: '' },
+    }, (err, stdout, stderr) => {
+      if (err) {
+        const e = err as Error & { code?: number | string };
+        logger.warn({
+          message: e.message?.slice(0, 200),
+          code: e.code,
+          stderr: stderr?.slice(0, 300),
+          stdout: stdout?.slice(0, 300),
+        }, 'summarizeWithClaude: CLI call failed');
+        resolve(null);
+        return;
+      }
+      const text = stdout.trim();
+      logger.info({ stdoutLen: text.length, stderr: stderr?.trim().slice(0, 200) || '' }, 'summarizeWithClaude: CLI returned');
+      resolve(text || null);
+    });
+
+    // Feed prompt via stdin to avoid arg length limits and special char issues
+    child.stdin?.write(prompt);
+    child.stdin?.end();
+  });
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -344,6 +871,8 @@ async function setTyping(jid: string, isTyping: boolean): Promise<void> {
 interface SendMessageOptions {
   /** Whether to forward the reply to the IM channel (Feishu/Telegram). Defaults to true for IM JIDs. */
   sendToIM?: boolean;
+  /** Pre-computed local image paths to attach to IM messages. Avoids redundant filesystem scans. */
+  localImagePaths?: string[];
 }
 
 function loadState(): void {
@@ -657,10 +1186,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  // Reply routing: IM JIDs reply to their respective IM channel.
-  // With the home-folder forced restart in the message loop, each JID gets its
-  // own processGroupMessages call, so JID-based routing is always correct.
-  const shouldReplyToIM = getChannelType(chatJid) !== null;
+  // Direct IM chats reply to themselves. Routed IM messages keep their original
+  // source_jid so workspace-bound conversations can reply back to the sender
+  // without mirroring every Web reply into IM.
+  //
+  // When messages from multiple sources (web + IM) are batched together, only
+  // route replies to IM if ALL messages came from the same IM source. If any
+  // message originated from web, the web user expects replies on web only — do
+  // not broadcast to IM (#99).
+  const directImReply = getChannelType(chatJid) !== null;
+  let replySourceImJid: string | null = null;
+  if (!directImReply) {
+    // chatJid is a web channel — check if ALL messages share the same IM source
+    const firstSourceJid = missedMessages[0]?.source_jid || chatJid;
+    const allSameImSource = getChannelType(firstSourceJid) !== null &&
+      missedMessages.every((m) => (m.source_jid || chatJid) === firstSourceJid);
+    if (allSameImSource) {
+      replySourceImJid = firstSourceJid;
+    }
+  } else {
+    // chatJid is an IM channel — reply directly
+    replySourceImJid = chatJid;
+  }
 
   const shared = isGroupShared(group.folder);
   const prompt = formatMessages(missedMessages, shared);
@@ -672,7 +1219,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     {
       group: group.name,
       messageCount: missedMessages.length,
-      shouldReplyToIM,
+      directImReply,
       imageCount: images.length,
       shared,
     },
@@ -698,6 +1245,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let sentReply = false;
   let lastError = '';
   let cursorCommitted = false;
+  let lastReplyMsgId: string | undefined;
   const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
 
@@ -748,12 +1296,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               queryTaskIds.add(taskId);
               const existing = getAgent(taskId);
               const desc = se.taskDescription || se.toolInputSummary || '';
+              const taskName = desc.slice(0, 40) || existing?.name || 'Task';
               if (!existing) {
                 createAgent({
                   id: taskId,
                   group_folder: group.folder,
                   chat_jid: chatJid,
-                  name: desc.slice(0, 40) || 'Task',
+                  name: taskName,
                   prompt: desc,
                   status: 'running',
                   kind: 'task',
@@ -765,6 +1314,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               } else if (se.taskDescription) {
                 updateAgentInfo(taskId, se.taskDescription.slice(0, 40), se.taskDescription);
               }
+              broadcastAgentStatus(chatJid, taskId, 'running', taskName, desc, undefined, 'task');
             } catch (err) {
               logger.warn({ err, toolUseId: se.toolUseId }, 'Failed to persist task_start to DB');
             }
@@ -774,6 +1324,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               const existing = getAgent(se.toolUseId);
               if (existing && existing.kind === 'task' && existing.status === 'running') {
                 updateAgentStatus(se.toolUseId, 'completed');
+                queryTaskIds.delete(existing.id);
+                broadcastAgentStatus(
+                  chatJid,
+                  existing.id,
+                  'completed',
+                  existing.name,
+                  existing.prompt,
+                  existing.result_summary || '任务已完成',
+                  'task',
+                );
               }
             } catch (err) {
               logger.warn({ err, toolUseId: se.toolUseId }, 'Failed to persist tool_use_end to DB');
@@ -811,12 +1371,35 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   completed_at: new Date().toISOString(),
                   result_summary: summary || null,
                 });
+                broadcastAgentStatus(chatJid, targetTaskId, status, 'Task', '', summary, 'task');
               } else if (existing.kind === 'task') {
                 updateAgentStatus(existing.id, status, summary);
                 queryTaskIds.delete(existing.id);
+                broadcastAgentStatus(
+                  chatJid,
+                  existing.id,
+                  status,
+                  existing.name,
+                  existing.prompt,
+                  summary,
+                  'task',
+                );
               }
             } catch (err) {
               logger.warn({ err, taskId: se.taskId }, 'Failed to persist task_notification to DB');
+            }
+          }
+
+          // Persist token usage to the latest agent message
+          if (se.eventType === 'usage' && se.usage) {
+            try {
+              updateLatestMessageTokenUsage(chatJid, JSON.stringify(se.usage), lastReplyMsgId);
+              logger.debug(
+                { chatJid, msgId: lastReplyMsgId, costUSD: se.usage.costUSD, inputTokens: se.usage.inputTokens },
+                'Token usage persisted',
+              );
+            } catch (err) {
+              logger.warn({ err, chatJid }, 'Failed to persist token usage');
             }
           }
 
@@ -839,15 +1422,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // Stop typing indicator before sending — clears the 4s refresh timer
             // so it doesn't keep firing while the agent stays alive in idle state.
             await setTyping(chatJid, false);
-            await sendMessage(chatJid, text, {
-              sendToIM: shouldReplyToIM,
+            const localImagePaths = extractLocalImImagePaths(text, effectiveGroup.folder);
+            lastReplyMsgId = await sendMessage(chatJid, text, {
+              sendToIM: directImReply,
+              localImagePaths,
             });
 
-            // Relay to IM channels bound to this workspace's main conversation
+            if (replySourceImJid && replySourceImJid !== chatJid) {
+              sendImWithFailTracking(replySourceImJid, text, localImagePaths);
+            }
+
+            // Optional mirror mode for explicitly bound IM channels
             const webJid = `web:${effectiveGroup.folder}`;
             for (const [imJid, g] of Object.entries(registeredGroups)) {
-              if (g.target_main_jid !== webJid || imJid === chatJid) continue;
-              if (getChannelType(imJid)) sendImWithFailTracking(imJid, text);
+              if (g.target_main_jid !== webJid || imJid === chatJid || imJid === replySourceImJid) continue;
+              if (g.reply_policy !== 'mirror') continue;
+              if (getChannelType(imJid)) sendImWithFailTracking(imJid, text, localImagePaths);
             }
 
             sentReply = true;
@@ -1129,6 +1719,8 @@ async function runAgent(
       queue.registerProcess(chatJid, proc, containerName, group.folder, identifier);
     };
 
+    const ownerHomeFolder = resolveOwnerHomeFolder(group);
+
     let output: ContainerOutput;
 
     if (executionMode === 'host') {
@@ -1146,6 +1738,7 @@ async function runAgent(
         },
         onProcessCb,
         wrappedOnOutput,
+        ownerHomeFolder,
       );
     } else {
       output = await runContainerAgent(
@@ -1162,6 +1755,7 @@ async function runAgent(
         },
         onProcessCb,
         wrappedOnOutput,
+        ownerHomeFolder,
       );
     }
 
@@ -1208,13 +1802,14 @@ async function sendMessage(
   jid: string,
   text: string,
   options: SendMessageOptions = {},
-): Promise<void> {
+): Promise<string | undefined> {
   const isIMChannel = getChannelType(jid) !== null;
   const sendToIM = options.sendToIM ?? isIMChannel;
   try {
     if (sendToIM && isIMChannel) {
       try {
-        await imManager.sendMessage(jid, text);
+        const localImagePaths = options.localImagePaths ?? extractLocalImImagePaths(text, resolveEffectiveFolder(jid));
+        await imManager.sendMessage(jid, text, localImagePaths);
       } catch (err) {
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
@@ -1245,8 +1840,10 @@ async function sendMessage(
     });
     logger.info({ jid, length: text.length, sendToIM }, 'Message sent');
     broadcastToWebClients(jid, text);
+    return msgId;
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
+    return undefined;
   }
 }
 
@@ -1344,6 +1941,62 @@ function startIpcWatcher(): void {
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
+              } else if (data.type === 'image' && data.chatJid && data.imageBase64) {
+                // Handle image IPC messages from send_image MCP tool
+                const targetGroup = registeredGroups[data.chatJid];
+                if (canSendCrossGroupMessage(isAdminHome, isHome, sourceGroup, sourceGroupEntry, targetGroup)) {
+                  try {
+                    const imageBuffer = Buffer.from(data.imageBase64, 'base64');
+                    const mimeType = data.mimeType || 'image/png';
+                    const caption = data.caption || undefined;
+                    const fileName = data.fileName || undefined;
+
+                    // Send to IM channel (caption is included in the image message itself)
+                    await imManager.sendImage(data.chatJid, imageBuffer, mimeType, caption, fileName);
+
+                    // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
+                    const displayText = caption
+                      ? `[图片: ${fileName || 'image'}]\n${caption}`
+                      : `[图片: ${fileName || 'image'}]`;
+                    const imgMsgId = crypto.randomUUID();
+                    const imgTimestamp = new Date().toISOString();
+                    ensureChatExists(data.chatJid);
+                    storeMessageDirect(
+                      imgMsgId,
+                      data.chatJid,
+                      'happyclaw-agent',
+                      ASSISTANT_NAME,
+                      displayText,
+                      imgTimestamp,
+                      true,
+                    );
+                    broadcastNewMessage(data.chatJid, {
+                      id: imgMsgId,
+                      chat_jid: data.chatJid,
+                      sender: 'happyclaw-agent',
+                      sender_name: ASSISTANT_NAME,
+                      content: displayText,
+                      timestamp: imgTimestamp,
+                      is_from_me: true,
+                    });
+                    broadcastToWebClients(data.chatJid, displayText);
+
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, mimeType, size: imageBuffer.length },
+                      'IPC image sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup, err },
+                      'Failed to process IPC image',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image attempt blocked',
+                  );
+                }
               }
               fs.unlinkSync(filePath);
             } catch (err) {
@@ -1415,7 +2068,7 @@ function startIpcWatcher(): void {
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
-              await processTaskIpc(data, sourceGroup, isAdminHome);
+              await processTaskIpc(data, sourceGroup, isAdminHome, isHome, sourceGroupEntry);
               fs.unlinkSync(filePath);
             } catch (err) {
               logger.error(
@@ -1486,9 +2139,14 @@ async function processTaskIpc(
     details?: Record<string, unknown>;
     priority?: 'normal' | 'important' | 'urgent';
     timestamp?: string;
+    // For send_file
+    filePath?: string;
+    fileName?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
+  isHome: boolean, // Whether source is a home container
+  sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
 ): Promise<void> {
   switch (data.type) {
     case 'schedule_task':
@@ -1856,6 +2514,46 @@ async function processTaskIpc(
       }
       break;
 
+    case 'send_file':
+      if (data.chatJid && data.filePath && data.fileName) {
+        // Cross-group authorization check (same as send_message)
+        const targetGroup = registeredGroups[data.chatJid];
+        if (!canSendCrossGroupMessage(isAdminHome, isHome, sourceGroup, sourceGroupEntry, targetGroup)) {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized IPC send_file attempt blocked',
+          );
+          break;
+        }
+
+        try {
+          // Resolve to workspace path - IPC sends relative paths from workspace/group
+          const fullPath = path.join(GROUPS_DIR, sourceGroup, data.filePath);
+
+          // Path traversal protection: ensure resolved path stays within workspace
+          const resolvedPath = path.resolve(fullPath);
+          const safeRoot = path.resolve(GROUPS_DIR, sourceGroup) + path.sep;
+          if (!resolvedPath.startsWith(safeRoot)) {
+            logger.warn(
+              { sourceGroup, filePath: data.filePath, resolvedPath },
+              'Path traversal attempt blocked in send_file IPC',
+            );
+            break;
+          }
+
+          await imManager.sendFile(data.chatJid, resolvedPath, data.fileName);
+          logger.info(
+            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName },
+            'File sent via IPC',
+          );
+        } catch (err) {
+          logger.error({ err, data }, 'Failed to send file via IPC');
+        }
+      } else {
+        logger.warn({ data }, 'Invalid send_file request - missing required fields');
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -1901,6 +2599,17 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
   const prompt = formatMessages(missedMessages, false);
   const images = collectMessageImages(virtualChatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
+  // Same mixed-source logic as processGroupMessages (#99): only route to IM
+  // when ALL messages share the same IM source.
+  let replySourceImJid: string | null = null;
+  {
+    const firstSourceJid = missedMessages[0]?.source_jid || virtualChatJid;
+    const allSameImSource = getChannelType(firstSourceJid) !== null &&
+      missedMessages.every((m) => (m.source_jid || virtualChatJid) === firstSourceJid);
+    if (allSameImSource) {
+      replySourceImJid = firstSourceJid;
+    }
+  }
 
   // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1915,6 +2624,7 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
   let cursorCommitted = false;
   let hadError = false;
   let lastError = '';
+  let lastAgentReplyMsgId: string | undefined;
   const lastProcessed = missedMessages[missedMessages.length - 1];
   const commitCursor = (): void => {
     if (cursorCommitted) return;
@@ -1938,6 +2648,15 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
     // Stream events
     if (output.status === 'stream' && output.streamEvent) {
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
+
+      // Persist token usage for agent conversations
+      if (output.streamEvent.eventType === 'usage' && output.streamEvent.usage) {
+        try {
+          updateLatestMessageTokenUsage(virtualChatJid, JSON.stringify(output.streamEvent.usage), lastAgentReplyMsgId);
+        } catch (err) {
+          logger.warn({ err, chatJid, agentId }, 'Failed to persist agent conversation token usage');
+        }
+      }
       return;
     }
 
@@ -1947,6 +2666,7 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       if (text) {
         const msgId = crypto.randomUUID();
+        lastAgentReplyMsgId = msgId;
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
         storeMessageDirect(
@@ -1962,10 +2682,16 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
           is_from_me: true,
         }, agentId);
 
-        // Send reply to linked IM channels (Feishu/Telegram groups with target_agent_id)
+        const localImagePaths = extractLocalImImagePaths(text, effectiveGroup.folder);
+        if (replySourceImJid) {
+          sendImWithFailTracking(replySourceImJid, text, localImagePaths);
+        }
+
+        // Optional mirror mode for linked IM channels
         for (const [imJid, g] of Object.entries(registeredGroups)) {
-          if (g.target_agent_id !== agentId) continue;
-          if (getChannelType(imJid)) sendImWithFailTracking(imJid, text);
+          if (g.target_agent_id !== agentId || imJid === replySourceImJid) continue;
+          if (g.reply_policy !== 'mirror') continue;
+          if (getChannelType(imJid)) sendImWithFailTracking(imJid, text, localImagePaths);
         }
 
         commitCursor();
@@ -2009,11 +2735,13 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
     const availableGroups = getAvailableGroups();
     writeGroupsSnapshot(effectiveGroup.folder, isAdminHome, availableGroups, new Set(Object.keys(registeredGroups)));
 
+    const ownerHomeFolder = resolveOwnerHomeFolder(effectiveGroup);
+
     let output: ContainerOutput;
     if (executionMode === 'host') {
-      output = await runHostAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput);
+      output = await runHostAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput, ownerHomeFolder);
     } else {
-      output = await runContainerAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput);
+      output = await runContainerAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput, ownerHomeFolder);
     }
 
     // Finalize session
@@ -2350,6 +3078,27 @@ function buildOnBotRemovedFromGroup(): (chatJid: string) => void {
   };
 }
 
+/**
+ * Build Telegram-specific bot-added-to-group handler.
+ * Auto-registers the group (via buildOnNewChat) then sends a welcome message
+ * guiding the user to bind or create a workspace.
+ */
+function buildTelegramBotAddedHandler(userId: string, homeFolder: string): (chatJid: string, chatName: string) => void {
+  const onNewChat = buildOnNewChat(userId, homeFolder);
+  return (chatJid: string, chatName: string) => {
+    onNewChat(chatJid, chatName);
+    const welcome =
+      `已加入「${chatName}」！当前绑定到默认工作区。\n\n` +
+      `/new <名称> — 新建工作区并绑定此群\n` +
+      `/bind <工作区> — 绑定到已有工作区\n` +
+      `/list — 查看所有工作区\n\n` +
+      `也可以直接发消息，我会在默认工作区回复。`;
+    imManager.sendMessage(chatJid, welcome).catch((err) =>
+      logger.warn({ chatJid, err }, 'Failed to send Telegram group welcome message'),
+    );
+  };
+}
+
 function buildIsChatAuthorized(userId: string): (jid: string) => boolean {
   return (jid) => {
     const group = registeredGroups[jid];
@@ -2441,6 +3190,16 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
 }
 
 /**
+ * Mention gating callback: when bot is NOT @mentioned in a group chat,
+ * return true to process the message anyway, false to drop it.
+ */
+function shouldProcessGroupMessage(chatJid: string): boolean {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  // require_mention defaults to true; if false → process all messages
+  return group?.require_mention === false;
+}
+
+/**
  * Connect IM channels for a specific user via imManager.
  * Reads the user's IM config and connects if enabled.
  */
@@ -2471,11 +3230,26 @@ async function connectUserIMChannels(
       onAgentMessage,
       onBotAddedToGroup,
       onBotRemovedFromGroup,
+      shouldProcessGroupMessage,
     });
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
-    telegram = await imManager.connectUserTelegram(userId, telegramConfig, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId), handleCommand, resolveGroupFolder);
+    telegram = await imManager.connectUserTelegram(
+      userId,
+      telegramConfig,
+      onNewChat,
+      buildIsChatAuthorized(userId),
+      buildOnPairAttempt(userId),
+      {
+        onCommand: handleCommand,
+        resolveGroupFolder,
+        resolveEffectiveChatJid,
+        onAgentMessage,
+        onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
+        onBotRemovedFromGroup,
+      },
+    );
   }
 
   return { feishu, telegram };
@@ -2724,6 +3498,7 @@ async function main(): Promise<void> {
         onCommand: handleCommand,
         onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
         onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+        shouldProcessGroupMessage,
       });
       if (connected) {
         syncGroupMetadata().catch((err) =>
@@ -2756,7 +3531,21 @@ async function main(): Promise<void> {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserTelegram(adminUser.id, config, onNewChat, buildIsChatAuthorized(adminUser.id), buildOnPairAttempt(adminUser.id), handleCommand);
+      const connected = await imManager.connectUserTelegram(
+        adminUser.id,
+        config,
+        onNewChat,
+        buildIsChatAuthorized(adminUser.id),
+        buildOnPairAttempt(adminUser.id),
+        {
+          onCommand: handleCommand,
+          resolveGroupFolder: (chatJid) => resolveEffectiveFolder(chatJid),
+          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+          onAgentMessage: buildOnAgentMessage(),
+          onBotAddedToGroup: buildTelegramBotAddedHandler(adminUser.id, homeFolder),
+          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+        },
+      );
       return connected;
     }
     logger.info('Telegram channel disabled via hot-reload');
@@ -2783,6 +3572,7 @@ async function main(): Promise<void> {
           onCommand: handleCommand,
           onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+          shouldProcessGroupMessage,
         });
         logger.info({ userId, connected }, 'User Feishu connection hot-reloaded');
         return connected;
@@ -2800,7 +3590,14 @@ async function main(): Promise<void> {
           onNewChat,
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
-          handleCommand,
+          {
+            onCommand: handleCommand,
+            resolveGroupFolder: (chatJid: string) => resolveEffectiveFolder(chatJid),
+            resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+            onAgentMessage: buildOnAgentMessage(),
+            onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
+            onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+          },
         );
         logger.info({ userId, connected }, 'User Telegram connection hot-reloaded');
         return connected;

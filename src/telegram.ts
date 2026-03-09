@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
 import crypto from 'crypto';
 import https from 'node:https';
 import { Agent as HttpsAgent } from 'node:https';
@@ -36,12 +36,21 @@ export interface TelegramConnectOpts {
   onCommand?: (chatJid: string, command: string) => Promise<string | null>;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (jid: string) => string | undefined;
+  /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
+  resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string | null } | null;
+  /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
+  onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** Bot 被添加到群聊时调用（仅 group/supergroup） */
+  onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+  /** Bot 被移出群聊或群被解散时调用 */
+  onBotRemovedFromGroup?: (chatJid: string) => void;
 }
 
 export interface TelegramConnection {
   connect(opts: TelegramConnectOpts): Promise<void>;
   disconnect(): Promise<void>;
-  sendMessage(chatId: string, text: string): Promise<void>;
+  sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void>;
+  sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
   isConnected(): boolean;
 }
@@ -398,16 +407,28 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
           updateChatName(jid, chatName);
           opts.onNewChat(jid, chatName);
 
-          // ── /clear 指令：重置上下文，不进入消息流 ──
-          // Match /clear and /clear@BotUsername (Telegram appends @bot in group chats)
-          if (/^\/clear(?:@\S+)?$/i.test(text.trim()) && opts.onCommand) {
+          // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
+          // Telegram 群聊中会追加 @BotUsername，需要去掉
+          const tgSlashMatch = text.trim().match(/^\/(\S+?)(?:@\S+)?(?:\s+(.*))?$/i);
+          if (tgSlashMatch && opts.onCommand) {
+            const cmdBody = (tgSlashMatch[1] + (tgSlashMatch[2] ? ' ' + tgSlashMatch[2] : '')).trim();
+            logger.info({ jid, cmd: tgSlashMatch[1], cmdBody }, 'Telegram slash command detected');
             try {
-              const reply = await opts.onCommand(jid, 'clear');
-              if (reply) await ctx.reply(reply);
+              const reply = await opts.onCommand(jid, cmdBody);
+              if (reply) {
+                await ctx.reply(reply);
+                return; // 已知命令，拦截
+              }
+              // reply 为 null 表示未知命令，继续作为普通消息处理
             } catch (err) {
-              logger.error({ jid, err }, 'Telegram /clear command failed');
+              logger.error({ jid, cmd: tgSlashMatch[1], err }, 'Telegram slash command failed');
+              try {
+                await ctx.reply('⚠️ 命令执行失败，请稍后重试');
+              } catch (sendErr) {
+                logger.error({ jid, sendErr }, 'Failed to send slash command error feedback');
+              }
+              return;
             }
-            return;
           }
 
           // Reaction 确认
@@ -417,27 +438,36 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
             logger.debug({ err, msgId }, 'Failed to add Telegram reaction');
           }
 
+          // 解析绑定路由
+          const agentRouting = opts.resolveEffectiveChatJid?.(jid);
+          const targetJid = agentRouting?.effectiveJid ?? jid;
+
           // 存储消息
           const id = crypto.randomUUID();
           const timestamp = new Date(ctx.message.date * 1000).toISOString();
           const senderId = ctx.from?.id ? `tg:${ctx.from.id}` : 'tg:unknown';
-          storeMessageDirect(id, jid, senderId, senderName, text, timestamp, false);
+          storeChatMetadata(targetJid, timestamp);
+          storeMessageDirect(id, targetJid, senderId, senderName, text, timestamp, false, undefined, undefined, jid);
 
           // 广播到 Web 客户端
-          broadcastNewMessage(jid, {
+          broadcastNewMessage(targetJid, {
             id,
-            chat_jid: jid,
+            chat_jid: targetJid,
+            source_jid: jid,
             sender: senderId,
             sender_name: senderName,
             content: text,
             timestamp,
             is_from_me: false,
-          });
+          }, agentRouting?.agentId ?? undefined);
 
-          logger.info(
-            { jid, sender: senderName, msgId },
-            'Telegram message stored',
-          );
+          // 触发 agent 处理
+          if (agentRouting?.agentId) {
+            opts.onAgentMessage?.(jid, agentRouting.agentId);
+            logger.info({ jid, effectiveJid: targetJid, agentId: agentRouting.agentId, sender: senderName, msgId }, 'Telegram message routed to conversation agent');
+          } else {
+            logger.info({ jid, sender: senderName, msgId, routed: !!agentRouting }, 'Telegram message stored');
+          }
         } catch (err) {
           logger.error({ err }, 'Error handling Telegram message');
         }
@@ -475,12 +505,40 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
           const imageData = await downloadTelegramPhotoAsBase64(photo.file_id, photo.file_size);
 
           let attachmentsJson: string | undefined;
+          let imgMarker = '[图片]';
+
           if (imageData) {
             attachmentsJson = JSON.stringify([{ type: 'image', data: imageData.base64, mimeType: imageData.mimeType }]);
+
+            // 存盘：与飞书图片处理逻辑对齐，agent 可通过路径直接操作文件
+            const groupFolder = opts.resolveGroupFolder?.(jid);
+            if (groupFolder) {
+              const extMap: Record<string, string> = {
+                'image/jpeg': '.jpg',
+                'image/png': '.png',
+                'image/gif': '.gif',
+                'image/webp': '.webp',
+                'image/bmp': '.bmp',
+                'image/tiff': '.tiff',
+              };
+              const ext = extMap[imageData.mimeType] ?? '.jpg';
+              const fileName = `telegram_img_${photo.file_id.slice(-8)}${ext}`;
+              try {
+                const relPath = await saveDownloadedFile(
+                  groupFolder,
+                  'telegram',
+                  fileName,
+                  Buffer.from(imageData.base64, 'base64'),
+                );
+                if (relPath) imgMarker = `[图片: ${relPath}]`;
+              } catch (err) {
+                logger.warn({ err, fileId: photo.file_id }, 'Failed to save Telegram photo to disk');
+              }
+            }
           }
 
           const caption = ctx.message.caption;
-          const text = caption ? `[图片]\n${caption}` : '[图片]';
+          const text = caption ? `${imgMarker}\n${caption}` : imgMarker;
 
           try {
             await ctx.react('👀');
@@ -488,23 +546,33 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
             logger.debug({ err, msgId }, 'Failed to add Telegram reaction');
           }
 
+          // 解析绑定路由
+          const agentRouting = opts.resolveEffectiveChatJid?.(jid);
+          const targetJid = agentRouting?.effectiveJid ?? jid;
+
           const id = crypto.randomUUID();
           const timestamp = new Date(ctx.message.date * 1000).toISOString();
           const senderId = ctx.from?.id ? `tg:${ctx.from.id}` : 'tg:unknown';
-          storeMessageDirect(id, jid, senderId, senderName, text, timestamp, false, attachmentsJson);
+          storeChatMetadata(targetJid, timestamp);
+          storeMessageDirect(id, targetJid, senderId, senderName, text, timestamp, false, attachmentsJson, undefined, jid);
 
-          broadcastNewMessage(jid, {
+          broadcastNewMessage(targetJid, {
             id,
-            chat_jid: jid,
+            chat_jid: targetJid,
+            source_jid: jid,
             sender: senderId,
             sender_name: senderName,
             content: text,
             timestamp,
             attachments: attachmentsJson,
             is_from_me: false,
-          });
+          }, agentRouting?.agentId ?? undefined);
 
-          logger.info({ jid, sender: senderName, msgId }, 'Telegram photo stored');
+          if (agentRouting?.agentId) {
+            opts.onAgentMessage?.(jid, agentRouting.agentId);
+          }
+
+          logger.info({ jid, sender: senderName, msgId, routed: !!agentRouting }, 'Telegram photo stored');
         } catch (err) {
           logger.error({ err }, 'Error handling Telegram photo');
         }
@@ -540,15 +608,17 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
 
           // file_size 超过上限时跳过下载
           if (doc.file_size !== undefined && doc.file_size > MAX_FILE_SIZE) {
+            const earlyRouting = opts.resolveEffectiveChatJid?.(jid);
+            const earlyTargetJid = earlyRouting?.effectiveJid ?? jid;
             const text = `[文件过大，未下载: ${originalFilename}]`;
             const id = crypto.randomUUID();
             const timestamp = new Date(ctx.message.date * 1000).toISOString();
             const senderId = ctx.from?.id ? `tg:${ctx.from.id}` : 'tg:unknown';
-            storeMessageDirect(id, jid, senderId, senderName, text, timestamp, false);
-            broadcastNewMessage(jid, {
-              id, chat_jid: jid, sender: senderId, sender_name: senderName,
+            storeMessageDirect(id, earlyTargetJid, senderId, senderName, text, timestamp, false, undefined, undefined, jid);
+            broadcastNewMessage(earlyTargetJid, {
+              id, chat_jid: earlyTargetJid, source_jid: jid, sender: senderId, sender_name: senderName,
               content: text, timestamp, is_from_me: false,
-            });
+            }, earlyRouting?.agentId ?? undefined);
             return;
           }
 
@@ -576,24 +646,64 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
             logger.debug({ err, msgId }, 'Failed to add Telegram reaction');
           }
 
+          // 解析绑定路由
+          const agentRouting = opts.resolveEffectiveChatJid?.(jid);
+          const targetJid = agentRouting?.effectiveJid ?? jid;
+
           const id = crypto.randomUUID();
           const timestamp = new Date(ctx.message.date * 1000).toISOString();
           const senderId = ctx.from?.id ? `tg:${ctx.from.id}` : 'tg:unknown';
-          storeMessageDirect(id, jid, senderId, senderName, text, timestamp, false);
+          storeChatMetadata(targetJid, timestamp);
+          storeMessageDirect(id, targetJid, senderId, senderName, text, timestamp, false, undefined, undefined, jid);
 
-          broadcastNewMessage(jid, {
+          broadcastNewMessage(targetJid, {
             id,
-            chat_jid: jid,
+            chat_jid: targetJid,
+            source_jid: jid,
             sender: senderId,
             sender_name: senderName,
             content: text,
             timestamp,
             is_from_me: false,
-          });
+          }, agentRouting?.agentId ?? undefined);
 
-          logger.info({ jid, sender: senderName, msgId }, 'Telegram document stored');
+          if (agentRouting?.agentId) {
+            opts.onAgentMessage?.(jid, agentRouting.agentId);
+          }
+
+          logger.info({ jid, sender: senderName, msgId, routed: !!agentRouting }, 'Telegram document stored');
         } catch (err) {
           logger.error({ err }, 'Error handling Telegram document');
+        }
+      });
+
+      // ── my_chat_member: Bot 加入/离开群聊检测 ──
+      bot.on('my_chat_member', async (ctx) => {
+        try {
+          const update = ctx.myChatMember;
+          const chatType = update.chat.type;
+          // 仅处理群聊；私聊走 /start + /pair 流程
+          if (chatType !== 'group' && chatType !== 'supergroup') return;
+
+          const chatId = String(update.chat.id);
+          const jid = `telegram:${chatId}`;
+          const chatName = update.chat.title || `Telegram ${chatId}`;
+          const newStatus = update.new_chat_member.status;
+          const oldStatus = update.old_chat_member.status;
+
+          if ((oldStatus === 'left' || oldStatus === 'kicked') &&
+              (newStatus === 'member' || newStatus === 'administrator')) {
+            logger.info({ jid, chatName, newStatus }, 'Telegram bot added to group');
+            opts.onBotAddedToGroup?.(jid, chatName);
+          }
+
+          if ((oldStatus === 'member' || oldStatus === 'administrator') &&
+              (newStatus === 'left' || newStatus === 'kicked')) {
+            logger.info({ jid, chatName, newStatus }, 'Telegram bot removed from group');
+            opts.onBotRemovedFromGroup?.(jid);
+          }
+        } catch (err) {
+          logger.error({ err }, 'Error handling Telegram my_chat_member update');
         }
       });
 
@@ -601,6 +711,7 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
         if (!bot || stopping) return;
         pollingPromise = bot
           .start({
+            allowed_updates: ['message', 'edited_message', 'my_chat_member'],
             onStart: () => {
               logger.info('Telegram bot started');
               if (!readyFired) {
@@ -656,7 +767,7 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void> {
       if (!bot) {
         logger.warn(
           { chatId },
@@ -686,9 +797,75 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
           }
         }
 
+        for (const localImagePath of localImagePaths || []) {
+          try {
+            await bot.api.sendPhoto(chatIdNum, new InputFile(localImagePath));
+          } catch (imageErr) {
+            logger.warn({ chatId, localImagePath, err: imageErr }, 'Failed to send Telegram image attachment');
+          }
+        }
+
         logger.info({ chatId }, 'Telegram message sent');
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Telegram message');
+        throw err;
+      }
+    },
+
+    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+      if (!bot) {
+        logger.warn({ chatId }, 'Telegram bot not initialized, skip sending image');
+        return;
+      }
+
+      const chatIdNum = Number(chatId);
+      if (isNaN(chatIdNum)) {
+        logger.error({ chatId }, 'Invalid Telegram chat ID for image');
+        return;
+      }
+
+      try {
+        // Determine file extension from MIME type
+        const extMap: Record<string, string> = {
+          'image/png': '.png',
+          'image/jpeg': '.jpg',
+          'image/gif': '.gif',
+          'image/webp': '.webp',
+          'image/bmp': '.bmp',
+          'image/tiff': '.tiff',
+        };
+        const ext = extMap[mimeType] || '.png';
+        const effectiveFileName = fileName || `image${ext}`;
+
+        const inputFile = new InputFile(imageBuffer, effectiveFileName);
+
+        // Telegram caption limit is 1024 characters; truncate to avoid API errors
+        const CAPTION_MAX = 1024;
+        const safeCaption = caption && caption.length > CAPTION_MAX
+          ? caption.slice(0, CAPTION_MAX - 3) + '...'
+          : (caption || undefined);
+
+        // GIF → sendAnimation (preserves animation); JPEG/PNG/WebP → sendPhoto; others → sendDocument
+        const isGif = mimeType === 'image/gif';
+        const isPhoto = ['image/png', 'image/jpeg', 'image/webp'].includes(mimeType);
+
+        if (isGif) {
+          await bot.api.sendAnimation(chatIdNum, inputFile, {
+            caption: safeCaption,
+          });
+        } else if (isPhoto) {
+          await bot.api.sendPhoto(chatIdNum, inputFile, {
+            caption: safeCaption,
+          });
+        } else {
+          await bot.api.sendDocument(chatIdNum, inputFile, {
+            caption: safeCaption,
+          });
+        }
+
+        logger.info({ chatId, mimeType, size: imageBuffer.length, fileName: effectiveFileName }, 'Telegram image sent');
+      } catch (err) {
+        logger.error({ err, chatId, mimeType }, 'Failed to send Telegram image');
         throw err;
       }
     },
@@ -745,6 +922,7 @@ export async function connectTelegram(
 export async function sendTelegramMessage(
   chatId: string,
   text: string,
+  localImagePaths?: string[],
 ): Promise<void> {
   if (!_defaultInstance) {
     logger.warn(
@@ -753,7 +931,7 @@ export async function sendTelegramMessage(
     );
     return;
   }
-  return _defaultInstance.sendMessage(chatId, text);
+  return _defaultInstance.sendMessage(chatId, text, localImagePaths);
 }
 
 /**

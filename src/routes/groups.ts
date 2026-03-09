@@ -46,6 +46,11 @@ import {
   listAgentsByJid,
   getGroupsByTargetAgent,
   getGroupsByTargetMainJid,
+  getMessage,
+  deleteMessage,
+  getUserPinnedGroups,
+  pinGroup,
+  unpinGroup,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -147,6 +152,7 @@ interface GroupPayloadItem {
   member_role?: 'owner' | 'member';
   member_count?: number;
   selected_skills?: string[] | null;
+  pinned_at?: string;
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -198,6 +204,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     }
   }
 
+  // Fetch user's pinned groups
+  const pins = getUserPinnedGroups(user.id);
+
   // Cache member info per folder (avoid repeated queries)
   const memberCache = new Map<string, { count: number; role: 'owner' | 'member' | null }>();
   function getMemberInfo(folder: string) {
@@ -239,6 +248,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,
       selected_skills: group.selected_skills ?? null,
+      pinned_at: pins[jid] || undefined,
     };
   }
 
@@ -266,8 +276,10 @@ function removeFlowArtifacts(folder: string): void {
   deleteContainerEnvConfig(folder);
 }
 
-function clearSessionJsonlFiles(folder: string): void {
-  const claudeDir = path.join(DATA_DIR, 'sessions', folder, '.claude');
+function clearSessionJsonlFiles(folder: string, agentId?: string): void {
+  const claudeDir = agentId
+    ? path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude')
+    : path.join(DATA_DIR, 'sessions', folder, '.claude');
   if (!fs.existsSync(claudeDir)) return;
 
   // 保留 settings.json，清除所有其他运行时文件和目录
@@ -603,21 +615,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   if (!existing) return c.json({ error: 'Group not found' }, 404);
 
   const authUser = c.get('user') as AuthUser;
-  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, existing)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  // Non-web JIDs (feishu/telegram) cannot be renamed by non-admin
-  if (!jid.startsWith('web:') && authUser.role !== 'admin') {
-    return c.json({ error: 'This group cannot be edited' }, 403);
-  }
-
-  if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
-    return c.json(
-      { error: 'Insufficient permissions for host execution mode' },
-      403,
-    );
-  }
 
   const body = await c.req.json().catch(() => ({}));
   const validation = GroupPatchSchema.safeParse(body);
@@ -628,31 +625,61 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  const { name: rawName, selected_skills } = validation.data;
+  const { name: rawName, selected_skills, is_pinned } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
   // 至少需要提供一个字段
-  if (!name && selected_skills === undefined) {
+  if (!name && selected_skills === undefined && is_pinned === undefined) {
     return c.json({ error: 'No fields to update' }, 400);
   }
 
-  const updated: RegisteredGroup = {
-    name: name || existing.name,
-    folder: existing.folder,
-    added_at: existing.added_at,
-    containerConfig: existing.containerConfig,
-    executionMode: existing.executionMode,
-    customCwd: existing.customCwd,
-    created_by: existing.created_by,
-    is_home: existing.is_home,
-    selected_skills: selected_skills !== undefined ? (selected_skills ?? null) : existing.selected_skills,
-  };
+  // Pin/unpin only requires canAccessGroup (it's a per-user preference)
+  const isPinOnly = is_pinned !== undefined && !name && selected_skills === undefined;
+  if (isPinOnly) {
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+  } else {
+    // Name/skills changes require canModifyGroup (owner only)
+    if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (!jid.startsWith('web:') && authUser.role !== 'admin') {
+      return c.json({ error: 'This group cannot be edited' }, 403);
+    }
+    if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
+      return c.json({ error: 'Insufficient permissions for host execution mode' }, 403);
+    }
+  }
 
-  setRegisteredGroup(jid, updated);
-  if (name) updateChatName(jid, name);
-  deps.getRegisteredGroups()[jid] = updated;
+  // Handle pin/unpin (per-user, separate table)
+  let pinned_at: string | undefined;
+  if (is_pinned === true) {
+    pinned_at = pinGroup(authUser.id, jid);
+  } else if (is_pinned === false) {
+    unpinGroup(authUser.id, jid);
+  }
 
-  return c.json({ success: true });
+  // Update registered group if name or skills changed
+  if (name || selected_skills !== undefined) {
+    const updated: RegisteredGroup = {
+      name: name || existing.name,
+      folder: existing.folder,
+      added_at: existing.added_at,
+      containerConfig: existing.containerConfig,
+      executionMode: existing.executionMode,
+      customCwd: existing.customCwd,
+      created_by: existing.created_by,
+      is_home: existing.is_home,
+      selected_skills: selected_skills !== undefined ? (selected_skills ?? null) : existing.selected_skills,
+    };
+
+    setRegisteredGroup(jid, updated);
+    if (name) updateChatName(jid, name);
+    deps.getRegisteredGroups()[jid] = updated;
+  }
+
+  return c.json({ success: true, pinned_at });
 });
 
 // DELETE /api/groups/:jid - 删除群组
@@ -801,6 +828,7 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
 });
 
 // POST /api/groups/:jid/reset-session - 重置会话上下文
+// Optional body: { agentId?: string } — when provided, only reset that agent's session
 groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const deps = getWebDeps();
   if (!deps) return c.json({ error: 'Server not initialized' }, 500);
@@ -819,16 +847,37 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // Collect all JIDs sharing the same folder (e.g., web:main + feishu groups)
-  const siblingJids = getJidsByFolder(group.folder);
-
-  // 1. Stop ALL running processes for this folder FIRST and WAIT for them to finish
-  //    to prevent any process from writing session files during cleanup
+  // Read optional agentId from request body
+  let agentId: string | undefined;
   try {
-    await Promise.all(siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })));
+    const body = await c.req.json().catch(() => ({}));
+    if (body && typeof body.agentId === 'string' && body.agentId) {
+      agentId = body.agentId;
+    }
+  } catch { /* no body or invalid JSON — treat as main session reset */ }
+
+  // Validate agentId belongs to this group
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== jid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+  }
+
+  // 1. Stop running processes
+  try {
+    if (agentId) {
+      // Agent-specific: only stop the agent's virtual JID process
+      const virtualJid = `${jid}#agent:${agentId}`;
+      await deps.queue.stopGroup(virtualJid, { force: true });
+    } else {
+      // Main session: stop ALL processes for this folder
+      const siblingJids = getJidsByFolder(group.folder);
+      await Promise.all(siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })));
+    }
   } catch (err) {
     logger.error(
-      { jid, siblingJids, err },
+      { jid, agentId, err },
       'Failed to stop containers before resetting session',
     );
     return c.json(
@@ -838,12 +887,11 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   }
 
   // 2. Delete session JSONL files so Claude starts fresh.
-  // Do this before touching DB state to reduce partial-reset failure cases.
   try {
-    clearSessionJsonlFiles(group.folder);
+    clearSessionJsonlFiles(group.folder, agentId);
   } catch (err) {
     logger.error(
-      { jid, folder: group.folder, err },
+      { jid, folder: group.folder, agentId, err },
       'Failed to clear session files during reset',
     );
     return c.json(
@@ -852,13 +900,15 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // 3. Delete session from DB and in-memory cache.
+  // 3. Delete session from DB (and in-memory cache for main session).
   try {
-    deleteSession(group.folder);
-    delete deps.getSessions()[group.folder];
+    deleteSession(group.folder, agentId);
+    if (!agentId) {
+      delete deps.getSessions()[group.folder];
+    }
   } catch (err) {
     logger.error(
-      { jid, folder: group.folder, err },
+      { jid, folder: group.folder, agentId, err },
       'Failed to clear session state during reset',
     );
     return c.json(
@@ -867,14 +917,15 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // 4. Insert system divider message (best-effort).
+  // 4. Insert system divider message into the correct JID (best-effort).
+  const targetJid = agentId ? `${jid}#agent:${agentId}` : jid;
   const dividerMessageId = crypto.randomUUID();
   const timestamp = new Date().toISOString();
   try {
-    ensureChatExists(jid);
+    ensureChatExists(targetJid);
     storeMessageDirect(
       dividerMessageId,
-      jid,
+      targetJid,
       '__system__',
       'system',
       'context_reset',
@@ -882,9 +933,9 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
       true,
     );
 
-    broadcastNewMessage(jid, {
+    broadcastNewMessage(targetJid, {
       id: dividerMessageId,
-      chat_jid: jid,
+      chat_jid: targetJid,
       sender: '__system__',
       sender_name: 'system',
       content: 'context_reset',
@@ -893,14 +944,27 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     });
   } catch (err) {
     logger.warn(
-      { jid, err },
+      { jid, agentId, err },
       'Session reset succeeded but failed to append divider message',
     );
   }
 
+  // 5. Advance lastAgentTimestamp so old messages before the reset are not
+  //    re-sent to the next fresh agent session.
+  if (agentId) {
+    const virtualJid = `${jid}#agent:${agentId}`;
+    deps.setLastAgentTimestamp(virtualJid, { timestamp, id: dividerMessageId });
+  } else {
+    // Main session: advance cursor for ALL sibling JIDs sharing this folder.
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const siblingJid of siblingJids) {
+      deps.setLastAgentTimestamp(siblingJid, { timestamp, id: dividerMessageId });
+    }
+  }
+
   logger.info(
-    { jid, folder: group.folder, siblingJids },
-    'Session reset: cleared session files and stopped all containers for folder',
+    { jid, folder: group.folder, agentId },
+    'Session reset: cleared session files and stopped containers',
   );
 
   return c.json({ success: true, dividerMessageId });
@@ -1066,6 +1130,41 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   return c.json({ messages, hasMore });
 });
 
+// DELETE /api/groups/:jid/messages/:messageId - 删除单条消息
+groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const messageId = c.req.param('messageId');
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  // Ownership check: admin can delete any message, non-admin can only delete their own
+  const msg = getMessage(jid, messageId);
+  if (!msg) {
+    return c.json({ error: 'Message not found' }, 404);
+  }
+  if (authUser.role !== 'admin') {
+    // AI messages (is_from_me=1) cannot be deleted by non-admin
+    // User messages can only be deleted by the sender
+    if (msg.is_from_me === 1 || (msg.sender && msg.sender !== authUser.id)) {
+      return c.json({ error: 'Permission denied' }, 403);
+    }
+  }
+
+  const deleted = deleteMessage(jid, messageId);
+  if (!deleted) {
+    return c.json({ error: 'Message not found' }, 404);
+  }
+
+  return c.json({ success: true });
+});
+
 // GET /api/groups/:jid/env - 获取容器环境变量配置
 groupRoutes.get('/:jid/env', authMiddleware, (c) => {
   const jid = c.req.param('jid');
@@ -1169,6 +1268,8 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     updated.anthropicApiKey = data.anthropicApiKey;
   if (data.claudeCodeOauthToken !== undefined)
     updated.claudeCodeOauthToken = data.claudeCodeOauthToken;
+  if (data.happyclawModel !== undefined)
+    updated.happyclawModel = data.happyclawModel;
   if (data.customEnv !== undefined) updated.customEnv = data.customEnv;
 
   try {
@@ -1314,6 +1415,36 @@ groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
 
   const members = getGroupMembers(group.folder);
   return c.json({ success: true, members });
+});
+
+// ─── Permission Mode (Code / Plan mode switching) ────────────────
+
+const VALID_PERMISSION_MODES = ['bypassPermissions', 'plan'];
+
+groupRoutes.put('/:jid/mode', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const jid = decodeURIComponent(c.req.param('jid'));
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Not authorized' }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const mode = (body as { mode?: string }).mode;
+
+  if (!mode || !VALID_PERMISSION_MODES.includes(mode)) {
+    return c.json({ error: `Invalid mode. Must be one of: ${VALID_PERMISSION_MODES.join(', ')}` }, 400);
+  }
+
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const sent = deps.queue.setPermissionMode(jid, mode);
+  return c.json({ success: true, mode, applied: sent });
 });
 
 export default groupRoutes;

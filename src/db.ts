@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
+import { logger } from './logger.js';
 import {
   AgentKind,
   AgentStatus,
@@ -100,12 +101,14 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT,
       chat_jid TEXT,
+      source_jid TEXT,
       sender TEXT,
       sender_name TEXT,
       content TEXT,
       timestamp TEXT,
       is_from_me INTEGER,
       attachments TEXT,
+      token_usage TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -248,6 +251,16 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
   `);
 
+  // User pinned groups (per-user workspace pinning)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_pinned_groups (
+      user_id TEXT NOT NULL,
+      jid TEXT NOT NULL,
+      pinned_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, jid)
+    );
+  `);
+
   // Sub-agents table for multi-agent parallel execution
   db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
@@ -282,6 +295,7 @@ export function initDatabase(): void {
   ensureColumn('registered_groups', 'init_source_path', 'TEXT');
   ensureColumn('registered_groups', 'init_git_url', 'TEXT');
   ensureColumn('messages', 'attachments', 'TEXT');
+  ensureColumn('messages', 'source_jid', 'TEXT');
   ensureColumn('registered_groups', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'is_home', 'INTEGER DEFAULT 0');
   ensureColumn('users', 'ai_name', 'TEXT');
@@ -296,6 +310,9 @@ export function initDatabase(): void {
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
   ensureColumn('registered_groups', 'target_agent_id', 'TEXT');
   ensureColumn('registered_groups', 'target_main_jid', 'TEXT');
+  ensureColumn('registered_groups', 'reply_policy', "TEXT DEFAULT 'source_only'");
+  ensureColumn('registered_groups', 'require_mention', 'INTEGER DEFAULT 1');
+  ensureColumn('messages', 'token_usage', 'TEXT');
 
   // Add index on target_agent_id for fast lookup of IM bindings
   db.exec('CREATE INDEX IF NOT EXISTS idx_rg_target_agent ON registered_groups(target_agent_id)');
@@ -337,15 +354,19 @@ export function initDatabase(): void {
     })();
   }
 
+  // v19→v20 migration: add token_usage column to messages
+  ensureColumn('messages', 'token_usage', 'TEXT');
   assertSchema('messages', [
     'id',
     'chat_jid',
+    'source_jid',
     'sender',
     'sender_name',
     'content',
     'timestamp',
     'is_from_me',
     'attachments',
+    'token_usage',
   ]);
   assertSchema('scheduled_tasks', [
     'id',
@@ -379,6 +400,7 @@ export function initDatabase(): void {
       'selected_skills',
       'target_agent_id',
       'target_main_jid',
+      'reply_policy',
     ],
     ['trigger_pattern', 'requires_trigger'],
   );
@@ -524,7 +546,7 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '19';
+  const SCHEMA_VERSION = '21';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -639,19 +661,238 @@ export function storeMessageDirect(
   timestamp: string,
   isFromMe: boolean,
   attachments?: string,
+  tokenUsage?: string,
+  sourceJid?: string,
 ): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msgId,
     chatJid,
+    sourceJid ?? chatJid,
     sender,
     senderName,
     content,
     timestamp,
     isFromMe ? 1 : 0,
     attachments ?? null,
+    tokenUsage ?? null,
   );
+}
+
+/**
+ * Update the token_usage field on a specific agent message, or fall back to
+ * the most recent agent message without token_usage for the given chat.
+ * When msgId is provided, uses precise `WHERE id = ? AND chat_jid = ?` match
+ * to avoid race conditions in concurrent scenarios.
+ */
+export function updateLatestMessageTokenUsage(
+  chatJid: string,
+  tokenUsage: string,
+  msgId?: string,
+): void {
+  if (msgId) {
+    db.prepare(
+      `UPDATE messages SET token_usage = ? WHERE id = ? AND chat_jid = ?`,
+    ).run(tokenUsage, msgId, chatJid);
+  } else {
+    db.prepare(
+      `UPDATE messages SET token_usage = ?
+       WHERE rowid = (
+         SELECT rowid FROM messages
+         WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
+         ORDER BY timestamp DESC LIMIT 1
+       )`,
+    ).run(tokenUsage, chatJid);
+  }
+}
+
+/**
+ * Get token usage statistics aggregated by date.
+ */
+export function getTokenUsageStats(
+  days: number,
+  chatJids?: string[],
+): Array<{
+  date: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
+  message_count: number;
+}> {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  const sinceStr = since.toISOString();
+
+  const jidFilter = chatJids && chatJids.length > 0
+    ? `AND m.chat_jid IN (${chatJids.map(() => '?').join(',')})`
+    : '';
+  const params: unknown[] = [sinceStr, ...(chatJids || [])];
+
+  const baseQuery = `
+    SELECT
+      date(m.timestamp) as date,
+      json_extract(m.token_usage, '$.modelUsage') as model_usage_json,
+      json_extract(m.token_usage, '$.inputTokens') as input_tokens,
+      json_extract(m.token_usage, '$.outputTokens') as output_tokens,
+      json_extract(m.token_usage, '$.cacheReadInputTokens') as cache_read_tokens,
+      json_extract(m.token_usage, '$.cacheCreationInputTokens') as cache_creation_tokens,
+      json_extract(m.token_usage, '$.costUSD') as cost_usd
+    FROM messages m
+    WHERE m.token_usage IS NOT NULL
+      AND m.timestamp >= ?
+      ${jidFilter}
+    ORDER BY m.timestamp ASC
+  `;
+
+  const rows = db.prepare(baseQuery).all(...params) as Array<{
+    date: string;
+    model_usage_json: string | null;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    cost_usd: number;
+  }>;
+
+  // Aggregate by date + model
+  type AggregatedEntry = {
+    date: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    cost_usd: number;
+    message_count: number;
+  };
+  const aggregated = new Map<string, AggregatedEntry>();
+
+  function addToAggregated(
+    date: string,
+    model: string,
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens: number,
+    cacheCreationTokens: number,
+    costUsd: number,
+  ): void {
+    const key = `${date}|${model}`;
+    const existing = aggregated.get(key);
+    if (existing) {
+      existing.input_tokens += inputTokens;
+      existing.output_tokens += outputTokens;
+      existing.cache_read_tokens += cacheReadTokens;
+      existing.cache_creation_tokens += cacheCreationTokens;
+      existing.cost_usd += costUsd;
+      existing.message_count += 1;
+    } else {
+      aggregated.set(key, {
+        date,
+        model,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_tokens: cacheReadTokens,
+        cache_creation_tokens: cacheCreationTokens,
+        cost_usd: costUsd,
+        message_count: 1,
+      });
+    }
+  }
+
+  for (const row of rows) {
+    if (row.model_usage_json) {
+      try {
+        const modelUsage = JSON.parse(row.model_usage_json) as Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+        for (const [model, usage] of Object.entries(modelUsage)) {
+          addToAggregated(
+            row.date, model,
+            usage.inputTokens || 0, usage.outputTokens || 0,
+            0, 0,
+            usage.costUSD || 0,
+          );
+        }
+      } catch (e) {
+        logger.warn({ date: row.date, error: e }, 'Failed to parse model_usage_json');
+        // fallback: use aggregate fields
+        addToAggregated(
+          row.date, 'unknown',
+          row.input_tokens || 0, row.output_tokens || 0,
+          row.cache_read_tokens || 0, row.cache_creation_tokens || 0,
+          row.cost_usd || 0,
+        );
+      }
+    } else {
+      addToAggregated(
+        row.date, 'unknown',
+        row.input_tokens || 0, row.output_tokens || 0,
+        row.cache_read_tokens || 0, row.cache_creation_tokens || 0,
+        row.cost_usd || 0,
+      );
+    }
+  }
+
+  return Array.from(aggregated.values());
+}
+
+/**
+ * Get token usage summary totals.
+ */
+export function getTokenUsageSummary(
+  days: number,
+  chatJids?: string[],
+): {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheCreationTokens: number;
+  totalCostUSD: number;
+  totalMessages: number;
+  totalActiveDays: number;
+} {
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  const sinceStr = since.toISOString();
+
+  const jidFilter = chatJids && chatJids.length > 0
+    ? `AND chat_jid IN (${chatJids.map(() => '?').join(',')})`
+    : '';
+  const params: unknown[] = [sinceStr, ...(chatJids || [])];
+
+  const row = db.prepare(`
+    SELECT
+      COALESCE(SUM(json_extract(token_usage, '$.inputTokens')), 0) as total_input,
+      COALESCE(SUM(json_extract(token_usage, '$.outputTokens')), 0) as total_output,
+      COALESCE(SUM(json_extract(token_usage, '$.cacheReadInputTokens')), 0) as total_cache_read,
+      COALESCE(SUM(json_extract(token_usage, '$.cacheCreationInputTokens')), 0) as total_cache_creation,
+      COALESCE(SUM(json_extract(token_usage, '$.costUSD')), 0) as total_cost,
+      COUNT(*) as total_messages,
+      COUNT(DISTINCT date(timestamp)) as total_active_days
+    FROM messages
+    WHERE token_usage IS NOT NULL AND timestamp >= ?
+      ${jidFilter}
+  `).get(...params) as {
+    total_input: number;
+    total_output: number;
+    total_cache_read: number;
+    total_cache_creation: number;
+    total_cost: number;
+    total_messages: number;
+    total_active_days: number;
+  };
+
+  return {
+    totalInputTokens: row.total_input,
+    totalOutputTokens: row.total_output,
+    totalCacheReadTokens: row.total_cache_read,
+    totalCacheCreationTokens: row.total_cache_creation,
+    totalCostUSD: row.total_cost,
+    totalMessages: row.total_messages,
+    totalActiveDays: row.total_active_days,
+  };
 }
 
 export function getNewMessages(
@@ -663,7 +904,7 @@ export function getNewMessages(
   const placeholders = jids.map(() => '?').join(',');
   // Filter out assistant outputs.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, attachments
+    SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
     FROM messages
     WHERE
       (timestamp > ? OR (timestamp = ? AND id > ?))
@@ -690,7 +931,7 @@ export function getMessagesSince(
 ): NewMessage[] {
   // Filter out assistant outputs.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, attachments
+    SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
     FROM messages
     WHERE
       chat_jid = ?
@@ -964,6 +1205,8 @@ type RegisteredGroupRow = {
   selected_skills: string | null;
   target_agent_id: string | null;
   target_main_jid: string | null;
+  reply_policy: string | null;
+  require_mention: number;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
@@ -985,6 +1228,8 @@ function parseGroupRow(row: RegisteredGroupRow): RegisteredGroup & { jid: string
     selected_skills: row.selected_skills ? JSON.parse(row.selected_skills) : null,
     target_agent_id: row.target_agent_id ?? undefined,
     target_main_jid: row.target_main_jid ?? undefined,
+    reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+    require_mention: row.require_mention === 1,
   };
 }
 
@@ -1000,8 +1245,8 @@ export function getRegisteredGroup(
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -1017,6 +1262,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.selected_skills ? JSON.stringify(group.selected_skills) : null,
     group.target_agent_id ?? null,
     group.target_main_jid ?? null,
+    group.reply_policy ?? 'source_only',
+    group.require_mention !== false ? 1 : 0,
   );
 }
 
@@ -1203,8 +1450,35 @@ export function deleteGroupData(jid: string, folder: string): void {
     // 5. 删除聊天记录
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
+    // 6. 删除 pin 记录
+    db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
   });
   tx();
+}
+
+// --- User pinned groups ---
+
+export function getUserPinnedGroups(userId: string): Record<string, string> {
+  const rows = db
+    .prepare('SELECT jid, pinned_at FROM user_pinned_groups WHERE user_id = ?')
+    .all(userId) as Array<{ jid: string; pinned_at: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) result[row.jid] = row.pinned_at;
+  return result;
+}
+
+export function pinGroup(userId: string, jid: string): string {
+  const pinned_at = new Date().toISOString();
+  db.prepare(
+    'INSERT OR REPLACE INTO user_pinned_groups (user_id, jid, pinned_at) VALUES (?, ?, ?)',
+  ).run(userId, jid, pinned_at);
+  return pinned_at;
+}
+
+export function unpinGroup(userId: string, jid: string): void {
+  db.prepare(
+    'DELETE FROM user_pinned_groups WHERE user_id = ? AND jid = ?',
+  ).run(userId, jid);
 }
 
 // --- Web API accessors ---
@@ -1220,14 +1494,14 @@ export function getMessagesPage(
 ): Array<NewMessage & { is_from_me: boolean }> {
   const sql = before
     ? `
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
       FROM messages
       WHERE chat_jid = ? AND timestamp < ?
       ORDER BY timestamp DESC
       LIMIT ?
     `
     : `
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
       FROM messages
       WHERE chat_jid = ?
       ORDER BY timestamp DESC
@@ -1256,7 +1530,7 @@ export function getMessagesAfter(
 ): Array<NewMessage & { is_from_me: boolean }> {
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
        FROM messages
        WHERE chat_jid = ? AND timestamp > ?
        ORDER BY timestamp ASC
@@ -1283,12 +1557,12 @@ export function getMessagesPageMulti(
 
   const placeholders = chatJids.map(() => '?').join(',');
   const sql = before
-    ? `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp < ?
        ORDER BY timestamp DESC
        LIMIT ?`
-    : `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
        FROM messages
        WHERE chat_jid IN (${placeholders})
        ORDER BY timestamp DESC
@@ -1321,7 +1595,7 @@ export function getMessagesAfterMulti(
   const placeholders = chatJids.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp > ?
        ORDER BY timestamp ASC
@@ -1367,7 +1641,7 @@ export function getMessagesByTimeRange(
   const endIso = new Date(endTs).toISOString();
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
        FROM messages
        WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?
        ORDER BY timestamp ASC
@@ -2481,6 +2755,25 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
 export function deleteMessagesForChatJid(chatJid: string): void {
   db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid);
   db.prepare('DELETE FROM chats WHERE jid = ?').run(chatJid);
+}
+
+export function getMessage(
+  chatJid: string,
+  messageId: string,
+): { id: string; chat_jid: string; sender: string | null; is_from_me: number } | null {
+  const row = db
+    .prepare('SELECT id, chat_jid, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?')
+    .get(messageId, chatJid) as
+    | { id: string; chat_jid: string; sender: string | null; is_from_me: number }
+    | undefined;
+  return row ?? null;
+}
+
+export function deleteMessage(chatJid: string, messageId: string): boolean {
+  const result = db
+    .prepare('DELETE FROM messages WHERE id = ? AND chat_jid = ?')
+    .run(messageId, chatJid);
+  return result.changes > 0;
 }
 
 export function isGroupShared(groupFolder: string): boolean {

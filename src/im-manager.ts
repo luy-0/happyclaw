@@ -43,6 +43,7 @@ export interface ConnectFeishuOptions {
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
+  shouldProcessGroupMessage?: (chatJid: string) => boolean;
 }
 
 class IMConnectionManager {
@@ -104,7 +105,7 @@ class IMConnectionManager {
    * Resolves the user by looking up chatJid -> registered_groups.created_by.
    * Falls back to iterating sibling groups if no created_by is set.
    */
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, localImagePaths?: string[]): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
       logger.debug({ jid }, 'Unknown channel type for JID, skip sending');
@@ -114,11 +115,56 @@ class IMConnectionManager {
     const chatId = extractChatId(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel) {
-      await channel.sendMessage(chatId, text);
+      await channel.sendMessage(chatId, text, localImagePaths);
       return;
     }
 
     logger.warn({ jid, channelType }, 'No IM channel available to send message');
+  }
+
+  /**
+   * Send an image to an IM chat, auto-routing via JID prefix.
+   */
+  async sendImage(jid: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) {
+      logger.debug({ jid }, 'Unknown channel type for JID, skip sending image');
+      return;
+    }
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.sendImage) {
+      await channel.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+      return;
+    }
+
+    // Fallback: if channel doesn't support sendImage, send caption as text
+    if (caption && channel) {
+      await channel.sendMessage(chatId, `📷 ${caption}`);
+      return;
+    }
+
+    logger.warn({ jid, channelType }, 'No IM channel available to send image');
+  }
+
+  /**
+   * Send a file to an IM chat, auto-routing via JID prefix.
+   * @throws Error if the channel doesn't support file sending
+   */
+  async sendFile(jid: string, filePath: string, fileName: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) {
+      throw new Error(`无法识别 JID 的通道类型: ${jid}`);
+    }
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.sendFile) {
+      await channel.sendFile(chatId, filePath, fileName);
+    } else {
+      throw new Error(`通道 ${channelType} 不支持发送文件`);
+    }
   }
 
   /**
@@ -205,6 +251,7 @@ class IMConnectionManager {
       onAgentMessage: options?.onAgentMessage,
       onBotAddedToGroup: options?.onBotAddedToGroup,
       onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
+      shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
     });
   }
 
@@ -217,8 +264,14 @@ class IMConnectionManager {
     onNewChat: (chatJid: string, chatName: string) => void,
     isChatAuthorized?: (jid: string) => boolean,
     onPairAttempt?: (jid: string, chatName: string, code: string) => Promise<boolean>,
-    onCommand?: (chatJid: string, command: string) => Promise<string | null>,
-    resolveGroupFolder?: (jid: string) => string | undefined,
+    options?: {
+      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      resolveGroupFolder?: (jid: string) => string | undefined;
+      resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string | null } | null;
+      onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+      onBotRemovedFromGroup?: (chatJid: string) => void;
+    },
   ): Promise<boolean> {
     if (!config.botToken) {
       logger.info({ userId }, 'Telegram config empty, skipping connection');
@@ -237,8 +290,12 @@ class IMConnectionManager {
       onNewChat,
       isChatAuthorized,
       onPairAttempt,
-      onCommand,
-      resolveGroupFolder,
+      onCommand: options?.onCommand,
+      resolveGroupFolder: options?.resolveGroupFolder,
+      resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+      onAgentMessage: options?.onAgentMessage,
+      onBotAddedToGroup: options?.onBotAddedToGroup,
+      onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
     });
   }
 
@@ -254,11 +311,11 @@ class IMConnectionManager {
    * Send a message to a Feishu chat.
    * @deprecated Use sendMessage(jid, text) which auto-routes.
    */
-  async sendFeishuMessage(chatJid: string, text: string): Promise<void> {
+  async sendFeishuMessage(chatJid: string, text: string, localImagePaths?: string[]): Promise<void> {
     const chatId = extractChatId(chatJid);
     const channel = this.findChannelForJid(chatJid, 'feishu');
     if (channel) {
-      await channel.sendMessage(chatId, text);
+      await channel.sendMessage(chatId, text, localImagePaths);
       return;
     }
     logger.warn({ chatJid }, 'No Feishu connection available to send message');
@@ -268,11 +325,11 @@ class IMConnectionManager {
    * Send a message to a Telegram chat.
    * @deprecated Use sendMessage(jid, text) which auto-routes.
    */
-  async sendTelegramMessage(chatJid: string, text: string): Promise<void> {
+  async sendTelegramMessage(chatJid: string, text: string, localImagePaths?: string[]): Promise<void> {
     const chatId = extractChatId(chatJid);
     const channel = this.findChannelForJid(chatJid, 'telegram');
     if (channel) {
-      await channel.sendMessage(chatId, text);
+      await channel.sendMessage(chatId, text, localImagePaths);
       return;
     }
     logger.warn({ chatJid }, 'No Telegram connection available to send message');

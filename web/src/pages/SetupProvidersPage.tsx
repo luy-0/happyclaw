@@ -1,33 +1,25 @@
 import { useEffect, useState } from 'react';
-import { ArrowRight, ExternalLink, KeyRound, Loader2, Link2, Plus, Server, ShieldCheck, X } from 'lucide-react';
+import { ArrowRight, Check, ExternalLink, HardDrive, KeyRound, Loader2, Link2, Plus, Server, ShieldCheck, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { api } from '../api/client';
+import type {
+  ClaudeThirdPartyProfileItem,
+  EnvRow,
+} from '../components/settings/types';
+import { getErrorMessage } from '../components/settings/types';
 import { useAuthStore } from '../stores/auth';
 
 type ProviderMode = 'official' | 'third_party';
-
-interface EnvRow {
-  key: string;
-  value: string;
-}
 
 const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'HAPPYCLAW_MODEL',
 ]);
-
-function getErrorMessage(err: unknown, fallback: string): string {
-  if (typeof err === 'object' && err !== null && 'message' in err) {
-    const msg = (err as { message?: unknown }).message;
-    if (typeof msg === 'string' && msg.trim()) return msg;
-  }
-  if (err instanceof Error && err.message) return err.message;
-  return fallback;
-}
 
 function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; error: string | null } {
   const customEnv: Record<string, string> = {};
@@ -68,6 +60,16 @@ export function SetupProvidersPage() {
   // Official mode
   const [officialToken, setOfficialToken] = useState('');
 
+  // Local Claude Code detection
+  const [localCC, setLocalCC] = useState<{
+    detected: boolean;
+    hasCredentials: boolean;
+    expiresAt: number | null;
+    accessTokenMasked: string | null;
+  } | null>(null);
+  const [localCCImporting, setLocalCCImporting] = useState(false);
+  const [localCCImported, setLocalCCImported] = useState(false);
+
   // OAuth flow state
   const [oauthLoading, setOauthLoading] = useState(false);
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -78,6 +80,7 @@ export function SetupProvidersPage() {
   // Third-party mode
   const [baseUrl, setBaseUrl] = useState('');
   const [authToken, setAuthToken] = useState('');
+  const [model, setModel] = useState('');
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
 
   useEffect(() => {
@@ -94,6 +97,16 @@ export function SetupProvidersPage() {
     }
   }, [setupStatus, navigate]);
 
+  // Detect local Claude Code credentials on mount
+  useEffect(() => {
+    api.get<{
+      detected: boolean;
+      hasCredentials: boolean;
+      expiresAt: number | null;
+      accessTokenMasked: string | null;
+    }>('/api/config/claude/detect-local').then(setLocalCC).catch(() => {});
+  }, []);
+
   const addCustomEnvRow = () => setCustomEnvRows((rows) => [...rows, { key: '', value: '' }]);
   const removeCustomEnvRow = (idx: number) =>
     setCustomEnvRows((rows) => rows.filter((_, i) => i !== idx));
@@ -101,6 +114,20 @@ export function SetupProvidersPage() {
     setCustomEnvRows((rows) =>
       rows.map((row, i) => (i === idx ? { ...row, [field]: value } : row)),
     );
+
+  const handleImportLocalCC = async () => {
+    setLocalCCImporting(true);
+    setError(null);
+    try {
+      await api.post('/api/config/claude/import-local');
+      setLocalCCImported(true);
+      setNotice('已导入本机 Claude Code 登录凭据。');
+    } catch (err) {
+      setError(getErrorMessage(err, '导入本机凭据失败'));
+    } finally {
+      setLocalCCImporting(false);
+    }
+  };
 
   const handleOAuthStart = async () => {
     setOauthLoading(true);
@@ -165,8 +192,8 @@ export function SetupProvidersPage() {
         return;
       }
       customEnv = envResult.customEnv;
-    } else if (!officialToken.trim() && !oauthDone) {
-      setError('官方渠道请通过一键登录或手动填写 setup-token / .credentials.json');
+    } else if (!officialToken.trim() && !oauthDone && !localCCImported) {
+      setError('官方渠道请通过一键登录、导入本机凭据或手动填写 setup-token / .credentials.json');
       return;
     }
 
@@ -180,8 +207,8 @@ export function SetupProvidersPage() {
       }
 
       if (providerMode === 'official') {
-        if (oauthDone) {
-          // OAuth already saved the token via /oauth/callback — just clear base URL and custom env
+        if (oauthDone || localCCImported) {
+          // OAuth or local import already saved the credentials — just clear base URL and custom env
           await api.put('/api/config/claude', { anthropicBaseUrl: '' });
           await api.put('/api/config/claude/custom-env', { customEnv: {} });
         } else {
@@ -225,12 +252,16 @@ export function SetupProvidersPage() {
           await api.put('/api/config/claude/custom-env', { customEnv: {} });
         }
       } else {
-        await api.put('/api/config/claude', { anthropicBaseUrl: baseUrl.trim() });
-        await api.put('/api/config/claude/secrets', {
-          anthropicAuthToken: authToken.trim(),
-          clearClaudeCodeOauthToken: true,
-          clearAnthropicApiKey: true,
-        });
+        await api.post<ClaudeThirdPartyProfileItem>(
+          '/api/config/claude/third-party/profiles',
+          {
+            name: '默认第三方',
+            anthropicBaseUrl: baseUrl.trim(),
+            anthropicAuthToken: authToken.trim(),
+            happyclawModel: model.trim(),
+          },
+        );
+
         await api.put('/api/config/claude/custom-env', { customEnv });
       }
 
@@ -322,6 +353,36 @@ export function SetupProvidersPage() {
 
           {providerMode === 'official' ? (
             <div className="space-y-4">
+              {/* Local Claude Code detection */}
+              {localCC?.hasCredentials && (
+                <div className={`rounded-lg border p-4 space-y-3 ${
+                  localCCImported
+                    ? 'border-emerald-200 bg-emerald-50/50'
+                    : 'border-blue-200 bg-blue-50/50'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <HardDrive className="w-4 h-4 text-blue-600" />
+                    <div className="text-sm font-medium text-slate-800">
+                      检测到本机已登录 Claude Code
+                    </div>
+                  </div>
+                  <div className="text-xs text-slate-600">
+                    本机 <code className="bg-white/60 px-1 rounded">~/.claude/.credentials.json</code> 中存在有效凭据（{localCC.accessTokenMasked}），可一键导入。
+                  </div>
+                  {localCCImported ? (
+                    <div className="flex items-center gap-1.5 text-sm text-emerald-700">
+                      <Check className="w-4 h-4" />
+                      已导入，点击下方按钮完成配置。
+                    </div>
+                  ) : (
+                    <Button onClick={handleImportLocalCC} disabled={localCCImporting || saving}>
+                      {localCCImporting ? <Loader2 className="size-4 animate-spin" /> : <HardDrive className="size-4" />}
+                      导入本机凭据
+                    </Button>
+                  )}
+                </div>
+              )}
+
               {/* OAuth one-click login */}
               <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 space-y-3">
                 <div className="text-sm font-medium text-foreground">一键登录 Claude（推荐）</div>
@@ -418,6 +479,17 @@ export function SetupProvidersPage() {
                 </div>
 
                 <div>
+                  <label className="block text-sm font-medium text-foreground mb-1">HAPPYCLAW_MODEL（可选）</label>
+                  <Input
+                    type="text"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    placeholder="opus / sonnet / haiku 或完整模型 ID"
+                    className="font-mono"
+                  />
+                </div>
+
+                <div>
                   <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_AUTH_TOKEN（必填）</label>
                   <Input
                     type="password"
@@ -440,6 +512,9 @@ export function SetupProvidersPage() {
                     添加
                   </button>
                 </div>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  这些变量属于系统全局设置，后续切换第三方配置时不会跟随切换。
+                </p>
 
                 {customEnvRows.length === 0 ? (
                   <p className="text-xs text-muted-foreground">暂无</p>

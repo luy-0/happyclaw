@@ -37,13 +37,18 @@ export interface IMChannelConnectOpts {
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用 */
   onBotRemovedFromGroup?: (chatJid: string) => void;
+  /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
+  shouldProcessGroupMessage?: (chatJid: string) => boolean;
 }
 
 export interface IMChannel {
   readonly channelType: string;
   connect(opts: IMChannelConnectOpts): Promise<boolean>;
   disconnect(): Promise<void>;
-  sendMessage(chatId: string, text: string): Promise<void>;
+  sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void>;
+  /** Send file to chat (if supported) */
+  sendFile?(chatId: string, filePath: string, fileName: string): Promise<void>;
+  sendImage?(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void>;
   setTyping(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   syncGroups?(): Promise<void>;
@@ -98,6 +103,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onAgentMessage: opts.onAgentMessage,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
+        shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
       });
       if (!connected) {
         inner = null;
@@ -112,12 +118,20 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void> {
       if (!inner) {
         logger.warn({ chatId }, 'Feishu channel not connected, skip sending message');
         return;
       }
-      await inner.sendMessage(chatId, text);
+      await inner.sendMessage(chatId, text, localImagePaths);
+    },
+
+    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+      if (!inner) {
+        logger.warn({ chatId }, 'Feishu channel not connected, skip sending image');
+        return;
+      }
+      await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
 
     async setTyping(chatId: string, isTyping: boolean): Promise<void> {
@@ -132,6 +146,14 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     async syncGroups(): Promise<void> {
       if (!inner) return;
       await inner.syncGroups();
+    },
+
+    async sendFile(chatId: string, filePath: string, fileName: string): Promise<void> {
+      if (!inner) {
+        logger.warn({ chatId }, 'Feishu channel not connected, skip sending file');
+        return;
+      }
+      await inner.sendFile(chatId, filePath, fileName);
     },
 
     async getChatInfo(chatId: string) {
@@ -170,6 +192,10 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
           onPairAttempt: opts.onPairAttempt,
           onCommand: opts.onCommand,
           resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          onBotAddedToGroup: opts.onBotAddedToGroup,
+          onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
         });
         return inner.isConnected();
       } catch (err) {
@@ -187,12 +213,20 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void> {
       if (!inner) {
         logger.warn({ chatId }, 'Telegram channel not connected, skip sending message');
         return;
       }
-      await inner.sendMessage(chatId, text);
+      await inner.sendMessage(chatId, text, localImagePaths);
+    },
+
+    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+      if (!inner) {
+        logger.warn({ chatId }, 'Telegram channel not connected, skip sending image');
+        return;
+      }
+      await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
 
     async setTyping(chatId: string, isTyping: boolean): Promise<void> {
