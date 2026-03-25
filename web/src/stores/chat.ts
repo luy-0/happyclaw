@@ -4,6 +4,7 @@ import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
 import { showToast, notifyIfHidden, shouldEmitBackgroundTaskNotice } from '../utils/toast';
+import { playNotificationSound } from '../utils/sound';
 import type { GroupInfo, AgentInfo, AvailableImGroup } from '../types';
 
 export type { GroupInfo, AgentInfo };
@@ -1646,6 +1647,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages: { ...s.messages, [chatJid]: updated },
       };
     });
+
+    // 播放提示音（仅在页面不可见且为 Agent 回复完成时）
+    const isAgentReply = msg.is_from_me && msg.sender !== '__system__' && source !== 'scheduled_task' && msg.source_kind !== 'sdk_send_message';
+    const shouldPlaySound = isAgentReply && !alreadyExists;
+    if (shouldPlaySound && typeof document !== 'undefined' && document.hidden) {
+      playNotificationSound();
+    }
 
     // query_interrupted 仅作为视觉分隔线，不清理流式状态。
     // 流式状态由 status:interrupted（冻结）→ interrupt_partial（转正）两阶段处理。
