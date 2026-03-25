@@ -129,19 +129,29 @@ export function TerminalPanel({
       if (data.chatJid === groupJid) {
         syncConnState('disconnected');
         terminal.write(`\r\n\x1b[33m[${data.reason || '终端已断开'}]\x1b[0m\r\n`);
+        // Auto-reconnect after unexpected stop (not user-initiated)
+        if (data.reason !== '用户关闭终端') {
+          terminal.write('\x1b[33m[3 秒后自动重连...]\x1b[0m\r\n');
+          setTimeout(() => {
+            if (connStateRef.current === 'disconnected' && wsManager.isConnected()) {
+              requestStartTerminal();
+            }
+          }, 3000);
+        }
       }
     });
 
     const unsubError = wsManager.on('terminal_error', (data: any) => {
       if (data.chatJid === groupJid) {
         syncConnState('disconnected');
-        // 针对工作区未运行的错误给出更友好的提示
-        if (data.error?.includes('工作区未运行')) {
-          terminal.write(`\r\n\x1b[33m[工作区启动中...]\x1b[0m\r\n`);
-          terminal.write(`\r\n已自动尝试启动工作区，请稍后点击"重新连接"。\r\n`);
-        } else if (data.error?.includes('工作区启动中')) {
-          terminal.write(`\r\n\x1b[33m[工作区启动中...]\x1b[0m\r\n`);
-          terminal.write(`\r\n工作区正在启动，请稍后点击"重新连接"。\r\n`);
+        // 针对工作区未运行/启动中的错误，自动延迟重连
+        if (data.error?.includes('工作区未运行') || data.error?.includes('工作区启动中')) {
+          terminal.write(`\r\n\x1b[33m[工作区启动中，5 秒后自动重连...]\x1b[0m\r\n`);
+          setTimeout(() => {
+            if (connStateRef.current === 'disconnected' && wsManager.isConnected()) {
+              requestStartTerminal();
+            }
+          }, 5000);
         } else {
           terminal.write(`\r\n\x1b[31m[错误: ${data.error}]\x1b[0m\r\n`);
         }
@@ -160,17 +170,35 @@ export function TerminalPanel({
       terminal.write('\r\n\x1b[33m[WebSocket 已断开，等待重连]\x1b[0m\r\n');
     });
 
-    // 用户输入 → WebSocket（仅在已连接时发送）
+    // IME 组合事件处理 —— 防止中文输入法在英文直输模式下产生重复输入
+    // xterm.js v6 内部已有 IME 处理，但 macOS 中文 IME 某些边界情况仍会泄漏
+    let composing = false;
+    const textarea = termRef.current?.querySelector('textarea');
+    const onCompositionStart = () => { composing = true; };
+    const onCompositionEnd = () => {
+      // 延迟重置，确保 compositionend 后的 onData 事件能正确发送
+      setTimeout(() => { composing = false; }, 50);
+    };
+    if (textarea) {
+      textarea.addEventListener('compositionstart', onCompositionStart);
+      textarea.addEventListener('compositionend', onCompositionEnd);
+    }
+
+    // 用户输入 → WebSocket（仅在已连接且非 IME 组合状态时发送）
     const onDataDisposable = terminal.onData((data) => {
+      if (composing) return;
       if (connStateRef.current === 'connected') {
         wsManager.send({ type: 'terminal_input', chatJid: groupJid, data });
       }
     });
 
-    // ResizeObserver 监听尺寸变化
+    // ResizeObserver 监听尺寸变化（debounce 防止动画期间 resize 风暴）
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const resizeObserver = new ResizeObserver(() => {
       if (!visibleRef.current) return;
-      requestAnimationFrame(() => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeTimer = null;
         if (fitAddonRef.current && xtermRef.current) {
           fitAddonRef.current.fit();
           if (connStateRef.current === 'connected') {
@@ -178,7 +206,7 @@ export function TerminalPanel({
             wsManager.send({ type: 'terminal_resize', chatJid: groupJid, cols, rows });
           }
         }
-      });
+      }, 150);
     });
     resizeObserver.observe(termRef.current);
 
@@ -187,7 +215,12 @@ export function TerminalPanel({
 
     // Cleanup
     return () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
       resizeObserver.disconnect();
+      if (textarea) {
+        textarea.removeEventListener('compositionstart', onCompositionStart);
+        textarea.removeEventListener('compositionend', onCompositionEnd);
+      }
       onDataDisposable.dispose();
       unsubOutput();
       unsubStarted();
@@ -207,14 +240,14 @@ export function TerminalPanel({
   return (
     <div className="h-full flex flex-col terminal-panel">
       {/* Status bar */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-[#1a1b26] border-b border-slate-700 text-xs">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-[#1a1b26] border-b border-[#2a2b36] text-xs">
         <div className="flex items-center gap-2">
           <span className={`inline-block w-2 h-2 rounded-full ${
             connState === 'connected' ? 'bg-green-400' :
             connState === 'connecting' ? 'bg-yellow-400 animate-pulse' :
-            'bg-slate-500'
+            'bg-neutral-500'
           }`} />
-          <span className="text-slate-400">
+          <span className="text-neutral-400">
             {connState === 'connected' ? '已连接' :
              connState === 'connecting' ? '连接中...' :
              connState === 'disconnected' ? '已断开' : '空闲'}
@@ -246,7 +279,7 @@ export function TerminalPanel({
           {onHide && (
             <button
               onClick={onHide}
-              className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+              className="p-1 rounded hover:bg-[#2a2b36] text-neutral-400 hover:text-neutral-200 transition-colors cursor-pointer"
               aria-label="隐藏终端"
               title="隐藏终端"
             >
@@ -256,7 +289,7 @@ export function TerminalPanel({
           {onDelete && (
             <button
               onClick={onDelete}
-              className="p-1 rounded hover:bg-red-900/30 text-slate-400 hover:text-red-300 transition-colors cursor-pointer"
+              className="p-1 rounded hover:bg-red-900/30 text-neutral-400 hover:text-red-300 transition-colors cursor-pointer"
               aria-label="删除终端"
               title="删除终端"
             >

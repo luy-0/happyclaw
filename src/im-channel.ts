@@ -14,7 +14,22 @@ import {
   type TelegramConnection,
   type TelegramConnectionConfig,
 } from './telegram.js';
+import {
+  createQQConnection,
+  type QQConnection,
+  type QQConnectionConfig,
+} from './qq.js';
+import {
+  createWeChatConnection,
+  type WeChatConnection,
+  type WeChatConnectionConfig,
+} from './wechat.js';
 import { logger } from './logger.js';
+import {
+  StreamingCardController,
+  type StreamingCardOptions,
+} from './feishu-streaming-card.js';
+import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 
 // ─── Unified Interface ──────────────────────────────────────────
 
@@ -24,13 +39,19 @@ export interface IMChannelConnectOpts {
   onMessage?: (chatJid: string, text: string, senderName: string) => void;
   ignoreMessagesBefore?: number;
   isChatAuthorized?: (jid: string) => boolean;
-  onPairAttempt?: (jid: string, chatName: string, code: string) => Promise<boolean>;
+  onPairAttempt?: (
+    jid: string,
+    chatName: string,
+    code: string,
+  ) => Promise<boolean>;
   /** Slash command callback (e.g. /clear). Returns reply text or null. */
   onCommand?: (chatJid: string, command: string) => Promise<string | null>;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (jid: string) => string | undefined;
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
-  resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string | null } | null;
+  resolveEffectiveChatJid?: (
+    chatJid: string,
+  ) => { effectiveJid: string; agentId: string | null } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   /** Bot 被添加到群聊时调用 */
@@ -39,35 +60,58 @@ export interface IMChannelConnectOpts {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
   shouldProcessGroupMessage?: (chatJid: string) => boolean;
+  /** 飞书流式卡片按钮中断回调 */
+  onCardInterrupt?: (chatJid: string) => void;
 }
 
 export interface IMChannel {
   readonly channelType: string;
   connect(opts: IMChannelConnectOpts): Promise<boolean>;
   disconnect(): Promise<void>;
-  sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void>;
+  sendMessage(
+    chatId: string,
+    text: string,
+    localImagePaths?: string[],
+  ): Promise<void>;
   /** Send file to chat (if supported) */
   sendFile?(chatId: string, filePath: string, fileName: string): Promise<void>;
-  sendImage?(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void>;
+  sendImage?(
+    chatId: string,
+    imageBuffer: Buffer,
+    mimeType: string,
+    caption?: string,
+    fileName?: string,
+  ): Promise<void>;
   setTyping(chatId: string, isTyping: boolean): Promise<void>;
+  /** Clear the ack reaction for a chat (e.g. when streaming card handled the reply) */
+  clearAckReaction?(chatId: string): void;
   isConnected(): boolean;
   syncGroups?(): Promise<void>;
-  getChatInfo?(chatId: string): Promise<{ avatar?: string; name?: string; user_count?: string; chat_type?: string; chat_mode?: string } | null>;
+  /** Create a streaming card session for real-time card updates (Feishu only) */
+  createStreamingSession?(chatId: string, onCardCreated?: (messageId: string) => void): StreamingCardController | undefined;
+  getChatInfo?(chatId: string): Promise<{
+    avatar?: string;
+    name?: string;
+    user_count?: string;
+    chat_type?: string;
+    chat_mode?: string;
+  } | null>;
 }
 
 // ─── Channel Registry ───────────────────────────────────────────
 
-export const CHANNEL_REGISTRY: Record<string, { prefix: string }> = {
-  feishu: { prefix: 'feishu:' },
-  telegram: { prefix: 'telegram:' },
-};
+/** Backward-compatible registry derived from the shared CHANNEL_PREFIXES. */
+export const CHANNEL_REGISTRY: Record<string, { prefix: string }> =
+  Object.fromEntries(
+    Object.entries(CHANNEL_PREFIXES).map(([type, prefix]) => [type, { prefix }]),
+  );
 
 /**
  * Determine the channel type from a JID string.
  * Returns the matching channelType key or null if no prefix matches.
  */
 export function getChannelType(jid: string): string | null {
-  for (const [type, { prefix }] of Object.entries(CHANNEL_REGISTRY)) {
+  for (const [type, prefix] of Object.entries(CHANNEL_PREFIXES)) {
     if (jid.startsWith(prefix)) return type;
   }
   return null;
@@ -77,7 +121,7 @@ export function getChannelType(jid: string): string | null {
  * Strip the channel prefix from a JID, returning the raw chat ID.
  */
 export function extractChatId(jid: string): string {
-  for (const { prefix } of Object.values(CHANNEL_REGISTRY)) {
+  for (const prefix of Object.values(CHANNEL_PREFIXES)) {
     if (jid.startsWith(prefix)) return jid.slice(prefix.length);
   }
   return jid;
@@ -104,6 +148,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
         shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+        onCardInterrupt: opts.onCardInterrupt,
       });
       if (!connected) {
         inner = null;
@@ -118,17 +163,33 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       }
     },
 
-    async sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'Feishu channel not connected, skip sending message');
+        logger.warn(
+          { chatId },
+          'Feishu channel not connected, skip sending message',
+        );
         return;
       }
       await inner.sendMessage(chatId, text, localImagePaths);
     },
 
-    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+    async sendImage(
+      chatId: string,
+      imageBuffer: Buffer,
+      mimeType: string,
+      caption?: string,
+      fileName?: string,
+    ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'Feishu channel not connected, skip sending image');
+        logger.warn(
+          { chatId },
+          'Feishu channel not connected, skip sending image',
+        );
         return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
@@ -137,6 +198,11 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     async setTyping(chatId: string, isTyping: boolean): Promise<void> {
       if (!inner) return;
       await inner.sendReaction(chatId, isTyping);
+    },
+
+    clearAckReaction(chatId: string): void {
+      if (!inner) return;
+      inner.clearAckReaction(chatId);
     },
 
     isConnected(): boolean {
@@ -148,9 +214,16 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       await inner.syncGroups();
     },
 
-    async sendFile(chatId: string, filePath: string, fileName: string): Promise<void> {
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'Feishu channel not connected, skip sending file');
+        logger.warn(
+          { chatId },
+          'Feishu channel not connected, skip sending file',
+        );
         return;
       }
       await inner.sendFile(chatId, filePath, fileName);
@@ -160,6 +233,19 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       if (!inner) return null;
       return inner.getChatInfo(chatId);
     },
+
+    createStreamingSession(chatId: string, onCardCreated?: (messageId: string) => void): StreamingCardController | undefined {
+      if (!inner) return undefined;
+      const larkClient = inner.getLarkClient();
+      if (!larkClient) return undefined;
+      const opts: StreamingCardOptions = {
+        client: larkClient,
+        chatId,
+        replyToMsgId: inner.getLastMessageId(chatId),
+        onCardCreated,
+      };
+      return new StreamingCardController(opts);
+    },
   };
 
   return channel;
@@ -167,7 +253,9 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
 
 // ─── Telegram Adapter ───────────────────────────────────────────
 
-export function createTelegramChannel(config: TelegramConnectionConfig): IMChannel {
+export function createTelegramChannel(
+  config: TelegramConnectionConfig,
+): IMChannel {
   let inner: TelegramConnection | null = null;
   // Telegram typing indicator expires after ~5s; resend every 4s while active.
   let typingTimer: NodeJS.Timeout | null = null;
@@ -191,6 +279,7 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
           isChatAuthorized: opts.isChatAuthorized ?? (() => true),
           onPairAttempt: opts.onPairAttempt,
           onCommand: opts.onCommand,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
@@ -213,20 +302,51 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
       }
     },
 
-    async sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'Telegram channel not connected, skip sending message');
+        logger.warn(
+          { chatId },
+          'Telegram channel not connected, skip sending message',
+        );
         return;
       }
       await inner.sendMessage(chatId, text, localImagePaths);
     },
 
-    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+    async sendImage(
+      chatId: string,
+      imageBuffer: Buffer,
+      mimeType: string,
+      caption?: string,
+      fileName?: string,
+    ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'Telegram channel not connected, skip sending image');
+        logger.warn(
+          { chatId },
+          'Telegram channel not connected, skip sending image',
+        );
         return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+    },
+
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'Telegram channel not connected, skip sending file',
+        );
+        return;
+      }
+      await inner.sendFile(chatId, filePath, fileName);
     },
 
     async setTyping(chatId: string, isTyping: boolean): Promise<void> {
@@ -241,7 +361,130 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
 
       // Send immediately, then repeat every 4s to keep indicator alive
       void sendAction();
-      typingTimer = setInterval(() => { void sendAction(); }, 4000);
+      typingTimer = setInterval(() => {
+        void sendAction();
+      }, 4000);
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
+    },
+  };
+
+  return channel;
+}
+
+// ─── QQ Adapter ─────────────────────────────────────────────────
+
+export function createQQChannel(config: QQConnectionConfig): IMChannel {
+  let inner: QQConnection | null = null;
+
+  const channel: IMChannel = {
+    channelType: 'qq',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner = createQQConnection(config);
+      try {
+        await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          isChatAuthorized: opts.isChatAuthorized ?? (() => true),
+          onPairAttempt: opts.onPairAttempt,
+          onCommand: opts.onCommand,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+        });
+        return inner.isConnected();
+      } catch (err) {
+        logger.error({ err }, 'QQ channel connect failed');
+        inner = null;
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(chatId: string, text: string): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'QQ channel not connected, skip sending message',
+        );
+        return;
+      }
+      await inner.sendMessage(chatId, text);
+    },
+
+    async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
+      // QQ Bot API v2 does not support typing indicators
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
+    },
+  };
+
+  return channel;
+}
+
+// ─── WeChat Adapter ─────────────────────────────────────────────
+
+export function createWeChatChannel(
+  config: WeChatConnectionConfig,
+): IMChannel {
+  let inner: WeChatConnection | null = null;
+
+  const channel: IMChannel = {
+    channelType: 'wechat',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner = createWeChatConnection(config);
+      try {
+        await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          onCommand: opts.onCommand,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+        });
+        return inner.isConnected();
+      } catch (err) {
+        logger.error({ err }, 'WeChat channel connect failed');
+        inner = null;
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(chatId: string, text: string): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'WeChat channel not connected, skip sending message',
+        );
+        return;
+      }
+      await inner.sendMessage(chatId, text);
+    },
+
+    async setTyping(chatId: string, isTyping: boolean): Promise<void> {
+      if (!inner) return;
+      await inner.sendTyping(chatId, isTyping);
     },
 
     isConnected(): boolean {

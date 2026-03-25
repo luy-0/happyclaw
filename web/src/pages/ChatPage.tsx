@@ -59,7 +59,7 @@ export function ChatPage() {
 
       {/* Chat View - Desktop: visible when active group exists, Mobile: only in detail route */}
       {activeGroupJid ? (
-        <div ref={chatViewRef} className={`${groupFolder ? 'flex-1' : 'hidden lg:block flex-1'}`}>
+        <div ref={chatViewRef} className={`${groupFolder ? 'flex-1 min-w-0' : 'hidden lg:block flex-1 min-w-0'}`}>
           <ChatView
             groupJid={activeGroupJid}
             onBack={handleBackToList}
@@ -90,10 +90,10 @@ export function ChatPage() {
             <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto mb-6">
               <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />
             </div>
-            <h2 className="text-xl font-semibold text-slate-900 mb-2">
+            <h2 className="text-xl font-semibold text-foreground mb-2">
               欢迎使用 {appearance?.appName || 'HappyClaw'}
             </h2>
-            <p className="text-slate-500 text-sm">
+            <p className="text-muted-foreground text-sm">
               从左侧选择一个工作区开始对话
             </p>
           </div>

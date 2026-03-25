@@ -2,10 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } fr
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
-import type { AgentInfo } from '../../types';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
-import { AgentStatusCard } from './AgentStatusCard';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
@@ -23,10 +21,6 @@ interface MessageListProps {
   isWaiting?: boolean;
   /** Callback to interrupt the current agent query */
   onInterrupt?: () => void;
-  /** Sub-agents to display as status cards in the main conversation */
-  agents?: AgentInfo[];
-  /** Callback when a sub-agent status card is clicked */
-  onAgentClick?: (agentId: string) => void;
   /** If set, this MessageList is showing a sub-agent's messages */
   agentId?: string;
   /** Callback to send a message (used for quick prompts in empty state) */
@@ -36,6 +30,7 @@ interface MessageListProps {
 type FlatItem =
   | { type: 'date'; content: string }
   | { type: 'divider'; content: string }
+  | { type: 'spawn'; content: string }
   | { type: 'error'; content: string }
   | { type: 'message'; content: Message };
 
@@ -46,10 +41,18 @@ const quickPrompts = [
   '帮我调试一个问题',
 ];
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agents, onAgentClick, agentId, onSend }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, onSend }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
+  // Spawn agents: selector returns stable reference (the agents array itself),
+  // then useMemo filters for spawn kind. Direct .filter() in selector causes
+  // infinite re-render because Zustand sees a new array reference every time.
+  const allAgentsForSpawn = useChatStore(s => groupJid ? s.agents[groupJid] : undefined);
+  const spawnAgents = useMemo(
+    () => (allAgentsForSpawn ?? []).filter(a => a.kind === 'spawn' && a.status === 'running'),
+    [allAgentsForSpawn],
+  );
   const currentUser = useAuthStore(s => s.user);
   const appearance = useAuthStore(s => s.appearance);
   const aiName = currentUser?.ai_name || appearance?.aiName || 'AI 助手';
@@ -57,6 +60,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
   const aiImageUrl = currentUser?.ai_avatar_url;
   const parentRef = useRef<HTMLDivElement>(null);
+  const scrollStateRef = useRef({ autoScroll: true, atTop: false });
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
   const prevMessageCount = useRef(messages.length);
@@ -81,11 +85,18 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         if (msg.sender === '__system__') {
           if (msg.content === 'context_reset') {
             items.push({ type: 'divider', content: '上下文已清除' });
+          } else if (msg.content === 'query_interrupted') {
+            items.push({ type: 'divider', content: '已中断' });
           } else if (msg.content.startsWith('agent_error:')) {
             items.push({ type: 'error', content: msg.content.slice('agent_error:'.length) });
           } else if (msg.content.startsWith('agent_max_retries:')) {
             items.push({ type: 'error', content: msg.content.slice('agent_max_retries:'.length) });
+          } else if (msg.content.startsWith('system_info:')) {
+            items.push({ type: 'divider', content: msg.content.slice('system_info:'.length) });
           }
+        } else if (!msg.is_from_me && /^\/(sw|spawn)\s+/i.test(msg.content)) {
+          // /sw or /spawn commands render as compact spawn-task cards
+          items.push({ type: 'spawn', content: msg.content.replace(/^\/(sw|spawn)\s+/i, '') });
         } else {
           items.push({ type: 'message', content: msg });
         }
@@ -106,6 +117,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       switch (item.type) {
         case 'date': return `date-${item.content}`;
         case 'divider': return `div-${index}`;
+        case 'spawn': return `spawn-${index}`;
         case 'error': return `err-${index}`;
         case 'message': return item.content.id;
       }
@@ -116,6 +128,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       switch (item.type) {
         case 'date': return 48;
         case 'divider':
+        case 'spawn':
         case 'error': return 56;
         case 'message': {
           const len = item.content.content.length;
@@ -131,7 +144,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         default: return 100;
       }
     },
-    overscan: 8,
+    overscan: window.innerWidth < 1024 ? 12 : 8,
   });
 
   // 检测向上滚动触发 loadMore + 保存滚动位置
@@ -141,9 +154,18 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
 
     const handleScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = parent;
-      const atBottom = scrollHeight - scrollTop - clientHeight < 100;
-      setAutoScroll(atBottom);
-      setAtTop(scrollTop < 50);
+      const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+      const isAtTop = scrollTop < 50;
+
+      // Only trigger setState when value actually changes
+      if (scrollStateRef.current.autoScroll !== isAtBottom) {
+        scrollStateRef.current.autoScroll = isAtBottom;
+        setAutoScroll(isAtBottom);
+      }
+      if (scrollStateRef.current.atTop !== isAtTop) {
+        scrollStateRef.current.atTop = isAtTop;
+        setAtTop(isAtTop);
+      }
 
       if (scrollTop < 100 && hasMore && !loading) {
         onLoadMore();
@@ -186,33 +208,54 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         parentRef.current.scrollTop = parentRef.current.scrollHeight;
       }
       setAutoScroll(true);
+      // 4-frame rAF chain (~66ms) to wait for measureElement to complete
+      let handle: number;
+      const correct = (depth: number) => {
+        handle = requestAnimationFrame(() => {
+          if (parentRef.current) {
+            parentRef.current.scrollTop = parentRef.current.scrollHeight;
+          }
+          if (depth < 3) correct(depth + 1);
+        });
+      };
+      correct(0);
+      return () => cancelAnimationFrame(handle);
     }
   }, [flatMessages.length, virtualizer, messages.length]);
 
   // Safety net: initialOffset relies on estimated sizes which may be inaccurate.
-  // After mount, verify we're actually at the bottom and correct if not.
+  // After mount (or when messages load asynchronously), verify we're actually at
+  // the bottom and correct if not. Depends on flatMessages.length so that async
+  // message loading triggers a fresh round of corrections.
   useEffect(() => {
     if (flatMessages.length === 0) return;
-    const raf1 = requestAnimationFrame(() => {
-      const el = parentRef.current;
-      if (!el) return;
-      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (gap > 100) {
-        el.scrollTop = el.scrollHeight;
-      }
-    });
-    return () => cancelAnimationFrame(raf1);
-    // Only on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Auto-scroll when streaming content updates
-  const streaming = useChatStore(s => agentId ? s.agentStreaming[agentId] : s.streaming[groupJid ?? '']);
-  useEffect(() => {
-    if (autoScroll && streaming) {
-      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
+    const timers: number[] = [];
+    for (const delay of [50, 150, 300, 500]) {
+      timers.push(window.setTimeout(() => {
+        const el = parentRef.current;
+        if (!el) return;
+        const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+        if (gap > 100) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }, delay));
     }
-  }, [streaming, autoScroll]);
+    return () => timers.forEach(clearTimeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flatMessages.length]);
+
+  // Auto-scroll when streaming content is active — poll-based to avoid
+  // re-rendering on every text_delta (the streaming object changes very frequently).
+  const hasStreaming = useChatStore(s =>
+    agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? '']
+  );
+  useEffect(() => {
+    if (!autoScroll || !hasStreaming) return;
+    const id = setInterval(() => {
+      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
+    }, 100);
+    return () => clearInterval(id);
+  }, [hasStreaming, autoScroll]);
 
   const scrollToTop = useCallback(() => {
     parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
@@ -232,7 +275,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         ref={parentRef}
         className="h-full overflow-y-auto overflow-x-hidden py-6 bg-background"
       >
-        <div className={displayMode === 'compact' ? 'mx-auto px-4 min-w-0' : 'max-w-3xl mx-auto px-4 min-w-0'}>
+        <div className={displayMode === 'compact' ? 'mx-auto px-4 min-w-0' : 'max-w-4xl mx-auto px-4 min-w-0'}>
         {loading && hasMore && (
           <div className="flex justify-center py-4">
             <Loader2 className="animate-spin text-primary" size={24} />
@@ -293,6 +336,32 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                       {item.content}
                     </span>
                     <div className="flex-1 border-t border-amber-300" />
+                  </div>
+                </div>
+              );
+            }
+
+            if (item.type === 'spawn') {
+              return (
+                <div
+                  key={virtualItem.key}
+                  ref={virtualizer.measureElement}
+                  data-index={virtualItem.index}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    transform: `translateY(${virtualItem.start}px)`,
+                  }}
+                >
+                  <div className="flex items-center gap-2 my-4 px-4">
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-violet-50 dark:bg-violet-950/40 text-xs text-violet-600 dark:text-violet-400 border border-violet-200 dark:border-violet-800">
+                      <span>⚡</span>
+                      <span className="font-medium">并行任务</span>
+                      <span className="text-violet-400 dark:text-violet-500">|</span>
+                      <span className="max-w-[400px] truncate">{item.content}</span>
+                    </span>
                   </div>
                 </div>
               );
@@ -362,8 +431,8 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                   />
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-slate-900">{aiName}</h3>
-                  <p className="text-sm text-slate-500 mt-1">有什么我可以帮你的吗？</p>
+                  <h3 className="text-lg font-semibold text-foreground">{aiName}</h3>
+                  <p className="text-sm text-muted-foreground mt-1">有什么我可以帮你的吗？</p>
                 </div>
               </div>
 
@@ -392,33 +461,29 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} agentId={agentId} />
         )}
 
-        {/* Agent status cards in main conversation (task agents only) */}
-        {!agentId && agents && agents.filter(a => a.kind === 'task').length > 0 && (
-          <div className="py-2">
-            {agents.filter(a => a.kind === 'task').map((agent) => (
-              <AgentStatusCard
-                key={agent.id}
-                agent={agent}
-                onClick={() => onAgentClick?.(agent.id)}
-              />
-            ))}
-          </div>
-        )}
+        {/* Inline streaming for spawn agents — parallel tasks in same chat */}
+        {groupJid && !agentId && spawnAgents.map(a => (
+          <StreamingDisplay key={a.id} groupJid={groupJid} isWaiting={true} agentId={a.id} senderName={a.name} />
+        ))}
 
-        {isWaiting && onInterrupt && (
-          <div className="flex justify-center py-1">
-            <button
-              type="button"
-              onClick={onInterrupt}
-              className="inline-flex items-center gap-1.5 px-3 py-1 text-xs text-slate-500 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-full transition-colors cursor-pointer"
-            >
-              <Square className="w-3 h-3" />
-              中断
-            </button>
-          </div>
-        )}
         </div>
       </div>
+
+      {/* Floating interrupt button — positioned outside scroll content to avoid
+          layout shift when textarea height changes (container resize would
+          briefly hide the button if it lived inside scroll content). */}
+      {isWaiting && onInterrupt && (
+        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10">
+          <button
+            type="button"
+            onClick={onInterrupt}
+            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs text-muted-foreground hover:text-red-600 bg-card/90 backdrop-blur-sm hover:bg-red-50 rounded-full border border-border shadow-sm transition-colors cursor-pointer"
+          >
+            <Square className="w-3 h-3" />
+            中断
+          </button>
+        </div>
+      )}
 
       {/* Floating scroll buttons */}
       {showScrollButtons && (

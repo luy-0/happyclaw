@@ -1,5 +1,4 @@
 import {
-  Radio,
   ShieldCheck,
   UserPlus,
   User,
@@ -8,11 +7,13 @@ import {
   BookOpen,
   Puzzle,
   Server,
+  Bot,
   UserCog,
   Info,
   Palette,
   MessageSquare,
   SlidersHorizontal,
+  Link2,
 } from 'lucide-react';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { SettingsTab } from './types';
@@ -25,24 +26,25 @@ interface NavItem {
 }
 
 const systemItems: NavItem[] = [
-  { key: 'channels', label: '系统渠道', icon: <Radio className="w-4 h-4" />, group: 'system' },
   { key: 'claude', label: 'Claude 提供商', icon: <ShieldCheck className="w-4 h-4" />, group: 'system' },
   { key: 'registration', label: '注册管理', icon: <UserPlus className="w-4 h-4" />, group: 'system' },
-  { key: 'appearance', label: '外观（全局）', icon: <Palette className="w-4 h-4" />, group: 'system' },
+  { key: 'appearance', label: '全局外观', icon: <Palette className="w-4 h-4" />, group: 'system' },
   { key: 'system', label: '系统参数', icon: <SlidersHorizontal className="w-4 h-4" />, group: 'system' },
 ];
 
 const accountItems: NavItem[] = [
-  { key: 'profile', label: '个人资料', icon: <User className="w-4 h-4" />, group: 'account' },
-  { key: 'my-channels', label: '我的通道', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
+  { key: 'profile', label: '个人偏好', icon: <User className="w-4 h-4" />, group: 'account' },
+  { key: 'my-channels', label: '消息通道', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
   { key: 'security', label: '安全与设备', icon: <Shield className="w-4 h-4" />, group: 'account' },
 ];
 
 const featureItems: NavItem[] = [
   { key: 'groups', label: '会话管理', icon: <Layers className="w-4 h-4" />, group: 'features' },
   { key: 'memory', label: '记忆管理', icon: <BookOpen className="w-4 h-4" />, group: 'features' },
-  { key: 'skills', label: '技能管理', icon: <Puzzle className="w-4 h-4" />, group: 'features' },
+  { key: 'skills', label: '技能(Skill)管理', icon: <Puzzle className="w-4 h-4" />, group: 'features' },
   { key: 'mcp-servers', label: 'MCP 服务器', icon: <Server className="w-4 h-4" />, group: 'features' },
+  { key: 'agent-definitions', label: 'Agent', icon: <Bot className="w-4 h-4" />, group: 'features' },
+  { key: 'bindings', label: 'IM 绑定', icon: <Link2 className="w-4 h-4" />, group: 'features' },
   { key: 'users', label: '用户管理', icon: <UserCog className="w-4 h-4" />, group: 'features' },
   { key: 'about', label: '关于', icon: <Info className="w-4 h-4" />, group: 'features' },
 ];
@@ -78,10 +80,10 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
   return (
     <>
       {/* Desktop: vertical sidebar */}
-      <nav className="hidden lg:block w-56 shrink-0 bg-background border-r border-border py-6 px-3">
+      <nav className="hidden lg:block w-56 shrink-0 bg-background border-r border-border py-6 px-3 overflow-y-auto">
         {visibleItems.map((section, si) => (
           <div key={section.group} className={si > 0 ? 'mt-6' : ''}>
-            <div className="px-3 mb-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+            <div className="px-3 mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
               {section.group}
             </div>
             <div className="space-y-1">
@@ -97,8 +99,8 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
                       active
                         ? 'bg-brand-50 text-primary font-medium'
                         : disabled
-                          ? 'text-slate-300 cursor-not-allowed'
-                          : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                          ? 'text-muted-foreground/50 cursor-not-allowed'
+                          : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                     }`}
                   >
                     {item.icon}
@@ -120,7 +122,7 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
           <nav className="px-3 pb-4 overflow-y-auto">
             {visibleItems.map((section, si) => (
               <div key={section.group} className={si > 0 ? 'mt-5' : ''}>
-                <div className="px-3 mb-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                <div className="px-3 mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                   {section.group}
                 </div>
                 <div className="space-y-1">
@@ -141,8 +143,8 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
                           active
                             ? 'bg-brand-50 text-primary font-medium'
                             : disabled
-                              ? 'text-slate-300 cursor-not-allowed'
-                              : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                              ? 'text-muted-foreground/50 cursor-not-allowed'
+                              : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                         }`}
                       >
                         {item.icon}

@@ -15,8 +15,8 @@ export interface GroupInfo {
   execution_mode?: 'container' | 'host';
   custom_cwd?: string;
   created_by?: string;
-  selected_skills?: string[] | null;
   pinned_at?: string;
+  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
 
 export interface AgentInfo {
@@ -24,7 +24,7 @@ export interface AgentInfo {
   name: string;
   prompt: string;
   status: 'idle' | 'running' | 'completed' | 'error';
-  kind: 'task' | 'conversation';
+  kind: 'task' | 'conversation' | 'spawn';
   created_at: string;
   completed_at?: string;
   result_summary?: string;
@@ -42,6 +42,7 @@ export interface AvailableImGroup {
   avatar?: string;
   member_count?: number;
   channel_type: string;
+  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
 
 export interface GroupMember {

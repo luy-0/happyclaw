@@ -17,19 +17,25 @@ import {
   Pencil,
   Save,
   Loader2,
+  Eye,
+  FileEdit,
 } from 'lucide-react';
 import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
+import { downloadFromUrl } from '../../utils/download';
+import { showToast } from '../../utils/toast';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { Badge } from '../shared/Badge';
+import { Badge } from '@/components/ui/badge';
+import { Label } from '@/components/ui/label';
 import { FileUploadZone } from './FileUploadZone';
+import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface FilePanelProps {
   groupJid: string;
@@ -75,8 +81,8 @@ function FileIcon({ name }: { name: string }) {
   if (CODE_EXTENSIONS.has(ext))
     return <FileCode className="w-4 h-4 text-emerald-500" />;
   if (TEXT_EXTENSIONS.has(ext))
-    return <FileText className="w-4 h-4 text-slate-500" />;
-  return <File className="w-4 h-4 text-slate-400" />;
+    return <FileText className="w-4 h-4 text-muted-foreground" />;
+  return <File className="w-4 h-4 text-muted-foreground" />;
 }
 
 function getFileExt(name: string): string {
@@ -232,7 +238,7 @@ function TextEditor({
             </Button>
             <button
               onClick={onClose}
-              className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
               aria-label="关闭编辑器"
             >
               <X className="w-5 h-5" />
@@ -244,7 +250,7 @@ function TextEditor({
         <div className="flex-1 p-3 overflow-hidden">
           {loading ? (
             <div className="flex items-center justify-center h-full">
-              <p className="text-sm text-slate-500">加载中...</p>
+              <p className="text-sm text-muted-foreground">加载中...</p>
             </div>
           ) : (
             <Textarea
@@ -260,8 +266,206 @@ function TextEditor({
         </div>
 
         {/* Footer hint */}
-        <div className="px-4 py-2 border-t border-slate-100 text-xs text-slate-400 flex-shrink-0">
+        <div className="px-4 py-2 border-t border-border text-xs text-muted-foreground flex-shrink-0">
           Ctrl/Cmd+S 保存 · Esc 关闭
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// ─── Markdown File Viewer (Preview + Edit) ─────────────────────
+
+function MarkdownFileViewer({
+  groupJid,
+  file,
+  onClose,
+}: {
+  groupJid: string;
+  file: FileEntry;
+  onClose: () => void;
+}) {
+  const { getFileContent, saveFileContent } = useFileStore();
+  const [content, setContent] = useState('');
+  const [editContent, setEditContent] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [mode, setMode] = useState<'preview' | 'edit'>('preview');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Lock body scroll on mount, restore on unmount (critical for iOS)
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    const handleSaveKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+        e.preventDefault();
+        doSave();
+      }
+    };
+    window.addEventListener('keydown', handleEsc);
+    window.addEventListener('keydown', handleSaveKey);
+    return () => {
+      window.removeEventListener('keydown', handleEsc);
+      window.removeEventListener('keydown', handleSaveKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onClose, editContent, dirty, mode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const text = await getFileContent(groupJid, file.path);
+      if (!cancelled && text !== null) {
+        setContent(text);
+        setEditContent(text);
+      }
+      if (!cancelled) setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [groupJid, file.path, getFileContent]);
+
+  const doSave = async () => {
+    if (!dirty || saving || mode !== 'edit') return;
+    setSaving(true);
+    const ok = await saveFileContent(groupJid, file.path, editContent);
+    setSaving(false);
+    if (ok) {
+      setContent(editContent);
+      setDirty(false);
+    }
+  };
+
+  const switchToEdit = () => {
+    setEditContent(content);
+    setMode('edit');
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  const switchToPreview = () => {
+    if (dirty) {
+      setContent(editContent);
+    }
+    setMode('preview');
+  };
+
+  // Only close on backdrop click (not on touch-scroll that ends on backdrop)
+  const handleBackdropClick = useCallback((e: React.MouseEvent) => {
+    if (e.target === e.currentTarget) onClose();
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 bg-black/50 sm:flex sm:items-center sm:justify-center sm:p-4 lg:p-6"
+      onClick={handleBackdropClick}
+      style={{ touchAction: 'none' }}
+    >
+      <div
+        className="bg-card w-full h-full sm:rounded-xl sm:shadow-xl sm:max-w-4xl sm:h-[90vh] sm:supports-[height:100dvh]:h-[90dvh] flex flex-col sm:animate-in sm:zoom-in-95 sm:duration-200"
+        style={{ maxHeight: '100dvh' }}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-3 sm:px-4 py-2.5 border-b border-border flex-shrink-0">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <FileIcon name={file.name} />
+            <span className="font-medium text-foreground text-sm truncate">{file.name}</span>
+            {dirty && (
+              <span className="text-xs text-amber-500 flex-shrink-0">未保存</span>
+            )}
+          </div>
+          <div className="flex items-center gap-1 sm:gap-1.5 flex-shrink-0">
+            {/* Mode toggle */}
+            <div className="flex items-center bg-muted rounded-lg p-0.5">
+              <button
+                onClick={switchToPreview}
+                className={`flex items-center gap-1 px-2.5 py-1.5 sm:px-2 sm:py-1 rounded-md text-xs font-medium transition-colors touch-manipulation ${
+                  mode === 'preview'
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <Eye className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+                <span className="hidden sm:inline">预览</span>
+              </button>
+              <button
+                onClick={switchToEdit}
+                className={`flex items-center gap-1 px-2.5 py-1.5 sm:px-2 sm:py-1 rounded-md text-xs font-medium transition-colors touch-manipulation ${
+                  mode === 'edit'
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <FileEdit className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+                <span className="hidden sm:inline">编辑</span>
+              </button>
+            </div>
+            {mode === 'edit' && (
+              <Button
+                size="sm"
+                onClick={doSave}
+                disabled={!dirty || saving}
+                className="touch-manipulation"
+              >
+                {saving && <Loader2 className="size-4 animate-spin" />}
+                <Save className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">保存</span>
+              </Button>
+            )}
+            <button
+              onClick={onClose}
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted touch-manipulation"
+              aria-label="关闭"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Content — explicit overflow container with touch-action for iOS */}
+        <div className="flex-1 min-h-0 relative">
+          {loading ? (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : mode === 'preview' ? (
+            <div
+              ref={scrollRef}
+              className="absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
+              style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y' }}
+            >
+              <MarkdownRenderer content={content} groupJid={groupJid} variant="docs" />
+            </div>
+          ) : (
+            <div className="absolute inset-0 p-2 sm:p-3">
+              <Textarea
+                ref={textareaRef}
+                value={editContent}
+                onChange={(e) => {
+                  setEditContent(e.target.value);
+                  setDirty(true);
+                }}
+                className="w-full h-full font-mono text-sm text-foreground resize-none bg-muted"
+                style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y' }}
+                spellCheck={false}
+              />
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-3 sm:px-4 py-1.5 border-t border-border text-xs text-muted-foreground flex-shrink-0">
+          {mode === 'edit' ? 'Ctrl/Cmd+S 保存 · Esc 关闭' : '点击「编辑」修改内容 · Esc 关闭'}
         </div>
       </div>
     </div>,
@@ -292,6 +496,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   // Preview / Editor state
   const [previewFile, setPreviewFile] = useState<FileEntry | null>(null);
   const [editFile, setEditFile] = useState<FileEntry | null>(null);
+  const [mdViewFile, setMdViewFile] = useState<FileEntry | null>(null);
 
   const isStreaming = useChatStore((s) => !!s.streaming[groupJid]);
   const canOpenLocalFolder = useAuthStore((s) => s.user?.role === 'admin');
@@ -357,6 +562,12 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       return;
     }
 
+    // Markdown 文件（非系统） → Markdown 预览/编辑
+    if (ext === 'md' && !item.isSystem) {
+      setMdViewFile(item);
+      return;
+    }
+
     // 文本文件（非系统） → 编辑
     if (TEXT_EXTENSIONS.has(ext) && !item.isSystem) {
       setEditFile(item);
@@ -366,14 +577,11 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
 
   const handleDownload = (item: FileEntry) => {
     const encoded = toBase64Url(item.path);
-    const url = withBasePath(`/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = item.name;
-    a.rel = 'noopener noreferrer';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
+    downloadFromUrl(url, item.name).catch((err) => {
+      console.error('Download failed:', err);
+      showToast('下载失败', err instanceof Error ? err.message : '文件下载出错，请重试');
+    });
   };
 
   const handleDeleteClick = (item: FileEntry) => {
@@ -443,7 +651,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
             <button
               onClick={handleOpenLocalFolder}
               disabled={openDirLoading}
-              className="hidden md:inline-flex text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              className="hidden md:inline-flex text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               title="打开工作区文件夹"
               aria-label="打开工作区文件夹"
             >
@@ -452,7 +660,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           )}
           <button
             onClick={handleRefresh}
-            className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
+            className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
             title="刷新"
             aria-label="刷新文件列表"
           >
@@ -461,7 +669,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           {onClose && (
             <button
               onClick={onClose}
-              className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
               aria-label="关闭文件面板"
             >
               <X className="w-5 h-5" />
@@ -481,7 +689,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           </button>
           {breadcrumbs.map((crumb, index) => (
             <div key={index} className="flex items-center gap-1">
-              <ChevronRight className="w-4 h-4 text-slate-400 flex-shrink-0" />
+              <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
               <button
                 onClick={() => handleNavigate(index)}
                 className="text-primary hover:underline whitespace-nowrap cursor-pointer"
@@ -503,11 +711,11 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       <div className="flex-1 overflow-y-auto px-2 py-2">
         {loading && fileList.length === 0 ? (
           <div className="flex items-center justify-center h-32">
-            <p className="text-sm text-slate-500">加载中...</p>
+            <p className="text-sm text-muted-foreground">加载中...</p>
           </div>
         ) : sortedFiles.length === 0 ? (
           <div className="flex items-center justify-center h-32">
-            <p className="text-sm text-slate-500">暂无文件</p>
+            <p className="text-sm text-muted-foreground">暂无文件</p>
           </div>
         ) : (
           <div className="space-y-0.5">
@@ -539,7 +747,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                     <div className="flex items-center gap-1.5">
                       <span
                         className={`text-sm truncate ${
-                          item.isSystem ? 'text-slate-400' : 'text-slate-700'
+                          item.isSystem ? 'text-muted-foreground' : 'text-foreground'
                         }`}
                       >
                         {item.name}
@@ -549,7 +757,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                       )}
                     </div>
                     {item.type === 'file' && (
-                      <p className="text-[11px] text-slate-400 leading-tight">{formatSize(item.size)}</p>
+                      <p className="text-[11px] text-muted-foreground leading-tight">{formatSize(item.size)}</p>
                     )}
                   </div>
 
@@ -563,7 +771,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                             e.stopPropagation();
                             setEditFile(item);
                           }}
-                          className="p-2.5 rounded hover:bg-brand-100 text-slate-400 hover:text-primary transition-colors cursor-pointer"
+                          className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
                           title="编辑"
                           aria-label="编辑文件"
                         >
@@ -576,7 +784,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                             e.stopPropagation();
                             handleDownload(item);
                           }}
-                          className="p-2.5 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
+                          className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
                           title="下载"
                           aria-label="下载文件"
                         >
@@ -588,7 +796,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                           e.stopPropagation();
                           handleDeleteClick(item);
                         }}
-                        className="p-2.5 rounded hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors cursor-pointer"
+                        className="p-2.5 rounded hover:bg-red-100 text-muted-foreground hover:text-red-600 transition-colors cursor-pointer"
                         title="删除"
                         aria-label="删除文件"
                       >
@@ -604,7 +812,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                           e.stopPropagation();
                           handleDownload(item);
                         }}
-                        className="p-2.5 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
+                        className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
                         title="下载"
                         aria-label="下载文件"
                       >
@@ -636,7 +844,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           </DialogHeader>
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-foreground mb-2">文件夹名称</label>
+              <Label className="mb-2">文件夹名称</Label>
               <Input
                 type="text"
                 value={newDirName}
@@ -689,6 +897,15 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           groupJid={groupJid}
           file={editFile}
           onClose={() => setEditFile(null)}
+        />
+      )}
+
+      {/* Markdown Viewer Overlay */}
+      {mdViewFile && (
+        <MarkdownFileViewer
+          groupJid={groupJid}
+          file={mdViewFile}
+          onClose={() => setMdViewFile(null)}
         />
       )}
     </div>

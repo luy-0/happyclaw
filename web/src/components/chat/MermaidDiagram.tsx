@@ -1,6 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, Check, Maximize2, X } from 'lucide-react';
+import DOMPurify from 'dompurify';
+
+/** 对 mermaid 渲染的 SVG 进行消毒，防止 XSS */
+function sanitizeSvg(raw: string): string {
+  return DOMPurify.sanitize(raw, {
+    USE_PROFILES: { svg: true, svgFilters: true },
+    ADD_TAGS: ['foreignObject'],
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed'],
+  });
+}
 
 let mermaidPromise: Promise<typeof import('mermaid')> | null = null;
 let idCounter = 0;
@@ -79,7 +89,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
       try {
         const rendered = await renderWithRetry(currentCode, 0);
         if (!disposed && codeRef.current === currentCode) {
-          setSvg(rendered);
+          setSvg(sanitizeSvg(rendered));
           setError(null);
           setLoading(false);
         }
@@ -109,7 +119,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
       <div className="my-4 rounded-lg bg-muted border border-border p-8 flex items-center justify-center">
         <div className="animate-pulse flex flex-col items-center gap-2">
           <div className="h-24 w-48 bg-muted-foreground/20 rounded" />
-          <span className="text-sm text-slate-400">Mermaid 图表渲染中...</span>
+          <span className="text-sm text-muted-foreground">Mermaid 图表渲染中...</span>
         </div>
       </div>
     );
@@ -121,7 +131,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
         <div className="absolute right-2 top-2 opacity-70 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity">
           <button
             onClick={handleCopy}
-            className="p-2 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs flex items-center gap-1"
+            className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-foreground text-xs flex items-center gap-1"
           >
             {copied ? (
               <>
@@ -152,14 +162,14 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
         <div className="absolute right-2 top-2 opacity-70 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity z-10 flex gap-1">
           <button
             onClick={() => setExpanded(true)}
-            className="p-2 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs flex items-center gap-1"
+            className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-foreground text-xs flex items-center gap-1"
             title="放大查看"
           >
             <Maximize2 size={14} />
           </button>
           <button
             onClick={handleCopy}
-            className="p-2 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs flex items-center gap-1"
+            className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-foreground text-xs flex items-center gap-1"
           >
             {copied ? (
               <>
@@ -191,14 +201,14 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           >
             <button
               onClick={() => setExpanded(false)}
-              className="absolute top-3 right-3 z-20 p-2 rounded-full bg-slate-900/70 text-white hover:bg-slate-900 transition-colors cursor-pointer"
+              className="absolute top-3 right-3 z-20 p-2 rounded-full bg-black/70 text-white hover:bg-black transition-colors cursor-pointer"
               aria-label="关闭图表预览"
               title="关闭"
             >
               <X size={16} />
             </button>
             <div
-              className="w-full h-full flex items-center justify-center [touch-action:pinch-zoom] [&>svg]:!w-[90vw] [&>svg]:!max-w-none [&>svg]:!h-auto [&>svg]:!max-h-[90vh]"
+              className="w-full h-full flex items-center justify-center [touch-action:pan-x_pan-y_pinch-zoom] [&>svg]:!w-[90vw] [&>svg]:!max-w-none [&>svg]:!h-auto [&>svg]:!max-h-[90vh]"
               dangerouslySetInnerHTML={{ __html: svg! }}
             />
           </div>

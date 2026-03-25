@@ -20,6 +20,7 @@ export interface ChatGroupItemProps {
   isActive: boolean;
   isHome: boolean;
   isPinned?: boolean;
+  isRunning?: boolean;
   editable?: boolean;
   deletable?: boolean;
   onSelect: (jid: string, folder: string) => void;
@@ -41,6 +42,7 @@ export function ChatGroupItem({
   isActive,
   isHome,
   isPinned,
+  isRunning,
   editable,
   deletable,
   onSelect,
@@ -64,7 +66,7 @@ export function ChatGroupItem({
       className={cn(
         'group relative rounded-lg mb-0.5 transition-colors',
         isActive
-          ? 'bg-accent max-lg:bg-background/70 max-lg:backdrop-blur-lg max-lg:saturate-[1.8] max-lg:border max-lg:border-border/40 max-lg:shadow-[0_8px_32px_rgba(0,0,0,0.06)]'
+          ? 'bg-accent dark:bg-accent max-lg:bg-background/70 max-lg:backdrop-blur-lg max-lg:saturate-[1.8] max-lg:border max-lg:border-border/40 max-lg:shadow-[0_8px_32px_rgba(0,0,0,0.06)]'
           : 'hover:bg-accent/50',
       )}
     >
@@ -77,7 +79,7 @@ export function ChatGroupItem({
             <Star className="w-3.5 h-3.5 text-yellow-500 fill-yellow-500 flex-shrink-0" />
           )}
           {isPinned && !isHome && (
-            <Pin className="w-3 h-3 text-teal-500 flex-shrink-0" />
+            <Pin className="w-3 h-3 text-primary flex-shrink-0" />
           )}
           <span
             className={cn(
@@ -87,6 +89,12 @@ export function ChatGroupItem({
           >
             {displayName}
           </span>
+          {isRunning && (
+            <span className="relative flex h-2 w-2 flex-shrink-0">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+            </span>
+          )}
           {executionMode === 'host' ? (
             <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700">
               宿主机

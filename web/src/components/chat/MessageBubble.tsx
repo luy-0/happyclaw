@@ -1,5 +1,7 @@
-import { useState, useRef, memo } from 'react';
-import { Copy, Check, ChevronDown, ChevronUp, Ellipsis } from 'lucide-react';
+import { useState, memo, lazy, Suspense } from 'react';
+import { Copy, Check, ChevronDown, ChevronUp, Ellipsis, ImageDown } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Message } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
@@ -8,6 +10,8 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { ImageLightbox } from './ImageLightbox';
 import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
+
+const ShareImageDialog = lazy(() => import('./ShareImageDialog').then(m => ({ default: m.ShareImageDialog })));
 
 interface MessageBubbleProps {
   message: Message;
@@ -31,7 +35,7 @@ function ReasoningBlock({ content }: { content: string }) {
     <div className="mb-3 rounded-xl border border-amber-200/60 bg-amber-50/40 overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-amber-50/60 transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 pr-16 text-left hover:bg-amber-50/60 transition-colors"
       >
         <svg className="w-4 h-4 text-amber-500 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z" />
@@ -53,12 +57,87 @@ function ReasoningBlock({ content }: { content: string }) {
   );
 }
 
+/** Parse and display token usage for AI messages */
+function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
+  const usage = (() => {
+    try {
+      return JSON.parse(tokenUsageJson) as {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheCreationInputTokens?: number;
+        costUSD?: number;
+        durationMs?: number;
+        numTurns?: number;
+        modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+      };
+    } catch {
+      return null;
+    }
+  })();
+
+  if (!usage) return null;
+
+  const models = usage.modelUsage ? Object.entries(usage.modelUsage) : [];
+  // 主模型 = 费用最高的（即用户指定的模型），内部模型不向用户展示
+  models.sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
+  const primary = models.length > 0 ? models[0] : null;
+  const primaryInput = primary ? primary[1].inputTokens : (usage.inputTokens || 0);
+  const primaryOutput = primary ? primary[1].outputTokens : (usage.outputTokens || 0);
+  const totalTokens = primaryInput + primaryOutput;
+
+  const formatNum = (n: number): string => {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
+  };
+
+  const summaryContent = (
+    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
+      <span>{formatNum(totalTokens)} tokens</span>
+      {usage.durationMs ? (
+        <>
+          <span className="opacity-40">·</span>
+          <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
+        </>
+      ) : null}
+    </span>
+  );
+
+  const hasDetails = primary || (usage.cacheReadInputTokens || 0) > 0;
+
+  if (!hasDetails) {
+    return <div className="mt-1.5">{summaryContent}</div>;
+  }
+
+  return (
+    <div className="mt-1.5">
+      <TooltipProvider delayDuration={200}>
+        <Tooltip>
+          <TooltipTrigger asChild>{summaryContent}</TooltipTrigger>
+          <TooltipContent side="bottom" align="start">
+            <div className="text-xs space-y-0.5">
+              {primary && <div className="opacity-70 font-medium mb-1">{primary[0]}</div>}
+              {primary && <div>In {formatNum(primaryInput)} / Out {formatNum(primaryOutput)}</div>}
+              {(usage.cacheReadInputTokens || 0) > 0 && (
+                <div className="opacity-70">
+                  Read {formatNum(usage.cacheReadInputTokens || 0)}
+                  {(usage.cacheCreationInputTokens || 0) > 0 && ` / Write ${formatNum(usage.cacheCreationInputTokens || 0)}`}
+                </div>
+              )}
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </div>
+  );
+}
+
 export const MessageBubble = memo(function MessageBubble({ message, showTime, thinkingContent, isShared }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [lightboxState, setLightboxState] = useState<{ images: string[]; index: number } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const touchTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const touchStartPos = useRef({ x: 0, y: 0 });
+  const [showShareDialog, setShowShareDialog] = useState(false);
   const currentUser = useAuthStore((s) => s.user);
   const appearance = useAuthStore((s) => s.appearance);
   const { mode: displayMode } = useDisplayMode();
@@ -111,11 +190,6 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     }
   };
 
-  const handleContextMenu = (e: React.MouseEvent) => {
-    e.preventDefault();
-    setContextMenu({ x: e.clientX, y: e.clientY });
-  };
-
   const handleMenuButton = (e: React.MouseEvent | React.TouchEvent) => {
     e.stopPropagation();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -123,27 +197,6 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     setContextMenu({ x: rect.left, y: rect.bottom + 4 });
   };
 
-  const handleTouchStart = (e: React.TouchEvent) => {
-    const touch = e.touches[0];
-    touchStartPos.current = { x: touch.clientX, y: touch.clientY };
-    touchTimer.current = setTimeout(() => {
-      mediumTap();
-      setContextMenu({ x: touch.clientX, y: touch.clientY - 10 });
-    }, 500);
-  };
-
-  const handleTouchEnd = () => {
-    if (touchTimer.current) clearTimeout(touchTimer.current);
-  };
-
-  const handleTouchMove = (e: React.TouchEvent) => {
-    const touch = e.touches[0];
-    const dx = Math.abs(touch.clientX - touchStartPos.current.x);
-    const dy = Math.abs(touch.clientY - touchStartPos.current.y);
-    if (dx > 10 || dy > 10) {
-      if (touchTimer.current) clearTimeout(touchTimer.current);
-    }
-  };
 
   // Context overflow system message
   if (message.sender === '__system__' && message.content.startsWith('context_overflow:')) {
@@ -152,7 +205,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
       <div className="mb-6">
         {showTime && (
           <div className="flex items-center gap-2 mb-2">
-            <span className="text-xs text-slate-500">{time}</span>
+            <span className="text-xs text-muted-foreground">{time}</span>
             <span className="text-xs font-medium text-red-600">系统消息</span>
           </div>
         )}
@@ -171,6 +224,67 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     );
   }
 
+  // Billing system message (quota exceeded / insufficient balance)
+  if (message.sender === '__billing__') {
+    const displayMsg = message.content.replace(/^⚠️\s*/, '');
+    const isBalanceBlocked = displayMsg.includes('充值余额后继续使用');
+    // Detect which quota window was exceeded
+    const windowLabels: Record<string, string> = { daily: '日度', weekly: '周度', monthly: '月度' };
+    let exceededWindow = '';
+    if (displayMsg.includes('日度')) exceededWindow = 'daily';
+    else if (displayMsg.includes('周度')) exceededWindow = 'weekly';
+    else if (displayMsg.includes('月度')) exceededWindow = 'monthly';
+    const windowTag = isBalanceBlocked ? '余额' : windowLabels[exceededWindow] || '配额';
+    // Extract reset hint if present (e.g. "约 3 小时后重置" or "约 1 天后重置")
+    const resetMatch = displayMsg.match(/约\s*(\d+)\s*(小时|天)后重置/);
+    return (
+      <div className="mb-6">
+        {showTime && (
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs text-muted-foreground">{time}</span>
+            <span className="text-xs font-medium text-amber-600">
+              {isBalanceBlocked ? '余额提醒' : '配额提醒'}
+            </span>
+          </div>
+        )}
+        <div className="relative bg-amber-50 dark:bg-amber-950/30 rounded-xl border border-amber-200 dark:border-amber-800 border-l-[3px] border-l-amber-500 px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="flex-shrink-0 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
+              !
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-1">
+                <h3 className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                  {isBalanceBlocked ? '余额不足' : `${windowTag}配额已用完`}
+                </h3>
+                {!isBalanceBlocked && exceededWindow && (
+                  <span className={`px-1.5 py-0.5 text-[10px] rounded-full font-medium ${
+                    exceededWindow === 'daily'
+                      ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                      : exceededWindow === 'weekly'
+                        ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300'
+                        : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
+                  }`}>
+                    {windowTag}限额
+                  </span>
+                )}
+              </div>
+              <p className="text-sm text-amber-800 dark:text-amber-300 leading-relaxed">{displayMsg}</p>
+              {resetMatch && (
+                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                  预计 {resetMatch[1]} {resetMatch[2]}后自动重置
+                </p>
+              )}
+              <Link to="/billing" className="inline-block mt-2 text-sm text-primary hover:underline font-medium">
+                查看账单 &rarr;
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ── Compact mode: all messages left-aligned, no bubbles, full-width ──
   if (displayMode === 'compact') {
     const isAI = message.is_from_me;
@@ -179,14 +293,14 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
       : (isOtherUser ? (message.sender_name || '用户') : (currentUser?.display_name || currentUser?.username || '我'));
 
     return (
-      <div className="group mb-2 border-b border-border pb-2" onContextMenu={handleContextMenu} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+      <div className="group mb-2 border-b border-border pb-2">
         {/* Sender line — no avatars in compact mode */}
         <div className="flex items-center gap-1.5 mb-1">
           <span className={`text-xs font-semibold ${isAI ? 'text-primary' : 'text-muted-foreground'}`}>{senderName}</span>
-          {showTime && <span className="text-[11px] text-slate-400">{time}</span>}
+          {showTime && <span className="text-[11px] text-muted-foreground">{time}</span>}
           <button
             onClick={handleCopy}
-            className="ml-1 w-5 h-5 rounded flex items-center justify-center text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+            className="ml-1 w-5 h-5 rounded flex items-center justify-center text-muted-foreground/50 hover:text-foreground/70 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
             title="复制"
           >
             {copied ? <Check className="w-3 h-3 text-primary" /> : <Copy className="w-3 h-3" />}
@@ -204,7 +318,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
                 key={i}
                 src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
                 alt={img.name || `图片 ${i + 1}`}
-                className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-slate-200 hover:border-primary transition-colors"
+                className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
                 onClick={() => setLightboxState({ images: allImageSrcs, index: i })}
               />
             ))}
@@ -220,6 +334,11 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
               <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground">{message.content}</p>
             )}
           </div>
+        )}
+
+        {/* Token usage (compact mode) */}
+        {isAI && message.token_usage && (
+          <TokenUsageDisplay tokenUsageJson={message.token_usage} />
         )}
 
         {lightboxState && (
@@ -239,9 +358,9 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
       const otherName = message.sender_name || '用户';
       const initial = otherName[0]?.toUpperCase() || '?';
       return (
-        <div className="group mb-4" onContextMenu={handleContextMenu} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+        <div className="group mb-4">
           <div className="flex items-center gap-2 mb-1.5 lg:hidden">
-            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center text-xs font-medium text-slate-600 flex-shrink-0">
+            <div className="w-6 h-6 rounded-full bg-muted flex items-center justify-center text-xs font-medium text-foreground/70 flex-shrink-0">
               {initial}
             </div>
             <span className="text-xs text-muted-foreground font-medium">{otherName}</span>
@@ -250,7 +369,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
 
           <div className="lg:flex lg:gap-3">
             <div className="hidden lg:block flex-shrink-0">
-              <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-sm font-medium text-slate-600">
+              <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center text-sm font-medium text-foreground/70">
                 {initial}
               </div>
             </div>
@@ -315,7 +434,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     // User message (own): right-aligned
     const showSenderLabel = isShared;
     return (
-      <div className="group flex justify-end mb-4" onContextMenu={handleContextMenu} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+      <div className="group flex justify-end mb-4">
         <div className="flex flex-col items-end min-w-0 w-full">
           {showSenderLabel && (
             <span className="text-xs text-muted-foreground font-medium mb-1 mr-1">
@@ -338,7 +457,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
               </div>
             )}
             {!hasOnlyImages && (
-              <div className="bg-card border border-border text-foreground px-4 py-2.5 rounded-2xl rounded-tr-sm shadow-sm">
+              <div className="bg-primary/10 text-foreground px-4 py-2.5 rounded-2xl rounded-tr-sm shadow-sm">
                 <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">{message.content}</p>
               </div>
             )}
@@ -354,7 +473,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             )}
           </div>
           {showTime && (
-            <span className="text-xs text-slate-400 mt-1.5 mr-1">{time}</span>
+            <span className="text-xs text-muted-foreground mt-1.5 mr-1">{time}</span>
           )}
         </div>
 
@@ -385,7 +504,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   const aiImageUrl = currentUser?.ai_avatar_url;
 
   return (
-    <div className="group mb-4" onContextMenu={handleContextMenu} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+    <div className="group mb-4">
       {/* Mobile: compact avatar + name row */}
       <div className="flex items-center gap-2 mb-1.5 lg:hidden">
         <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="sm" />
@@ -406,9 +525,17 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           </div>
 
           {/* Card */}
-          <div className="relative bg-card rounded-xl border border-border border-l-[3px] border-l-[var(--brand-400)] px-5 py-4 max-lg:bg-card/90 max-lg:backdrop-blur-sm overflow-hidden">
+          <div className="relative bg-surface rounded-xl border border-border/60 px-5 py-4 max-lg:bg-surface/90 max-lg:backdrop-blur-sm overflow-hidden font-serif shadow-card">
             {/* Action buttons */}
             <div className="absolute top-2 right-2 flex items-center gap-0.5 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity">
+              <button
+                onClick={() => setShowShareDialog(true)}
+                className="w-7 h-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 max-lg:hidden cursor-pointer"
+                title="分享图片"
+                aria-label="生成分享图片"
+              >
+                <ImageDown className="w-4 h-4" />
+              </button>
               <button
                 onClick={handleCopy}
                 className="w-7 h-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 max-lg:hidden cursor-pointer"
@@ -438,7 +565,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
                     key={i}
                     src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
                     alt={img.name || `图片 ${i + 1}`}
-                    className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-slate-200 hover:border-primary transition-colors"
+                    className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
                     onClick={() => setLightboxState({ images: allImageSrcs, index: i })}
                   />
                 ))}
@@ -450,6 +577,11 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
               <div className="max-w-none overflow-hidden">
                 <MarkdownRenderer content={message.content} groupJid={message.chat_jid} variant="chat" />
               </div>
+            )}
+
+            {/* Token usage */}
+            {message.is_from_me && message.token_usage && (
+              <TokenUsageDisplay tokenUsageJson={message.token_usage} />
             )}
           </div>
         </div>
@@ -469,13 +601,23 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           onClose={() => setContextMenu(null)}
           chatJid={message.chat_jid}
           messageId={message.id}
+          onShareImage={() => setShowShareDialog(true)}
         />
+      )}
+      {showShareDialog && (
+        <Suspense>
+          <ShareImageDialog
+            onClose={() => setShowShareDialog(false)}
+            message={message}
+          />
+        </Suspense>
       )}
     </div>
   );
 }, (prev, next) =>
   prev.message.id === next.message.id &&
   prev.message.content === next.message.content &&
+  prev.message.token_usage === next.message.token_usage &&
   prev.showTime === next.showTime &&
   prev.thinkingContent === next.thinkingContent &&
   prev.isShared === next.isShared

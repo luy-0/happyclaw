@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
 import { Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
 
+import { Label } from '@/components/ui/label';
 import { useAuthStore } from '../../stores/auth';
+import { useBillingStore, type BillingPlan } from '../../stores/billing';
 import { api } from '../../api/client';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import type { SettingsNotification, SystemSettings } from './types';
+import { Switch } from '@/components/ui/switch';
+import type { SystemSettings } from './types';
 import { getErrorMessage } from './types';
-
-interface SystemSettingsSectionProps extends SettingsNotification {}
 
 interface FieldConfig {
   key: keyof SystemSettings;
@@ -126,14 +128,22 @@ const fields: FieldConfig[] = [
   },
 ];
 
-export function SystemSettingsSection({ setNotice, setError }: SystemSettingsSectionProps) {
+export function SystemSettingsSection() {
   const { hasPermission } = useAuthStore();
 
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [displayValues, setDisplayValues] = useState<Record<string, number>>({});
+  const [billingEnabled, setBillingEnabled] = useState(false);
+  const [billingMinStartBalanceUsd, setBillingMinStartBalanceUsd] = useState(0.01);
+  const [billingCurrency, setBillingCurrency] = useState('USD');
+  const [billingCurrencyRate, setBillingCurrencyRate] = useState(1);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
+  const loadBillingStatus = useBillingStore((s) => s.loadBillingStatus);
+  const { plans, loadPlans, updatePlan } = useBillingStore();
+  const [defaultPlanId, setDefaultPlanId] = useState('');
+  const [settingDefault, setSettingDefault] = useState(false);
   const canManage = hasPermission('manage_system_config');
 
   useEffect(() => {
@@ -144,23 +154,58 @@ export function SystemSettingsSection({ setNotice, setError }: SystemSettingsSec
         setSettings(data);
         const display: Record<string, number> = {};
         for (const f of fields) {
-          display[f.key] = f.toDisplay(data[f.key]);
+          display[f.key] = f.toDisplay(data[f.key] as number);
         }
         setDisplayValues(display);
+        setBillingEnabled(data.billingEnabled ?? false);
+        setBillingMinStartBalanceUsd(data.billingMinStartBalanceUsd ?? 0.01);
+        setBillingCurrency(data.billingCurrency ?? 'USD');
+        setBillingCurrencyRate(data.billingCurrencyRate ?? 1);
       } catch (err) {
-        setError(getErrorMessage(err, '加载系统参数失败'));
+        toast.error(getErrorMessage(err, '加载系统参数失败'));
       } finally {
         setLoading(false);
       }
     })();
-  }, [setError]);
+  }, []);
+
+  // Load plans when billing is enabled (for default plan picker)
+  useEffect(() => {
+    if (billingEnabled) {
+      loadPlans();
+    }
+  }, [billingEnabled, loadPlans]);
+
+  // Sync default plan ID from loaded plans
+  useEffect(() => {
+    const def = plans.find((p: BillingPlan) => p.is_default);
+    setDefaultPlanId(def?.id ?? '');
+  }, [plans]);
+
+  const handleSetDefaultPlan = async (planId: string) => {
+    if (!planId || planId === defaultPlanId) return;
+    setSettingDefault(true);
+    try {
+      await updatePlan(planId, { is_default: true });
+      setDefaultPlanId(planId);
+      toast.success('默认套餐已更新');
+    } catch (err) {
+      toast.error(getErrorMessage(err, '设置默认套餐失败'));
+    } finally {
+      setSettingDefault(false);
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
-    setError(null);
-    setNotice(null);
     try {
-      const payload: Partial<SystemSettings> = {};
+      const payload: Partial<SystemSettings> = {
+        billingEnabled,
+        billingMode: 'wallet_first',
+        billingMinStartBalanceUsd,
+        billingCurrency,
+        billingCurrencyRate,
+      };
       for (const f of fields) {
         const val = displayValues[f.key];
         if (val !== undefined) {
@@ -171,12 +216,18 @@ export function SystemSettingsSection({ setNotice, setError }: SystemSettingsSec
       setSettings(data);
       const display: Record<string, number> = {};
       for (const f of fields) {
-        display[f.key] = f.toDisplay(data[f.key]);
+        display[f.key] = f.toDisplay(data[f.key] as number);
       }
       setDisplayValues(display);
-      setNotice('系统参数已保存，新参数将对后续启动的容器/进程生效');
+      setBillingEnabled(data.billingEnabled ?? false);
+      setBillingMinStartBalanceUsd(data.billingMinStartBalanceUsd ?? 0.01);
+      setBillingCurrency(data.billingCurrency ?? 'USD');
+      setBillingCurrencyRate(data.billingCurrencyRate ?? 1);
+      // 刷新计费状态，更新导航栏可见性
+      loadBillingStatus();
+      toast.success('系统参数已保存，新参数将对后续启动的容器/进程生效');
     } catch (err) {
-      setError(getErrorMessage(err, '保存系统参数失败'));
+      toast.error(getErrorMessage(err, '保存系统参数失败'));
     } finally {
       setSaving(false);
     }
@@ -185,29 +236,29 @@ export function SystemSettingsSection({ setNotice, setError }: SystemSettingsSec
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
       </div>
     );
   }
 
   if (!canManage) {
-    return <div className="text-sm text-slate-500">需要系统配置权限才能修改系统参数。</div>;
+    return <div className="text-sm text-muted-foreground">需要系统配置权限才能修改系统参数。</div>;
   }
 
   if (!settings) return null;
 
   return (
     <div className="space-y-6">
-      <p className="text-sm text-slate-500">
+      <p className="text-sm text-muted-foreground">
         调整容器运行参数和安全限制。修改后无需重启，新参数对后续创建的容器/进程立即生效。
       </p>
 
       <div className="space-y-5">
         {fields.map((f) => (
           <div key={f.key}>
-            <label className="block text-sm font-medium text-slate-900 mb-1">
+            <Label className="mb-1">
               {f.label}
-            </label>
+            </Label>
             <div className="flex items-center gap-2">
               <Input
                 type="number"
@@ -224,13 +275,130 @@ export function SystemSettingsSection({ setNotice, setError }: SystemSettingsSec
                 step={f.step}
                 className="max-w-32"
               />
-              <span className="text-sm text-slate-500">{f.unit}</span>
+              <span className="text-sm text-muted-foreground">{f.unit}</span>
             </div>
-            <p className="text-xs text-slate-400 mt-1">
+            <p className="text-xs text-muted-foreground mt-1">
               {f.description}（范围：{f.min} - {f.max} {f.unit}）
             </p>
           </div>
         ))}
+      </div>
+
+      {/* 计费设置 */}
+      <div className="border-t border-border pt-6 space-y-5">
+        <h3 className="text-sm font-semibold text-foreground">计费系统</h3>
+
+        <div className="flex items-center justify-between">
+          <div>
+            <Label>启用计费</Label>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              开启后普通用户必须先有余额才能使用，管理员可在后台进行充扣和套餐分配
+            </p>
+          </div>
+          <Switch
+            checked={billingEnabled}
+            onCheckedChange={setBillingEnabled}
+            aria-label="启用计费系统"
+          />
+        </div>
+
+        {billingEnabled && (
+          <>
+          <div>
+              <Label className="mb-1">
+                计费模式
+              </Label>
+              <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                钱包优先（固定）
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                普通用户必须先有余额才能使用，套餐只决定费率和资源上限。
+              </p>
+            </div>
+
+            <div>
+              <Label className="mb-1">
+                最低起用余额
+              </Label>
+              <Input
+                type="number"
+                value={billingMinStartBalanceUsd}
+                onChange={(e) => setBillingMinStartBalanceUsd(Number(e.target.value) || 0)}
+                min={0}
+                step={0.01}
+                className="max-w-32"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                普通用户余额低于该值时，消息和任务都会被阻断。
+              </p>
+            </div>
+
+            <div>
+              <Label className="mb-1">
+                显示货币符号
+              </Label>
+              <Input
+                type="text"
+                value={billingCurrency}
+                onChange={(e) => setBillingCurrency(e.target.value)}
+                className="max-w-32"
+                placeholder="USD"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                前端显示的货币符号（如 USD、CNY、EUR）
+              </p>
+            </div>
+
+            <div>
+              <Label className="mb-1">
+                汇率乘数
+              </Label>
+              <Input
+                type="number"
+                value={billingCurrencyRate}
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  setBillingCurrencyRate(Number.isFinite(val) ? val : 1);
+                }}
+                min={0.01}
+                max={1000}
+                step={0.01}
+                className="max-w-32"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                将 USD 转为显示货币的乘数（如 CNY 约 7.2）
+              </p>
+            </div>
+
+            <div>
+              <Label className="mb-1">
+                默认套餐
+              </Label>
+              <select
+                value={defaultPlanId}
+                onChange={(e) => handleSetDefaultPlan(e.target.value)}
+                disabled={settingDefault || plans.filter((p: BillingPlan) => p.is_active).length === 0}
+                className="h-9 px-3 text-sm border border-zinc-300 dark:border-zinc-600 rounded-md bg-transparent max-w-64"
+              >
+                <option value="" disabled>
+                  {plans.filter((p: BillingPlan) => p.is_active).length === 0
+                    ? '请先创建可用套餐'
+                    : '请选择默认套餐'}
+                </option>
+                {plans
+                  .filter((p: BillingPlan) => p.is_active)
+                  .map((p: BillingPlan) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}{p.is_default ? ' (当前默认)' : ''}
+                    </option>
+                  ))}
+              </select>
+              <p className="text-xs text-muted-foreground mt-1">
+                新用户注册时自动分配的套餐
+              </p>
+            </div>
+          </>
+        )}
       </div>
 
       <div>

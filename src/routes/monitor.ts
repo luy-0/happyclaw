@@ -13,38 +13,132 @@ import {
   canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
-import { getRegisteredGroup, getRouterState } from '../db.js';
+import { getRegisteredGroup, getRouterState, hasContainerModeGroups } from '../db.js';
 import { CONTAINER_IMAGE } from '../config.js';
 import { getSystemSettings } from '../runtime-config.js';
 import { logger } from '../logger.js';
 
 const execFileAsync = promisify(execFile);
 
-// --- Claude Code version cache (1h TTL) ---
+// --- Claude Code version cache ---
 
-let cachedClaudeVersion: { version: string | null; fetchedAt: number } | null =
-  null;
+interface VersionInfo {
+  host: string | null;
+  container: string | null;
+  latest: string | null;
+}
+
+let cachedVersions: {
+  info: VersionInfo;
+  fetchedAt: number;
+  imageId: string | null;
+} | null = null;
 const VERSION_CACHE_TTL = 60 * 60 * 1000;
 
-async function getClaudeCodeVersion(): Promise<string | null> {
+// Latest version cache (separate TTL, queried from npm registry)
+let cachedLatestVersion: { version: string | null; fetchedAt: number } | null =
+  null;
+const LATEST_VERSION_CACHE_TTL = 30 * 60 * 1000; // 30min
+
+/** Query latest Claude Code version from npm registry */
+async function getLatestClaudeCodeVersion(): Promise<string | null> {
   const now = Date.now();
   if (
-    cachedClaudeVersion &&
-    now - cachedClaudeVersion.fetchedAt < VERSION_CACHE_TTL
+    cachedLatestVersion &&
+    now - cachedLatestVersion.fetchedAt < LATEST_VERSION_CACHE_TTL
   ) {
-    return cachedClaudeVersion.version;
+    return cachedLatestVersion.version;
   }
+
   try {
-    const { stdout } = await execFileAsync('claude', ['--version'], {
-      timeout: 5000,
-    });
+    const { stdout } = await execFileAsync(
+      'npm',
+      ['view', '@anthropic-ai/claude-code', 'version'],
+      { timeout: 15000 },
+    );
     const version = stdout.trim() || null;
-    cachedClaudeVersion = { version, fetchedAt: now };
+    cachedLatestVersion = { version, fetchedAt: now };
     return version;
   } catch {
-    cachedClaudeVersion = { version: null, fetchedAt: now };
+    // Fallback: keep stale cache if available
+    if (cachedLatestVersion) return cachedLatestVersion.version;
+    cachedLatestVersion = { version: null, fetchedAt: now };
     return null;
   }
+}
+
+/** Get host Claude Code version by running SDK's built-in cli.js --version */
+async function getHostClaudeCodeVersion(): Promise<string | null> {
+  try {
+    const cliPath = path.resolve(
+      process.cwd(),
+      'container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/cli.js',
+    );
+    const { stdout } = await execFileAsync(
+      'node',
+      ['-e', `process.argv = ['node', 'claude', '--version']; require('${cliPath}')`],
+      { timeout: 10000 },
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getDockerImageId(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'docker',
+      ['images', CONTAINER_IMAGE, '--format', '{{.ID}}'],
+      { timeout: 5000 },
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get container Claude Code version from SDK's cli.js inside Docker image */
+async function getContainerClaudeCodeVersion(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'docker',
+      [
+        'run', '--rm', '--entrypoint', 'node',
+        CONTAINER_IMAGE, '-e',
+        `process.argv = ['node', 'claude', '--version']; require('/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js')`,
+      ],
+      { timeout: 30000 },
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getClaudeCodeVersions(): Promise<VersionInfo> {
+  const now = Date.now();
+  const imageId = await getDockerImageId();
+
+  // Return cached if same image and within TTL
+  if (
+    cachedVersions &&
+    cachedVersions.imageId === imageId &&
+    now - cachedVersions.fetchedAt < VERSION_CACHE_TTL
+  ) {
+    return cachedVersions.info;
+  }
+
+  // Fetch all versions concurrently
+  const [host, container, latest] = await Promise.all([
+    getHostClaudeCodeVersion(),
+    imageId ? getContainerClaudeCodeVersion() : Promise.resolve(null),
+    getLatestClaudeCodeVersion(),
+  ]);
+  const info: VersionInfo = { host, container, latest };
+
+  cachedVersions = { info, fetchedAt: now, imageId };
+  return info;
 }
 
 // --- Docker build state ---
@@ -121,6 +215,8 @@ monitorRoutes.get('/health', async (c) => {
 });
 
 async function checkDockerImageExists(): Promise<boolean> {
+  // Skip Docker check entirely when no groups use container mode
+  if (!hasContainerModeGroups()) return false;
   try {
     const { stdout } = await execFileAsync(
       'docker',
@@ -187,7 +283,7 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     groups: filteredGroups,
     dockerImageExists,
     dockerBuildInProgress: buildState.building,
-    claudeCodeVersion: isAdmin ? await getClaudeCodeVersion() : undefined,
+    claudeCodeVersions: isAdmin ? await getClaudeCodeVersions() : undefined,
     dockerBuildLogs:
       isAdmin && buildState.building ? buildState.logs.slice(-50) : undefined,
     dockerBuildResult: isAdmin ? buildState.result : undefined,
@@ -273,6 +369,8 @@ monitorRoutes.post(
         : `Build process exited with code ${code}`;
       if (success) {
         logger.info('Docker image build completed');
+        // Invalidate version cache so next query fetches from new image
+        cachedVersions = null;
       } else {
         logger.error({ code }, 'Docker image build failed');
       }

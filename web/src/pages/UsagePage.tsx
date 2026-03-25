@@ -1,9 +1,15 @@
 import { useEffect, useMemo } from 'react';
-import { RefreshCw, Zap, ArrowUpRight, ArrowDownRight, DollarSign, MessageSquare, Database } from 'lucide-react';
+import {
+  RefreshCw, Zap, ArrowUpRight, ArrowDownRight, DollarSign,
+  MessageSquare, Database, Filter, Info,
+} from 'lucide-react';
 import { useUsageStore } from '../stores/usage';
+import { useAuthStore } from '../stores/auth';
+import { formatTokens } from '../components/billing/utils';
 import { PageHeader } from '@/components/common/PageHeader';
 import { SkeletonStatCards } from '@/components/common/Skeletons';
 import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip,
   ResponsiveContainer, CartesianGrid, Legend, PieChart, Pie, Cell,
@@ -27,12 +33,6 @@ const CHART_COLORS = [
   '#ec4899',
 ];
 
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
-}
-
 function formatCost(usd: number): string {
   if (usd >= 1) return `$${usd.toFixed(2)}`;
   if (usd >= 0.01) return `$${usd.toFixed(3)}`;
@@ -41,14 +41,36 @@ function formatCost(usd: number): string {
 }
 
 export function UsagePage() {
-  const { summary, breakdown, days, loading, error, loadStats, setDays } = useUsageStore();
+  const {
+    summary, breakdown, dataRange, days, loading, error,
+    loadStats, setDays, loadFilters,
+    selectedUserId, selectedModel, availableModels, availableUsers,
+    setSelectedUserId, setSelectedModel,
+  } = useUsageStore();
+  const user = useAuthStore((s) => s.user);
+  const isAdmin = user?.role === 'admin';
 
   useEffect(() => {
     loadStats();
-  }, [loadStats]);
+    loadFilters();
+  }, [loadStats, loadFilters]);
 
-  // Aggregate daily data for chart
+  // Subtitle with data range info
+  const subtitle = useMemo(() => {
+    if (dataRange && dataRange.activeDays > 0) {
+      const from = dataRange.from.slice(5); // MM-DD
+      const to = dataRange.to.slice(5);
+      if (dataRange.activeDays < days) {
+        return `过去 ${days} 天内有 ${dataRange.activeDays} 天数据（${from} ~ ${to}）`;
+      }
+      return `${from} ~ ${to} 共 ${dataRange.activeDays} 天`;
+    }
+    return `过去 ${days} 天的 Token 用量和费用`;
+  }, [dataRange, days]);
+
+  // Aggregate daily data for chart — fill all dates in the selected period
   const dailyData = useMemo(() => {
+    // Aggregate breakdown by date
     const byDate = new Map<string, { date: string; input: number; output: number; cacheRead: number; cost: number; messages: number }>();
     for (const row of breakdown) {
       const existing = byDate.get(row.date);
@@ -57,7 +79,7 @@ export function UsagePage() {
         existing.output += row.output_tokens;
         existing.cacheRead += row.cache_read_tokens;
         existing.cost += row.cost_usd;
-        existing.messages += row.message_count;
+        existing.messages += row.request_count;
       } else {
         byDate.set(row.date, {
           date: row.date,
@@ -65,12 +87,32 @@ export function UsagePage() {
           output: row.output_tokens,
           cacheRead: row.cache_read_tokens,
           cost: row.cost_usd,
-          messages: row.message_count,
+          messages: row.request_count,
         });
       }
     }
-    return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
-  }, [breakdown]);
+
+    // Generate complete date range for the selected period
+    const result: typeof Array.prototype = [];
+    const today = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      const dateStr = `${yyyy}-${mm}-${dd}`;
+      result.push(byDate.get(dateStr) || {
+        date: dateStr,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cost: 0,
+        messages: 0,
+      });
+    }
+    return result;
+  }, [breakdown, days]);
 
   // Model breakdown for pie chart
   const modelData = useMemo(() => {
@@ -88,18 +130,53 @@ export function UsagePage() {
         });
       }
     }
-    return Array.from(byModel.values()).sort((a, b) => b.cost - a.cost);
+    return Array.from(byModel.values())
+      .filter((m) => m.tokens > 0 || m.cost > 0)
+      .sort((a, b) => b.cost - a.cost);
   }, [breakdown]);
+
+  // Cache hit rate
+  const cacheHitRate = useMemo(() => {
+    if (!summary) return null;
+    const totalInput = summary.totalInputTokens + summary.totalCacheReadTokens;
+    if (totalInput === 0) return null;
+    return (summary.totalCacheReadTokens / totalInput * 100).toFixed(1);
+  }, [summary]);
 
   return (
     <div className="min-h-full bg-background p-4 lg:p-8">
       <div className="max-w-7xl mx-auto">
         <PageHeader
           title="用量统计"
-          subtitle={`过去 ${days} 天的 Token 用量和费用`}
+          subtitle={subtitle}
           className="mb-6"
           actions={
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* Filters */}
+              {isAdmin && availableUsers.length > 1 && (
+                <select
+                  value={selectedUserId || ''}
+                  onChange={(e) => setSelectedUserId(e.target.value || null)}
+                  className="h-9 px-3 rounded-lg border border-border bg-card text-sm text-foreground"
+                >
+                  <option value="">全部用户</option>
+                  {availableUsers.map((u) => (
+                    <option key={u.id} value={u.id}>{u.username}</option>
+                  ))}
+                </select>
+              )}
+              {availableModels.length > 1 && (
+                <select
+                  value={selectedModel || ''}
+                  onChange={(e) => setSelectedModel(e.target.value || null)}
+                  className="h-9 px-3 rounded-lg border border-border bg-card text-sm text-foreground"
+                >
+                  <option value="">全部模型</option>
+                  {availableModels.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              )}
               <div className="flex rounded-lg border border-border overflow-hidden">
                 {PERIOD_OPTIONS.map((opt) => (
                   <button
@@ -121,6 +198,13 @@ export function UsagePage() {
             </div>
           }
         />
+
+        {availableModels.length > 1 && (
+          <p className="text-xs text-muted-foreground mb-4 flex items-center gap-1.5">
+            <Info className="w-3.5 h-3.5 shrink-0" />
+            除主模型外，SDK 可能调用轻量模型处理意图分析等内部任务以优化成本
+          </p>
+        )}
 
         {loading && !summary && <SkeletonStatCards />}
 
@@ -157,7 +241,7 @@ export function UsagePage() {
               />
               <StatCard
                 icon={<MessageSquare className="w-5 h-5" />}
-                label="对话次数"
+                label="请求次数"
                 value={String(summary.totalMessages)}
                 color="text-purple-600 dark:text-purple-400"
                 bgColor="bg-purple-50 dark:bg-purple-950"
@@ -166,7 +250,7 @@ export function UsagePage() {
 
             {/* Cache Stats */}
             {(summary.totalCacheReadTokens > 0 || summary.totalCacheCreationTokens > 0) && (
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                 <StatCard
                   icon={<Database className="w-5 h-5" />}
                   label="缓存读取"
@@ -181,50 +265,62 @@ export function UsagePage() {
                   color="text-orange-600 dark:text-orange-400"
                   bgColor="bg-orange-50 dark:bg-orange-950"
                 />
+                {cacheHitRate !== null && (
+                  <StatCard
+                    icon={<Filter className="w-5 h-5" />}
+                    label="缓存命中率"
+                    value={`${cacheHitRate}%`}
+                    color="text-primary dark:text-brand-400"
+                    bgColor="bg-brand-50 dark:bg-brand-700/10"
+                  />
+                )}
               </div>
             )}
 
             {/* Daily Token Chart */}
             {dailyData.length > 0 && (
-              <div className="bg-card rounded-xl border border-border p-4 lg:p-6">
-                <h2 className="text-lg font-semibold text-foreground mb-4">每日 Token 用量</h2>
-                <div className="h-64 lg:h-80">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={dailyData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis
-                        dataKey="date"
-                        tick={{ fontSize: 12, fill: 'var(--muted-foreground)' }}
-                        tickFormatter={(v: string) => v.slice(5)} // MM-DD
-                      />
-                      <YAxis
-                        tick={{ fontSize: 12, fill: 'var(--muted-foreground)' }}
-                        tickFormatter={formatTokens}
-                      />
-                      <RechartsTooltip
-                        contentStyle={{
-                          backgroundColor: 'var(--card)',
-                          border: '1px solid var(--border)',
-                          borderRadius: '8px',
-                          color: 'var(--foreground)',
-                        }}
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        formatter={(value: any, name: any) => [formatTokens(Number(value) || 0), String(name)]}
-                        labelFormatter={(label) => `日期: ${label}`}
-                      />
-                      <Legend />
-                      <Bar dataKey="input" name="输入" stackId="tokens" fill="var(--color-primary)" radius={[0, 0, 0, 0]} />
-                      <Bar dataKey="output" name="输出" stackId="tokens" fill="#f59e0b" radius={[4, 4, 0, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
+              <Card>
+                <CardContent>
+                  <h2 className="text-lg font-semibold text-foreground mb-4">每日 Token 用量</h2>
+                  <div className="h-64 lg:h-80">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={dailyData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                        <XAxis
+                          dataKey="date"
+                          tick={{ fontSize: 12, fill: 'var(--muted-foreground)' }}
+                          tickFormatter={(v: string) => v.slice(5)} // MM-DD
+                        />
+                        <YAxis
+                          tick={{ fontSize: 12, fill: 'var(--muted-foreground)' }}
+                          tickFormatter={formatTokens}
+                        />
+                        <RechartsTooltip
+                          contentStyle={{
+                            backgroundColor: 'var(--card)',
+                            border: '1px solid var(--border)',
+                            borderRadius: '8px',
+                            color: 'var(--foreground)',
+                          }}
+                          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                          formatter={(value: any, name: any) => [formatTokens(Number(value) || 0), String(name)]}
+                          labelFormatter={(label) => `日期: ${label}`}
+                        />
+                        <Legend />
+                        <Bar dataKey="input" name="输入" stackId="tokens" fill="var(--color-primary)" radius={[0, 0, 0, 0]} />
+                        <Bar dataKey="output" name="输出" stackId="tokens" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </CardContent>
+              </Card>
             )}
 
             {/* Daily Cost Chart */}
             {dailyData.length > 0 && (
-              <div className="bg-card rounded-xl border border-border p-4 lg:p-6">
-                <h2 className="text-lg font-semibold text-foreground mb-4">每日费用</h2>
+              <Card>
+                <CardContent>
+                  <h2 className="text-lg font-semibold text-foreground mb-4">每日费用</h2>
                 <div className="h-64 lg:h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={dailyData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
@@ -252,14 +348,16 @@ export function UsagePage() {
                       <Bar dataKey="cost" name="费用 (USD)" fill="#ef4444" radius={[4, 4, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
-                </div>
-              </div>
+                  </div>
+                </CardContent>
+              </Card>
             )}
 
             {/* Model Breakdown */}
             {modelData.length > 0 && (
-              <div className="bg-card rounded-xl border border-border p-4 lg:p-6">
-                <h2 className="text-lg font-semibold text-foreground mb-4">模型用量分布</h2>
+              <Card>
+                <CardContent>
+                  <h2 className="text-lg font-semibold text-foreground mb-4">模型用量分布</h2>
                 <div className="flex flex-col lg:flex-row gap-6">
                   {/* Pie Chart */}
                   <div className="h-64 w-full lg:w-1/2">
@@ -318,19 +416,22 @@ export function UsagePage() {
                       </tbody>
                     </table>
                   </div>
-                </div>
-              </div>
+                  </div>
+                </CardContent>
+              </Card>
             )}
 
             {/* Empty State */}
-            {dailyData.length === 0 && !loading && (
-              <div className="bg-card rounded-xl border border-border p-12 text-center">
+            {summary.totalMessages === 0 && !loading && (
+              <Card>
+                <CardContent className="text-center py-8">
                 <Zap className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
                 <h3 className="text-lg font-semibold text-foreground mb-2">暂无用量数据</h3>
                 <p className="text-muted-foreground">
                   与 AI 对话后，用量数据将自动记录在这里
                 </p>
-              </div>
+                </CardContent>
+              </Card>
             )}
           </div>
         )}
@@ -353,14 +454,16 @@ function StatCard({
   bgColor: string;
 }) {
   return (
-    <div className="bg-card rounded-xl border border-border p-4">
-      <div className="flex items-center gap-3 mb-2">
+    <Card>
+      <CardContent>
+        <div className="flex items-center gap-3 mb-2">
         <div className={`w-10 h-10 rounded-lg ${bgColor} flex items-center justify-center ${color}`}>
           {icon}
         </div>
       </div>
-      <p className="text-2xl font-bold text-foreground">{value}</p>
-      <p className="text-sm text-muted-foreground">{label}</p>
-    </div>
+        <p className="text-2xl font-bold text-foreground">{value}</p>
+        <p className="text-sm text-muted-foreground">{label}</p>
+      </CardContent>
+    </Card>
   );
 }

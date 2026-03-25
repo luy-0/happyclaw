@@ -8,7 +8,8 @@ import {
   ContainerEnvSchema,
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
-import { DATA_DIR, GROUPS_DIR } from '../config.js';
+import { checkGroupLimit } from '../billing.js';
+import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
@@ -73,6 +74,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { z } from 'zod';
 import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
+import { getStreamingSession } from '../feishu-streaming-card.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -151,8 +153,8 @@ interface GroupPayloadItem {
   is_shared?: boolean;
   member_role?: 'owner' | 'member';
   member_count?: number;
-  selected_skills?: string[] | null;
   pinned_at?: string;
+  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -168,7 +170,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   const result: Record<string, GroupPayloadItem> = {};
 
   // 先过滤出要显示的群组 jid
-  const visibleEntries: Array<[string, typeof groups[string]]> = [];
+  const visibleEntries: Array<[string, (typeof groups)[string]]> = [];
   for (const [jid, group] of Object.entries(groups)) {
     const isHome = !!group.is_home;
     const isWeb = jid.startsWith('web:');
@@ -183,10 +185,12 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     if (isHome && group.created_by !== user.id) continue;
 
     // Host execution groups require admin unless it's the user's own home group
-    if (isHost && !isAdmin && !(isHome && group.created_by === user.id)) continue;
+    if (isHost && !isAdmin && !(isHome && group.created_by === user.id))
+      continue;
 
     // User isolation: all users only see their own groups + shared groups
-    if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid })) continue;
+    if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid }))
+      continue;
 
     visibleEntries.push([jid, group]);
   }
@@ -196,10 +200,17 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   const latestByJid = new Map<string, { content: string; timestamp: string }>();
   if (visibleJids.length > 0) {
     // 用 multi 查询获取足够多的消息来覆盖所有 jid
-    const allLatest = getMessagesPageMulti(visibleJids, undefined, visibleJids.length * 3);
+    const allLatest = getMessagesPageMulti(
+      visibleJids,
+      undefined,
+      visibleJids.length * 3,
+    );
     for (const msg of allLatest) {
       if (!latestByJid.has(msg.chat_jid)) {
-        latestByJid.set(msg.chat_jid, { content: msg.content, timestamp: msg.timestamp });
+        latestByJid.set(msg.chat_jid, {
+          content: msg.content,
+          timestamp: msg.timestamp,
+        });
       }
     }
   }
@@ -208,7 +219,10 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   const pins = getUserPinnedGroups(user.id);
 
   // Cache member info per folder (avoid repeated queries)
-  const memberCache = new Map<string, { count: number; role: 'owner' | 'member' | null }>();
+  const memberCache = new Map<
+    string,
+    { count: number; role: 'owner' | 'member' | null }
+  >();
   function getMemberInfo(folder: string) {
     let cached = memberCache.get(folder);
     if (!cached) {
@@ -247,8 +261,8 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       is_shared: isShared || undefined,
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,
-      selected_skills: group.selected_skills ?? null,
       pinned_at: pins[jid] || undefined,
+      activation_mode: group.activation_mode ?? 'auto',
     };
   }
 
@@ -361,11 +375,18 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: 'Group name is required' }, 400);
   }
 
-  const executionMode = validation.data.execution_mode || 'container';
+  // If user didn't specify execution mode, pick based on Docker availability
+  const executionMode = validation.data.execution_mode || (await isDockerAvailable() ? 'container' : 'host');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
   const authUser = c.get('user') as AuthUser;
+
+  // Billing: check group limit
+  const groupLimit = checkGroupLimit(authUser.id, authUser.role);
+  if (!groupLimit.allowed) {
+    return c.json({ error: groupLimit.reason }, 403);
+  }
 
   // 互斥校验：init_source_path 和 init_git_url 不能同时指定
   if (initSourcePath && initGitUrl) {
@@ -378,7 +399,10 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   // init_source_path / init_git_url 仅 container 模式可用
   if (executionMode === 'host' && (initSourcePath || initGitUrl)) {
     return c.json(
-      { error: 'init_source_path and init_git_url are only valid for container mode' },
+      {
+        error:
+          'init_source_path and init_git_url are only valid for container mode',
+      },
       400,
     );
   }
@@ -412,7 +436,11 @@ groupRoutes.post('/', authMiddleware, async (c) => {
 
       // 白名单校验：检查路径是否在允许的根目录下
       const allowlist = loadMountAllowlist();
-      if (allowlist && allowlist.allowedRoots && allowlist.allowedRoots.length > 0) {
+      if (
+        allowlist &&
+        allowlist.allowedRoots &&
+        allowlist.allowedRoots.length > 0
+      ) {
         let allowed = false;
         for (const root of allowlist.allowedRoots) {
           const expandedRoot = root.path.startsWith('~')
@@ -437,7 +465,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
         }
 
         if (!allowed) {
-          const allowedPaths = allowlist.allowedRoots.map((r) => r.path).join(', ');
+          const allowedPaths = allowlist.allowedRoots
+            .map((r) => r.path)
+            .join(', ');
           return c.json(
             {
               error: `custom_cwd must be under an allowed root. Allowed roots: ${allowedPaths}. Check config/mount-allowlist.json`,
@@ -460,26 +490,41 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       );
     }
     if (!path.isAbsolute(initSourcePath)) {
-      return c.json({ error: 'init_source_path must be an absolute path' }, 400);
+      return c.json(
+        { error: 'init_source_path must be an absolute path' },
+        400,
+      );
     }
 
     let realPath: string;
     try {
       const stat = fs.statSync(initSourcePath);
       if (!stat.isDirectory()) {
-        return c.json({ error: 'init_source_path must be an existing directory' }, 400);
+        return c.json(
+          { error: 'init_source_path must be an existing directory' },
+          400,
+        );
       }
       realPath = fs.realpathSync(initSourcePath);
     } catch {
-      return c.json({ error: 'init_source_path directory does not exist' }, 400);
+      return c.json(
+        { error: 'init_source_path directory does not exist' },
+        400,
+      );
     }
 
     // 白名单校验
     const allowlist = loadMountAllowlist();
-    if (allowlist && allowlist.allowedRoots && allowlist.allowedRoots.length > 0) {
+    if (
+      allowlist &&
+      allowlist.allowedRoots &&
+      allowlist.allowedRoots.length > 0
+    ) {
       const allowedRoot = findAllowedRoot(realPath, allowlist.allowedRoots);
       if (!allowedRoot) {
-        const allowedPaths = allowlist.allowedRoots.map((r) => r.path).join(', ');
+        const allowedPaths = allowlist.allowedRoots
+          .map((r) => r.path)
+          .join(', ');
         return c.json(
           {
             error: `init_source_path must be under an allowed root. Allowed roots: ${allowedPaths}. Check config/mount-allowlist.json`,
@@ -489,10 +534,15 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       }
 
       // 敏感路径过滤
-      const blockedMatch = matchesBlockedPattern(realPath, allowlist.blockedPatterns);
+      const blockedMatch = matchesBlockedPattern(
+        realPath,
+        allowlist.blockedPatterns,
+      );
       if (blockedMatch) {
         return c.json(
-          { error: `init_source_path matches blocked pattern "${blockedMatch}"` },
+          {
+            error: `init_source_path matches blocked pattern "${blockedMatch}"`,
+          },
           403,
         );
       }
@@ -508,7 +558,10 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       );
     }
     if (initGitUrl.length > 2000) {
-      return c.json({ error: 'init_git_url is too long (max 2000 characters)' }, 400);
+      return c.json(
+        { error: 'init_git_url is too long (max 2000 characters)' },
+        400,
+      );
     }
 
     let gitUrl: URL;
@@ -525,7 +578,10 @@ groupRoutes.post('/', authMiddleware, async (c) => {
 
     // 阻止内网地址
     if (isPrivateHostname(gitUrl.hostname)) {
-      return c.json({ error: 'init_git_url must not point to a private/internal address' }, 400);
+      return c.json(
+        { error: 'init_git_url must not point to a private/internal address' },
+        400,
+      );
     }
   }
 
@@ -558,28 +614,43 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     if (initSourcePath) {
       await fsp.mkdir(groupDir, { recursive: true });
       await fsp.cp(initSourcePath, groupDir, { recursive: true });
-      logger.info({ folder, source: initSourcePath }, 'Workspace initialized from local directory');
+      logger.info(
+        { folder, source: initSourcePath },
+        'Workspace initialized from local directory',
+      );
     }
 
     if (initGitUrl) {
-      await execFileAsync('git', ['clone', '--depth', '1', initGitUrl, groupDir], {
-        timeout: 120_000,
-      });
-      logger.info({ folder, url: initGitUrl }, 'Workspace initialized from git clone');
+      await execFileAsync(
+        'git',
+        ['clone', '--depth', '1', initGitUrl, groupDir],
+        {
+          timeout: 120_000,
+        },
+      );
+      logger.info(
+        { folder, url: initGitUrl },
+        'Workspace initialized from git clone',
+      );
     }
   } catch (err) {
     // 初始化失败时清理
-    logger.error({ folder, err }, 'Workspace initialization failed, cleaning up');
+    logger.error(
+      { folder, err },
+      'Workspace initialization failed, cleaning up',
+    );
     fs.rmSync(groupDir, { recursive: true, force: true });
     deleteRegisteredGroup(jid);
     deleteChatHistory(jid);
     delete deps.getRegisteredGroups()[jid];
 
     const errMsg = err instanceof Error ? err.message : String(err);
-    return c.json(
-      { error: `Workspace initialization failed: ${errMsg}` },
-      500,
-    );
+    return c.json({ error: `Workspace initialization failed: ${errMsg}` }, 500);
+  }
+
+  // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
+  if (executionMode === 'container') {
+    deps.ensureTerminalContainerStarted(jid);
   }
 
   return c.json({
@@ -619,36 +690,79 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const validation = GroupPatchSchema.safeParse(body);
   if (!validation.success) {
-    return c.json(
-      { error: 'Invalid request body' },
-      400,
-    );
+    return c.json({ error: 'Invalid request body' }, 400);
   }
 
-  const { name: rawName, selected_skills, is_pinned } = validation.data;
+  const {
+    name: rawName,
+    is_pinned,
+    activation_mode,
+    execution_mode,
+  } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
   // 至少需要提供一个字段
-  if (!name && selected_skills === undefined && is_pinned === undefined) {
+  if (
+    !name &&
+    is_pinned === undefined &&
+    activation_mode === undefined &&
+    execution_mode === undefined
+  ) {
     return c.json({ error: 'No fields to update' }, 400);
   }
 
+  // 不允许修改 is_home=true 的主容器执行模式（主容器由 loadState 强制管理）
+  if (execution_mode !== undefined && existing.is_home) {
+    return c.json(
+      { error: 'Cannot change execution mode of home containers' },
+      403,
+    );
+  }
+
+  // member 用户不允许使用 host 模式（安全限制）
+  if (execution_mode === 'host' && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
   // Pin/unpin only requires canAccessGroup (it's a per-user preference)
-  const isPinOnly = is_pinned !== undefined && !name && selected_skills === undefined;
+  const isPinOnly =
+    is_pinned !== undefined &&
+    !name &&
+    activation_mode === undefined &&
+    execution_mode === undefined;
   if (isPinOnly) {
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...existing, jid },
+      )
+    ) {
       return c.json({ error: 'Group not found' }, 404);
     }
   } else {
     // Name/skills changes require canModifyGroup (owner only)
-    if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...existing, jid },
+      )
+    ) {
       return c.json({ error: 'Group not found' }, 404);
     }
     if (!jid.startsWith('web:') && authUser.role !== 'admin') {
       return c.json({ error: 'This group cannot be edited' }, 403);
     }
-    if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
-      return c.json({ error: 'Insufficient permissions for host execution mode' }, 403);
+    if (
+      isHostExecutionGroup(existing) &&
+      !hasHostExecutionPermission(authUser)
+    ) {
+      return c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      );
     }
   }
 
@@ -660,18 +774,30 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     unpinGroup(authUser.id, jid);
   }
 
-  // Update registered group if name or skills changed
-  if (name || selected_skills !== undefined) {
+  // Update registered group if name, activation_mode, or execution_mode changed
+  if (name || activation_mode !== undefined || execution_mode !== undefined) {
     const updated: RegisteredGroup = {
       name: name || existing.name,
       folder: existing.folder,
       added_at: existing.added_at,
       containerConfig: existing.containerConfig,
-      executionMode: existing.executionMode,
+      executionMode:
+        execution_mode !== undefined
+          ? (execution_mode as ExecutionMode)
+          : existing.executionMode,
       customCwd: existing.customCwd,
+      initSourcePath: existing.initSourcePath,
+      initGitUrl: existing.initGitUrl,
       created_by: existing.created_by,
       is_home: existing.is_home,
-      selected_skills: selected_skills !== undefined ? (selected_skills ?? null) : existing.selected_skills,
+      target_agent_id: existing.target_agent_id,
+      target_main_jid: existing.target_main_jid,
+      reply_policy: existing.reply_policy,
+      require_mention: existing.require_mention,
+      activation_mode:
+        activation_mode !== undefined
+          ? activation_mode
+          : existing.activation_mode,
     };
 
     setRegisteredGroup(jid, updated);
@@ -709,7 +835,11 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
 
   // Block deletion if any IM binding exists (agent or main conversation)
   const agents = listAgentsByJid(jid);
-  const boundAgents: Array<{ agentId: string; agentName: string; imGroups: Array<{ jid: string; name: string }> }> = [];
+  const boundAgents: Array<{
+    agentId: string;
+    agentName: string;
+    imGroups: Array<{ jid: string; name: string }>;
+  }> = [];
   for (const a of agents) {
     if (a.kind === 'conversation') {
       const linked = getGroupsByTargetAgent(a.id);
@@ -717,19 +847,34 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
         boundAgents.push({
           agentId: a.id,
           agentName: a.name,
-          imGroups: linked.map(l => ({ jid: l.jid, name: l.group.name })),
+          imGroups: linked.map((l) => ({ jid: l.jid, name: l.group.name })),
         });
       }
     }
   }
-  const mainBound = getGroupsByTargetMainJid(`web:${existing.folder}`);
+  // Search by actual JID; also check legacy folder-based format for backward compat
+  const mainBoundByJid = getGroupsByTargetMainJid(jid);
+  const legacyMainJid = `web:${existing.folder}`;
+  const mainBoundByFolder =
+    legacyMainJid !== jid ? getGroupsByTargetMainJid(legacyMainJid) : [];
+  const mainBoundJids = new Set(mainBoundByJid.map((l) => l.jid));
+  const mainBound = [
+    ...mainBoundByJid,
+    ...mainBoundByFolder.filter((l) => !mainBoundJids.has(l.jid)),
+  ];
   if (boundAgents.length > 0 || mainBound.length > 0) {
-    const mainImGroups = mainBound.map(l => ({ jid: l.jid, name: l.group.name }));
-    return c.json({
-      error: '该工作区绑定了 IM 群组，请先解绑后再删除。',
-      bound_agents: boundAgents,
-      bound_main_im_groups: mainImGroups,
-    }, 409);
+    const mainImGroups = mainBound.map((l) => ({
+      jid: l.jid,
+      name: l.group.name,
+    }));
+    return c.json(
+      {
+        error: '该工作区绑定了 IM 群组，请先解绑后再删除。',
+        bound_agents: boundAgents,
+        bound_main_im_groups: mainImGroups,
+      },
+      409,
+    );
   }
 
   // Wait for container to fully stop before cleaning up its files
@@ -796,6 +941,12 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
 
   const interrupted = deps.queue.interruptQuery(jid);
   if (interrupted) {
+    // ── 立即 abort 飞书流式卡片 ──
+    const session = getStreamingSession(jid);
+    if (session?.isActive()) {
+      session.abort('已中断').catch(() => {});
+    }
+
     // Persist interrupt as a system marker so refresh/state-restore can
     // deterministically clear waiting even when no assistant reply exists.
     const messageId = crypto.randomUUID();
@@ -821,7 +972,10 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
         is_from_me: true,
       });
     } catch (err) {
-      logger.warn({ jid, err }, 'Interrupt succeeded but failed to append system marker');
+      logger.warn(
+        { jid, err },
+        'Interrupt succeeded but failed to append system marker',
+      );
     }
   }
   return c.json({ success: true, interrupted });
@@ -837,7 +991,9 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const group = getRegisteredGroup(jid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
-  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+  if (
+    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })
+  ) {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
@@ -854,7 +1010,9 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     if (body && typeof body.agentId === 'string' && body.agentId) {
       agentId = body.agentId;
     }
-  } catch { /* no body or invalid JSON — treat as main session reset */ }
+  } catch {
+    /* no body or invalid JSON — treat as main session reset */
+  }
 
   // Validate agentId belongs to this group
   if (agentId) {
@@ -873,7 +1031,9 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     } else {
       // Main session: stop ALL processes for this folder
       const siblingJids = getJidsByFolder(group.folder);
-      await Promise.all(siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })));
+      await Promise.all(
+        siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+      );
     }
   } catch (err) {
     logger.error(
@@ -958,7 +1118,10 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     // Main session: advance cursor for ALL sibling JIDs sharing this folder.
     const siblingJids = getJidsByFolder(group.folder);
     for (const siblingJid of siblingJids) {
-      deps.setLastAgentTimestamp(siblingJid, { timestamp, id: dividerMessageId });
+      deps.setLastAgentTimestamp(siblingJid, {
+        timestamp,
+        id: dividerMessageId,
+      });
     }
   }
 
@@ -979,7 +1142,9 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   const group = getRegisteredGroup(jid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
-  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+  if (
+    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })
+  ) {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
@@ -994,7 +1159,9 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
 
   // 1. Stop ALL active processes for this folder first to avoid writes during cleanup.
   try {
-    await Promise.all(siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })));
+    await Promise.all(
+      siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+    );
   } catch (err) {
     logger.error(
       { jid, siblingJids, err },
@@ -1068,7 +1235,10 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   const after = c.req.query('after');
   const agentIdParam = c.req.query('agentId');
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
-  const limit = Math.min(Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 50, 200);
+  const limit = Math.min(
+    Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 50,
+    200,
+  );
 
   // Agent conversation: query messages from the virtual chat_jid
   if (agentIdParam) {
@@ -1099,8 +1269,10 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       const siblingGroup = getRegisteredGroup(siblingJid);
       if (!siblingGroup) continue;
       // Merge siblings by ownership: same creator, or admin's own IM channels
-      const ownerMatch = group.created_by && siblingGroup.created_by === group.created_by;
-      const adminSelfMatch = authUser.role === 'admin' && siblingGroup.created_by === authUser.id;
+      const ownerMatch =
+        group.created_by && siblingGroup.created_by === group.created_by;
+      const adminSelfMatch =
+        authUser.role === 'admin' && siblingGroup.created_by === authUser.id;
       if (ownerMatch || adminSelfMatch) {
         queryJids.push(siblingJid);
       }
@@ -1185,8 +1357,7 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
   // Check permissions
   if (
     user.role !== 'admin' &&
-    (!user.permissions ||
-      !user.permissions.includes('manage_group_env'))
+    (!user.permissions || !user.permissions.includes('manage_group_env'))
   ) {
     return c.json({ error: 'Insufficient permissions' }, 403);
   }
@@ -1215,8 +1386,7 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
   // Check permissions
   if (
     envUser.role !== 'admin' &&
-    (!envUser.permissions ||
-      !envUser.permissions.includes('manage_group_env'))
+    (!envUser.permissions || !envUser.permissions.includes('manage_group_env'))
   ) {
     return c.json({ error: 'Insufficient permissions' }, 403);
   }
@@ -1224,10 +1394,7 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const validation = ContainerEnvSchema.safeParse(body);
   if (!validation.success) {
-    return c.json(
-      { error: 'Invalid request body' },
-      400,
-    );
+    return c.json({ error: 'Invalid request body' }, 400);
   }
 
   const data = validation.data;
@@ -1268,8 +1435,8 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     updated.anthropicApiKey = data.anthropicApiKey;
   if (data.claudeCodeOauthToken !== undefined)
     updated.claudeCodeOauthToken = data.claudeCodeOauthToken;
-  if (data.happyclawModel !== undefined)
-    updated.happyclawModel = data.happyclawModel;
+  if (data.anthropicModel !== undefined)
+    updated.anthropicModel = data.anthropicModel;
   if (data.customEnv !== undefined) updated.customEnv = data.customEnv;
 
   try {
@@ -1316,7 +1483,12 @@ groupRoutes.get('/:jid/members/search', authMiddleware, (c) => {
   if (!group) return c.json({ error: 'Group not found' }, 404);
 
   const authUser = c.get('user') as AuthUser;
-  if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+  if (
+    !canManageGroupMembers(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid },
+    )
+  ) {
     return c.json({ error: 'Forbidden' }, 403);
   }
 
@@ -1324,10 +1496,16 @@ groupRoutes.get('/:jid/members/search', authMiddleware, (c) => {
   if (!q.trim()) return c.json({ users: [] });
 
   const result = listUsers({ query: q.trim(), status: 'active', pageSize: 10 });
-  const existingIds = new Set(getGroupMembers(group.folder).map((m) => m.user_id));
+  const existingIds = new Set(
+    getGroupMembers(group.folder).map((m) => m.user_id),
+  );
   const users = result.users
     .filter((u) => !existingIds.has(u.id))
-    .map((u) => ({ id: u.id, username: u.username, display_name: u.display_name }));
+    .map((u) => ({
+      id: u.id,
+      username: u.username,
+      display_name: u.display_name,
+    }));
 
   return c.json({ users });
 });
@@ -1390,7 +1568,9 @@ groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
   // Self-removal: any member can leave
   const isSelfRemoval = targetUserId === authUser.id;
   if (!isSelfRemoval) {
-    if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)) {
+    if (
+      !canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)
+    ) {
       return c.json({ error: 'Insufficient permissions' }, 403);
     }
   }
@@ -1409,7 +1589,13 @@ groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
   removeGroupMember(group.folder, targetUserId);
   invalidateAllowedUserCache(jid);
   logger.info(
-    { jid, folder: group.folder, targetUserId, removedBy: authUser.id, isSelfRemoval },
+    {
+      jid,
+      folder: group.folder,
+      targetUserId,
+      removedBy: authUser.id,
+      isSelfRemoval,
+    },
     'Group member removed',
   );
 
@@ -1417,34 +1603,71 @@ groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
   return c.json({ success: true, members });
 });
 
-// ─── Permission Mode (Code / Plan mode switching) ────────────────
+// --- MCP Configuration Routes ---
 
-const VALID_PERMISSION_MODES = ['bypassPermissions', 'plan'];
-
-groupRoutes.put('/:jid/mode', authMiddleware, async (c) => {
-  const user = c.get('user') as AuthUser;
-  const jid = decodeURIComponent(c.req.param('jid'));
-
+// GET /api/groups/:jid/mcp - 获取工作区 MCP 配置
+groupRoutes.get('/:jid/mcp', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
   const group = getRegisteredGroup(jid);
-  if (!group) {
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (!canAccessGroup(user, { ...group, jid })) {
-    return c.json({ error: 'Not authorized' }, 403);
+
+  return c.json({
+    mcp_mode: group.mcp_mode ?? 'inherit',
+    selected_mcps: group.selected_mcps ?? null,
+  });
+});
+
+// PUT /api/groups/:jid/mcp - 更新工作区 MCP 配置
+groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
   }
 
   const body = await c.req.json().catch(() => ({}));
-  const mode = (body as { mode?: string }).mode;
+  const mcp_mode = body.mcp_mode;
+  const selected_mcps = body.selected_mcps;
 
-  if (!mode || !VALID_PERMISSION_MODES.includes(mode)) {
-    return c.json({ error: `Invalid mode. Must be one of: ${VALID_PERMISSION_MODES.join(', ')}` }, 400);
+  // Validate mcp_mode
+  if (mcp_mode !== undefined && mcp_mode !== 'inherit' && mcp_mode !== 'custom') {
+    return c.json({ error: 'Invalid mcp_mode' }, 400);
   }
 
-  const deps = getWebDeps();
-  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+  // Validate selected_mcps
+  if (selected_mcps !== undefined && selected_mcps !== null) {
+    if (!Array.isArray(selected_mcps)) {
+      return c.json({ error: 'selected_mcps must be an array' }, 400);
+    }
+    for (const mcp of selected_mcps) {
+      if (typeof mcp !== 'string') {
+        return c.json({ error: 'selected_mcps must contain strings' }, 400);
+      }
+    }
+  }
 
-  const sent = deps.queue.setPermissionMode(jid, mode);
-  return c.json({ success: true, mode, applied: sent });
+  // Update the group
+  const updatedGroup: RegisteredGroup = {
+    ...group,
+    mcp_mode: mcp_mode ?? group.mcp_mode ?? 'inherit',
+    selected_mcps: selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
+  };
+
+  setRegisteredGroup(jid, updatedGroup);
+
+  return c.json({
+    success: true,
+    mcp_mode: updatedGroup.mcp_mode,
+    selected_mcps: updatedGroup.selected_mcps,
+  });
 });
 
 export default groupRoutes;

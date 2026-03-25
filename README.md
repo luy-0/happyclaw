@@ -51,7 +51,7 @@
 
 ## HappyClaw 是什么
 
-HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claude-code/tree/main/packages/claude-agent-sdk) 构建的自托管多用户 AI Agent 系统。它将完整的 Claude Code 运行时封装为可通过飞书、Telegram 和 Web 界面访问的服务，支持文件读写、终端操作、浏览器自动化、多轮推理及 MCP 工具生态。
+HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claude-code/tree/main/packages/claude-agent-sdk) 构建的自托管多用户 AI Agent 系统。它将完整的 Claude Code 运行时封装为可通过飞书、Telegram、QQ 和 Web 界面访问的服务，支持文件读写、终端操作、浏览器自动化、多轮推理及 MCP 工具生态。
 
 核心设计原则：**不重新实现 Agent 能力，直接复用 Claude Code**。底层调用的是完整的 Claude Code CLI 运行时，而非 API Wrapper 或 Prompt Chain。Claude Code 的每次升级——新工具、更强的推理、更多的 MCP 支持——HappyClaw 零适配自动受益。
 
@@ -60,7 +60,7 @@ HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claud
 - **原生 Claude Code 驱动** — 基于 Claude Agent SDK，底层为完整的 Claude Code CLI 运行时，继承其全部能力
 - **多用户隔离** — Per-user 工作区、Per-user IM 通道、RBAC 权限体系、邀请码注册、审计日志，每个用户拥有独立的执行环境
 - **移动端 PWA** — 针对移动端深度优化，支持一键安装到桌面，iOS / Android 均已适配，随时随地通过手机访问 AI Agent
-- **飞书深度集成** — WebSocket 长连接实时通信、富文本卡片渲染、Reaction 反馈、自动注册群组，同时支持 Telegram Bot 和 Web 界面，三端消息统一路由
+- **四端消息统一路由** — 飞书 WebSocket 长连接（富文本卡片、Reaction 反馈）、Telegram Bot API、QQ Bot API v2（私聊 + 群聊 @Bot）、Web 界面，四端消息统一路由
 
 > 项目借鉴了 [OpenClaw](https://github.com/nicepkg/OpenClaw) 的容器化架构，并融合了 Claude Code 官方 [Cowork](https://github.com/anthropics/claude-code/tree/main/packages/cowork) 的多会话协作思路：多个独立 Agent 会话并行工作，各自拥有隔离的工作空间和持久记忆，结果通过 IM 渠道送达。
 
@@ -72,9 +72,10 @@ HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claud
 |------|---------|---------|------|
 | **飞书** | WebSocket 长连接 | 富文本卡片 | 图片消息（Vision）、文件消息自动下载到工作区、Reaction 反馈、自动注册群组 |
 | **Telegram** | Bot API (Long Polling) | Markdown → HTML | 长消息自动分片（3800 字符）、图片走 Vision（base64）、文档文件自动下载到工作区 |
+| **QQ** | WebSocket (Bot API v2) | 纯文本 | 私聊 + 群聊 @Bot、图片消息（Vision）、配对码绑定 |
 | **Web** | WebSocket 实时通信 | 流式 Markdown | 图片粘贴/拖拽上传、虚拟滚动 |
 
-每个用户可独立配置自己的 IM 通道（飞书应用凭据、Telegram Bot Token），互不干扰。消息统一路由：飞书来源回飞书，Telegram 来源回 Telegram，Web 来源回 Web。
+每个用户可独立配置自己的 IM 通道（飞书应用凭据、Telegram Bot Token、QQ Bot 凭据），互不干扰。消息统一路由：飞书来源回飞书，Telegram 来源回 Telegram，QQ 来源回 QQ，Web 来源回 Web。
 
 
 ### Agent 执行引擎
@@ -199,6 +200,7 @@ Agent 自主维护跨会话的持久记忆：
 
 - 飞书企业自建应用凭据 — 仅飞书集成需要，前往 [飞书开放平台](https://open.feishu.cn) 创建
 - Telegram Bot Token — 仅 Telegram 集成需要，通过 [@BotFather](https://t.me/BotFather) 获取
+- QQ Bot 凭据 — 仅 QQ 集成需要，前往 [QQ 开放平台](https://q.qq.com/qqbot/openclaw/index.html) 创建
 
 > Claude Code CLI 无需手动安装——项目依赖的 Claude Agent SDK 已内置完整的 CLI 运行时，`make start` 首次启动时自动安装。
 
@@ -221,7 +223,7 @@ make start
 
 1. **创建管理员** — 自定义用户名和密码（无默认账号）
 2. **配置 Claude API** — 填入 API 密钥和模型（支持中转服务）
-3. **配置 IM 通道**（可选）— 飞书 App ID/Secret 或 Telegram Bot Token
+3. **配置 IM 通道**（可选）— 飞书 App ID/Secret、Telegram Bot Token 或 QQ Bot 凭据
 4. **开始对话** — 在 Web 聊天页面直接发送消息
 
 > 所有配置通过 Web 界面完成，不依赖任何配置文件。API 密钥 AES-256-GCM 加密存储。
@@ -242,11 +244,45 @@ admin 用户默认使用宿主机模式（无需 Docker），开箱即用。如�
 
 1. 前往 [飞书开放平台](https://open.feishu.cn)，创建企业自建应用
 2. 在应用的「事件订阅」中添加：`im.message.receive_v1`（接收消息）
-3. 在应用的「权限管理」中开通：`im:message`（发送消息）、`im:message.receive_v3`（接收消息）
+3. 在应用的「权限管理」中开通以下权限：
+   - `cardkit:card:write`（创建和更新卡片）
+   - `im:chat`（获取与更新群组信息）
+   - `im:chat:read`（获取群组信息）
+   - `im:chat:readonly`（以应用身份读取群组信息）
+   - `im:message`（发送消息）
+   - `im:message.group_at_msg:readonly`（接收群聊 @消息）
+   - `im:message.group_msg`（接收群聊所有消息）— **敏感权限**，需管理员审批。如不开通，群聊中只有 @机器人 的消息才会被处理
+   - `im:message.p2p_msg:readonly`（接收私聊消息）
+
+   <details>
+   <summary>📋 权限 JSON（可直接导入飞书开放平台）</summary>
+
+   ```json
+   {
+     "scopes": {
+       "tenant": [
+         "cardkit:card:write",
+         "im:chat",
+         "im:chat:read",
+         "im:chat:readonly",
+         "im:message",
+         "im:message.group_at_msg:readonly",
+         "im:message.group_msg",
+         "im:message.p2p_msg:readonly"
+       ],
+       "user": []
+     }
+   }
+   ```
+
+   </details>
+
 4. 发布应用版本并等待审批通过
 5. 在 HappyClaw Web 界面的「设置 → IM 通道 → 飞书」中填入 App ID 和 App Secret
 
 每个用户可在个人设置中独立配置飞书应用凭据，实现 per-user 的飞书 Bot。
+
+> **群聊 Mention 控制**：默认群聊中需要 @机器人 才会响应。可通过 `/require_mention false` 命令切换为全量响应（需要 `im:message.group_msg` 权限）。
 
 
 ### 配置 Telegram 集成
@@ -257,9 +293,19 @@ admin 用户默认使用宿主机模式（无需 Docker），开箱即用。如�
 4. **群聊使用**：如需在 Telegram 群中使用 Bot，需在 BotFather 中发送 `/mybots` → 选择 Bot → Bot Settings → Group Privacy → Turn off，否则 Bot 只能接收 `/` 命令消息
 
 
+### 配置 QQ 集成
+
+1. 前往 [QQ 开放平台](https://q.qq.com/qqbot/openclaw/index.html)，使用手机 QQ 扫码注册登录
+2. 创建机器人，设置名称和头像
+3. 在机器人管理页面获取 **App ID** 和 **App Secret**
+4. 在 HappyClaw Web 界面的「设置 → IM 通道 → QQ」中填入 App ID 和 App Secret
+5. **配对绑定**：在设置页生成配对码，然后在 QQ 中向 Bot 发送 `/pair <配对码>` 完成绑定
+
+> QQ Bot 使用官方 API v2 协议，支持 C2C 私聊和群聊 @Bot 消息。群聊中 Bot 仅接收 @Bot 的消息。
+
 ### IM 斜杠命令
 
-飞书/Telegram 中以 `/` 开头的消息会被拦截为斜杠命令（未知命令继续作为普通消息处理）：
+飞书/Telegram/QQ 中以 `/` 开头的消息会被拦截为斜杠命令（未知命令继续作为普通消息处理）：
 
 | 命令 | 缩写 | 用途 |
 |------|------|------|
@@ -271,6 +317,7 @@ admin 用户默认使用宿主机模式（无需 Docker），开箱即用。如�
 | `/new <名称>` | - | 创建新工作区并绑定当前群组 |
 | `/recall` | `/rc` | AI 总结最近对话记录 |
 | `/clear` | - | 清除当前对话的会话上下文 |
+| `/require_mention` | - | 切换群聊响应模式：`true`（需要 @）或 `false`（全量响应） |
 
 
 ### 执行模式
@@ -309,6 +356,7 @@ flowchart TD
     subgraph 接入层
         Feishu("飞书<br/>(WebSocket 长连接)")
         Telegram("Telegram<br/>(Bot API)")
+        QQ("QQ<br/>(Bot API v2)")
         Web("Web 界面<br/>(React 19 SPA)")
     end
 
@@ -338,6 +386,7 @@ flowchart TD
 
     Feishu --> Router
     Telegram --> Router
+    QQ --> Router
     Web --> Router
 
     Router --> Queue
@@ -360,7 +409,7 @@ flowchart TD
     Auth --> DB
     SDK --> Memory
 
-    class Feishu,Telegram,Web fe
+    class Feishu,Telegram,QQ,Web fe
     class Router,Queue,Scheduler,WS,Auth,Config svc
     class DB db
     class Host,Container faas
@@ -380,7 +429,7 @@ flowchart TD
 | **Agent** | Claude Agent SDK · Claude Code CLI · MCP SDK · IPC 文件通道 |
 | **容器** | Docker (node:22-slim) · Chromium · agent-browser · Python · 40+ 预装工具 |
 | **安全** | bcrypt (12 轮) · AES-256-GCM · HMAC Cookie · RBAC · 路径遍历防护 · 挂载白名单 |
-| **IM 集成** | @larksuiteoapi/node-sdk (飞书) · grammY (Telegram) |
+| **IM 集成** | @larksuiteoapi/node-sdk (飞书) · grammY (Telegram) · QQ Bot API v2 (WebSocket + REST) |
 
 ### 目录结构
 
@@ -394,7 +443,8 @@ happyclaw/
 │   ├── routes/                   #   路由（auth / groups / files / config / monitor / memory / tasks / skills / admin / browse / agents / mcp-servers）
 │   ├── feishu.ts                 #   飞书连接工厂（WebSocket 长连接）
 │   ├── telegram.ts               #   Telegram 连接工厂（Bot API）
-│   ├── im-manager.ts             #   IM 连接池（per-user 飞书/Telegram 连接管理）
+│   ├── qq.ts                     #   QQ 连接工厂（Bot API v2 WebSocket）
+│   ├── im-manager.ts             #   IM 连接池（per-user 飞书/Telegram/QQ 连接管理）
 │   ├── im-downloader.ts          #   IM 文件下载工具（保存到工作区 downloads/）
 │   ├── container-runner.ts       #   Docker / 宿主机进程管理
 │   ├── group-queue.ts            #   并发控制队列
@@ -434,7 +484,7 @@ happyclaw/
 ├── data/                         # 运行时数据（启动时自动创建）
 │   ├── db/messages.db            #   SQLite 数据库（WAL 模式）
 │   ├── groups/{folder}/          #   会话工作目录（Agent 可读写）
-│   │   ├── downloads/{channel}/  #     IM 文件下载（feishu/telegram，按日期分子目录）
+│   │   ├── downloads/{channel}/  #     IM 文件下载（feishu/telegram/qq，按日期分子目录）
 │   │   └── CLAUDE.md             #     会话私有记忆
 │   ├── groups/user-global/{id}/  #   用户全局记忆目录
 │   ├── sessions/{folder}/.claude/#   Claude 会话持久化

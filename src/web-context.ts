@@ -3,8 +3,13 @@
 import { WebSocket } from 'ws';
 import { RegisteredGroup, UserRole } from './types.js';
 import { GroupQueue } from './group-queue.js';
-import type { AuthUser, NewMessage, MessageCursor } from './types.js';
-import { getJidsByFolder, getRegisteredGroup, getGroupMemberRole } from './db.js';
+import type { AuthUser, NewMessage, MessageCursor, UserSessionWithUser } from './types.js';
+import {
+  getJidsByFolder,
+  getRegisteredGroup,
+  getGroupMemberRole,
+  getSessionWithUser,
+} from './db.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -22,15 +27,47 @@ export interface WebDeps {
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
   advanceGlobalCursor: (cursor: MessageCursor) => void;
-  reloadFeishuConnection?: (config: { appId: string; appSecret: string; enabled?: boolean }) => Promise<boolean>;
-  reloadTelegramConnection?: (config: { botToken: string; enabled?: boolean }) => Promise<boolean>;
-  reloadUserIMConfig?: (userId: string, channel: 'feishu' | 'telegram') => Promise<boolean>;
+  reloadFeishuConnection?: (config: {
+    appId: string;
+    appSecret: string;
+    enabled?: boolean;
+  }) => Promise<boolean>;
+  reloadTelegramConnection?: (config: {
+    botToken: string;
+    enabled?: boolean;
+  }) => Promise<boolean>;
+  reloadUserIMConfig?: (
+    userId: string,
+    channel: 'feishu' | 'telegram' | 'qq' | 'wechat',
+  ) => Promise<boolean>;
   isFeishuConnected?: () => boolean;
   isTelegramConnected?: () => boolean;
   isUserFeishuConnected?: (userId: string) => boolean;
   isUserTelegramConnected?: (userId: string) => boolean;
-  processAgentConversation?: (chatJid: string, agentId: string) => Promise<void>;
-  getFeishuChatInfo?: (userId: string, chatId: string) => Promise<{ avatar?: string; name?: string; user_count?: string; chat_type?: string; chat_mode?: string } | null>;
+  isUserQQConnected?: (userId: string) => boolean;
+  isUserWeChatConnected?: (userId: string) => boolean;
+  processAgentConversation?: (
+    chatJid: string,
+    agentId: string,
+  ) => Promise<void>;
+  getFeishuChatInfo?: (
+    userId: string,
+    chatId: string,
+  ) => Promise<{
+    avatar?: string;
+    name?: string;
+    user_count?: string;
+    chat_type?: string;
+    chat_mode?: string;
+  } | null>;
+  clearImFailCounts?: (jid: string) => void;
+  updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
+  triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
+  handleSpawnCommand?: (
+    chatJid: string,
+    message: string,
+    sourceImJid?: string,
+  ) => Promise<string>;
 }
 
 export type Variables = {
@@ -53,13 +90,63 @@ export function getWebDeps(): WebDeps | null {
 export const lastActiveCache = new Map<string, number>();
 export const LAST_ACTIVE_DEBOUNCE_MS = 5 * 60 * 1000;
 const LAST_ACTIVE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const lastActiveCleanupTimer = setInterval(() => {
-  const cutoff = Date.now() - LAST_ACTIVE_CACHE_TTL_MS;
-  for (const [sessionId, touchedAt] of lastActiveCache.entries()) {
-    if (touchedAt < cutoff) lastActiveCache.delete(sessionId);
-  }
-}, 60 * 60 * 1000);
+const lastActiveCleanupTimer = setInterval(
+  () => {
+    const cutoff = Date.now() - LAST_ACTIVE_CACHE_TTL_MS;
+    for (const [sessionId, touchedAt] of lastActiveCache.entries()) {
+      if (touchedAt < cutoff) lastActiveCache.delete(sessionId);
+    }
+  },
+  60 * 60 * 1000,
+);
 lastActiveCleanupTimer.unref?.();
+
+// Session data cache — 30s TTL, avoids DB query on every request
+const SESSION_CACHE_TTL_MS = 30 * 1000;
+const sessionCache = new Map<string, { data: UserSessionWithUser; expiry: number }>();
+
+export function getCachedSessionWithUser(
+  sessionId: string,
+): UserSessionWithUser | undefined {
+  const cached = sessionCache.get(sessionId);
+  if (cached && cached.expiry > Date.now()) {
+    return cached.data;
+  }
+  sessionCache.delete(sessionId);
+  const data = getSessionWithUser(sessionId);
+  if (data) {
+    sessionCache.set(sessionId, {
+      data,
+      expiry: Date.now() + SESSION_CACHE_TTL_MS,
+    });
+  }
+  return data;
+}
+
+export function invalidateSessionCache(sessionId: string): void {
+  sessionCache.delete(sessionId);
+  lastActiveCache.delete(sessionId);
+}
+
+export function invalidateUserSessions(userId: string): void {
+  for (const [sid, entry] of sessionCache.entries()) {
+    if (entry.data.user_id === userId) {
+      sessionCache.delete(sid);
+      lastActiveCache.delete(sid);
+    }
+  }
+}
+
+const sessionCacheCleanupTimer = setInterval(
+  () => {
+    const now = Date.now();
+    for (const [sid, entry] of sessionCache.entries()) {
+      if (entry.expiry < now) sessionCache.delete(sid);
+    }
+  },
+  5 * 60 * 1000,
+);
+sessionCacheCleanupTimer.unref?.();
 
 // Cookie parser - used by middleware and WebSocket
 export function parseCookie(

@@ -3,6 +3,14 @@ import fs from 'fs';
 import { GROUPS_DIR } from './config.js';
 import { logger } from './logger.js';
 
+// --- Storage usage cache (5 minute TTL) ---
+const _storageCache = new Map<string, { bytes: number; expires: number }>();
+const STORAGE_CACHE_TTL = 5 * 60 * 1000;
+
+function getStorageCacheKey(folder: string, rootOverride?: string): string {
+  return getFileRoot(folder, rootOverride);
+}
+
 // 类型
 export interface FileEntry {
   name: string;
@@ -106,7 +114,11 @@ export function listFiles(
   rootOverride?: string,
 ): { files: FileEntry[]; currentPath: string } {
   const relativePath = subPath || '';
-  const absolutePath = validateAndResolvePath(folder, relativePath, rootOverride);
+  const absolutePath = validateAndResolvePath(
+    folder,
+    relativePath,
+    rootOverride,
+  );
 
   // 目录不存在时返回空列表，不自动创建（避免 GET 请求产生写副作用）
   if (!fs.existsSync(absolutePath)) {
@@ -157,7 +169,11 @@ export function listFiles(
  * @param rootOverride 可选的自定义根目录（绝对路径）
  * @throws 系统路径或路径不存在时抛出异常
  */
-export function deleteFile(folder: string, relativePath: string, rootOverride?: string): void {
+export function deleteFile(
+  folder: string,
+  relativePath: string,
+  rootOverride?: string,
+): void {
   // Reject empty / root-equivalent paths explicitly
   if (!relativePath || relativePath === '.' || relativePath === '/') {
     throw new Error('Cannot delete root directory');
@@ -168,7 +184,11 @@ export function deleteFile(folder: string, relativePath: string, rootOverride?: 
     throw new Error('Cannot delete system path');
   }
 
-  const absolutePath = validateAndResolvePath(folder, relativePath, rootOverride);
+  const absolutePath = validateAndResolvePath(
+    folder,
+    relativePath,
+    rootOverride,
+  );
   const root = getFileRoot(folder, rootOverride);
 
   // Double-check: never delete the group root itself
@@ -228,5 +248,73 @@ export function createDirectory(
   fs.mkdirSync(absolutePath, { recursive: true });
   // chmod 0o777 确保容器（node/1000）与宿主机用户均可读写
   // 与 container-runner.ts 的 mkdirForContainer() 行为一致
-  try { fs.chmodSync(absolutePath, 0o777); } catch { /* 忽略只读文件系统 */ }
+  try {
+    fs.chmodSync(absolutePath, 0o777);
+  } catch {
+    /* 忽略只读文件系统 */
+  }
+}
+
+/**
+ * 递归计算目录总大小（字节），带 5 分钟缓存
+ */
+export function getGroupStorageUsage(
+  folder: string,
+  rootOverride?: string,
+): number {
+  const cacheKey = getStorageCacheKey(folder, rootOverride);
+  const cached = _storageCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) {
+    return cached.bytes;
+  }
+
+  const root = getFileRoot(folder, rootOverride);
+  if (!fs.existsSync(root)) return 0;
+
+  let totalBytes = 0;
+  try {
+    totalBytes = calculateDirSize(root);
+  } catch (err) {
+    logger.warn({ err, folder }, 'Failed to calculate storage usage');
+  }
+
+  _storageCache.set(cacheKey, {
+    bytes: totalBytes,
+    expires: Date.now() + STORAGE_CACHE_TTL,
+  });
+  return totalBytes;
+}
+
+export function invalidateGroupStorageUsage(
+  folder: string,
+  rootOverride?: string,
+): void {
+  _storageCache.delete(getStorageCacheKey(folder, rootOverride));
+}
+
+const MAX_DIR_DEPTH = 20;
+
+function calculateDirSize(dirPath: string, depth = 0): number {
+  if (depth > MAX_DIR_DEPTH) return 0;
+  let total = 0;
+  let entries;
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+    if (entry.isSymbolicLink()) continue; // skip symlinks to avoid loops
+    if (entry.isDirectory()) {
+      total += calculateDirSize(fullPath, depth + 1);
+    } else if (entry.isFile()) {
+      try {
+        total += fs.statSync(fullPath).size;
+      } catch {
+        /* skip unreadable files */
+      }
+    }
+  }
+  return total;
 }

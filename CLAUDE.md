@@ -6,9 +6,9 @@
 
 HappyClaw 是一个自托管的多用户 AI Agent 系统：
 
-- **输入**：飞书 / Telegram / Web 界面消息（每个用户可独立配置 IM 通道）
+- **输入**：飞书 / Telegram / QQ / Web 界面消息（每个用户可独立配置 IM 通道）
 - **执行**：Docker 容器或宿主机进程中运行 Claude Agent（基于 Claude Agent SDK），每个用户拥有独立主容器
-- **输出**：飞书富文本卡片 / Telegram HTML / Web 实时流式推送
+- **输出**：飞书富文本卡片 / Telegram HTML / QQ 纯文本 / Web 实时流式推送
 - **记忆**：Agent 自主维护 `CLAUDE.md` 和工作区文件，实现跨会话持久记忆
 
 ## 2. 核心架构
@@ -22,7 +22,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/routes/auth.ts` | 认证：登录 / 登出 / 注册、`GET /api/auth/me`（含 `setupStatus`）、设置向导、RBAC、邀请码 |
 | `src/routes/groups.ts` | 群组 CRUD、消息分页、会话重置（重建工作区）、群组级容器环境变量 |
 | `src/routes/files.ts` | 文件上传（50MB 限制）/ 下载 / 删除、目录管理、路径遍历防护 |
-| `src/routes/config.ts` | Claude / 飞书配置（AES-256-GCM 加密存储）、连通性测试、批量应用到所有容器、per-user IM 通道配置（`/api/config/user-im/feishu`、`/api/config/user-im/telegram`） |
+| `src/routes/config.ts` | Claude / 飞书配置（AES-256-GCM 加密存储）、连通性测试、批量应用到所有容器、per-user IM 通道配置（`/api/config/user-im/feishu`、`/api/config/user-im/telegram`、`/api/config/user-im/qq`） |
 | `src/routes/monitor.ts` | 系统状态：容器列表、队列状态、健康检查（`GET /api/health` 无需认证） |
 | `src/routes/memory.ts` | 记忆文件读写（`groups/global/` + `groups/{folder}/`）、全文检索 |
 | `src/routes/tasks.ts` | 定时任务 CRUD + 执行日志查询 |
@@ -33,8 +33,9 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/routes/mcp-servers.ts` | MCP Servers 管理（CRUD + `POST /api/mcp-servers/sync-host`，per-user） |
 | `src/feishu.ts` | 飞书连接工厂（`createFeishuConnection`）：WebSocket 长连接、消息去重（LRU 1000 条 / 30min TTL）、富文本卡片、Reaction；`file` 消息下载到工作区；`post` 图文消息仅提取文字 |
 | `src/telegram.ts` | Telegram 连接工厂（`createTelegramConnection`）：Bot API Long Polling、Markdown → HTML 转换、长消息分片（3800 字符）；`message:photo` 下载为 base64 供 Vision；`message:document` 下载文件到工作区 |
+| `src/qq.ts` | QQ 连接工厂（`createQQConnection`）：Bot API v2 WebSocket 长连接、OAuth Token 管理、C2C 私聊 + 群聊 @Bot、消息去重（LRU 1000 条 / 30min TTL）、Markdown → 纯文本、长消息分片（5000 字符）、图片下载为 base64 供 Vision |
 | `src/im-downloader.ts` | IM 文件下载工具：`saveDownloadedFile()` 将 Buffer 写入 `downloads/{channel}/{YYYY-MM-DD}/`，处理路径安全、文件名冲突和 50MB 限制 |
-| `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 飞书/Telegram 连接管理、热重连、批量断开 |
+| `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 飞书/Telegram/QQ 连接管理、热重连、批量断开 |
 | `src/container-runner.ts` | 容器生命周期：Docker run + 宿主机进程模式、卷挂载构建（isAdminHome 区分权限）、环境变量注入 |
 | `src/agent-output-parser.ts` | Agent 输出解析：OUTPUT_MARKER 流式输出解析、stdout/stderr 处理、进程生命周期回调（从 container-runner.ts 提取的共享逻辑） |
 | `src/group-queue.ts` | 并发控制：最大 20 容器 + 最大 5 宿主机进程、会话级队列、任务优先于消息、指数退避重试 |
@@ -42,7 +43,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/task-scheduler.ts` | 定时调度：60s 轮询、cron / interval / once 三种模式、group / isolated 上下文 |
 | `src/file-manager.ts` | 文件安全：路径遍历防护、符号链接检测、系统路径保护（`logs/`、`CLAUDE.md`、`.claude/`、`conversations/`） |
 | `src/mount-security.ts` | 挂载安全：白名单校验、黑名单模式匹配（`.ssh`、`.gnupg` 等）、非主会话只读强制 |
-| `src/db.ts` | 数据层：SQLite WAL 模式、Schema 版本校验（v1→v18）、核心表定义 |
+| `src/db.ts` | 数据层：SQLite WAL 模式、Schema 版本校验（v1→v24）、核心表定义 |
 | `src/auth.ts` | 密码工具：bcrypt 哈希/验证、Session Token 生成、用户名/密码校验 |
 | `src/permissions.ts` | 权限常量和模板定义（`ALL_PERMISSIONS`、`PERMISSION_TEMPLATES`） |
 | `src/schemas.ts` | Zod v4 校验 schema：API 请求体校验 |
@@ -50,7 +51,6 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/web-context.ts` | Web 共享状态：`WebDeps` 依赖注入、群组访问权限检查、WS 客户端管理 |
 | `src/middleware/auth.ts` | 认证中间件：Cookie Session 校验、权限检查中间件工厂 |
 | `src/im-channel.ts` | 统一 IM 通道接口（`IMChannel`）、Feishu/Telegram 适配器工厂 |
-| `src/intent-analyzer.ts` | 消息意图分析：stop/correction/continue 识别 |
 | `src/commands.ts` | Web 端斜杠命令处理器（`/clear` 重置会话） |
 | `src/im-command-utils.ts` | IM 斜杠命令纯函数工具：`formatWorkspaceList()`、`formatContextMessages()` |
 | `src/telegram-pairing.ts` | Telegram 配对码：6 位随机码，5 分钟过期 |
@@ -193,7 +193,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 | 容器 → 主进程 | `data/ipc/{folder}/messages/*.json` | Agent 主动发送消息（`send_message` MCP 工具） |
 | 容器 → 主进程 | `data/ipc/{folder}/tasks/*.json` | 任务管理（创建 / 暂停 / 恢复 / 取消） |
 
-文件操作使用原子写入（先写 `.tmp` 再 `rename`），读取后立即删除。IPC 轮询间隔 1s（`IPC_POLL_INTERVAL`）。
+文件操作使用原子写入（先写 `.tmp` 再 `rename`），读取后立即删除。IPC 通信使用 `fs.watch` 事件驱动（50-100ms debounce）+ 5s 后备轮询。
 
 ### 3.4 容器挂载策略
 
@@ -253,10 +253,11 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 `IMConnectionManager`（`src/im-manager.ts`）管理 per-user 的 IM 连接：
 
-- 每个用户可独立配置飞书和 Telegram 连接（存储在 `data/config/user-im/{userId}/feishu.json` 和 `telegram.json`）
-- `feishu.ts` 和 `telegram.ts` 改为工厂模式（`createFeishuConnection()`、`createTelegramConnection()`），返回无状态的连接实例
+- 每个用户可独立配置飞书、Telegram 和 QQ 连接（存储在 `data/config/user-im/{userId}/feishu.json`、`telegram.json`、`qq.json`）
+- `feishu.ts`、`telegram.ts`、`qq.ts` 均为工厂模式（`createFeishuConnection()`、`createTelegramConnection()`、`createQQConnection()`），返回无状态的连接实例
 - 系统启动时 `loadState()` 遍历所有用户，加载已保存的 IM 配置并建立连接
-- 管理员的系统级飞书/Telegram 配置（`data/config/feishu-provider.json`）绑定到 admin 用户的连接
+- 首次启动时自动迁移系统级 IM 配置到 admin 的 per-user 配置（`migrateSystemIMToPerUser()`）
+- 系统级 API（`/api/config/feishu`、`/api/config/telegram`）已标记 deprecated，新代码应使用 `/api/config/user-im/*`
 - 收到 IM 消息时，通过 `onNewChat` 回调自动注册到该用户的主容器（`home-{userId}`）
 - 支持热重连（`ignoreMessagesBefore` 过滤渠道关闭期间的堆积消息）
 - 优雅关闭时 `disconnectAll()` 批量断开所有连接
@@ -299,7 +300,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 |------|-------|--------|
 | 主容器 folder | `main` | `home-{userId}` |
 | 执行模式 | `host`（宿主机） | `container`（Docker） |
-| IM 通道 | 独立的飞书/Telegram 连接 | 独立的飞书/Telegram 连接 |
+| IM 通道 | 独立的飞书/Telegram/QQ 连接 | 独立的飞书/Telegram/QQ 连接 |
 | 全局记忆写入 | 可读写 | 只读 |
 | 项目根目录挂载 | 读写 | 不可访问 |
 | 跨组 MCP 操作 | `register_group`、跨组任务管理 | 仅限自己的群组 |
@@ -310,7 +311,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 ## 5. 数据库表
 
-SQLite WAL 模式，Schema 经历 v1→v18 演进（`db.ts` 中的 `SCHEMA_VERSION`）。
+SQLite WAL 模式，Schema 经历 v1→v24 演进（`db.ts` 中的 `SCHEMA_VERSION`）。
 
 | 表 | 主键 | 用途 |
 |-----|------|------|
@@ -327,6 +328,9 @@ SQLite WAL 模式，Schema 经历 v1→v18 演进（`db.ts` 中的 `SCHEMA_VERSI
 | `auth_audit_log` | `id` (auto) | 认证审计日志 |
 | `group_members` | `(group_folder, user_id)` | 共享工作区成员（用户与群组的多对多关系） |
 | `agents` | `id` | Sub-Agent（status、kind、prompt、result_summary，属于特定群组） |
+| `usage_records` | `id` | Token 用量明细（per-model 拆行，关联 user_id、group_folder、message_id） |
+| `usage_daily_summary` | `(user_id, model, date)` | 日维度用量预聚合（本地时区日期，增量 UPSERT） |
+| `user_quotas` | `user_id` | 用户配额（预留，暂不写入数据） |
 
 **注意**：`registered_groups.folder` 允许重复（多个飞书群组可映射到同一 folder）。`registered_groups.is_home` 标记用户主容器。
 
@@ -357,9 +361,11 @@ data/
   config/container-env/{folder}.json       # 群组级环境变量覆盖
   config/user-im/{userId}/feishu.json      # 用户级飞书 IM 配置（AES-256-GCM 加密）
   config/user-im/{userId}/telegram.json    # 用户级 Telegram IM 配置（AES-256-GCM 加密）
+  config/user-im/{userId}/qq.json          # 用户级 QQ IM 配置（AES-256-GCM 加密）
   config/registration.json                 # 注册设置（开关、邀请码要求）
   config/session-secret.key                # 会话签名密钥（0600 权限）
   config/system-settings.json              # 系统运行参数（容器超时、并发限制等）
+  streaming-buffer/                         # 流式文本磁盘缓冲（崩溃恢复用，自动清理）
   skills/{userId}/                         # 用户级 Skills 数据
   mcp-servers/{userId}/servers.json        # 用户 MCP Servers 配置
 
@@ -406,13 +412,19 @@ scripts/                      # 构建辅助脚本
 - `GET|PUT /api/config/claude` · `PUT /api/config/claude/secrets`
 - `GET|PUT /api/config/claude/custom-env`
 - `POST /api/config/claude/test`（连通性测试） · `POST /api/config/claude/apply`（应用到所有容器）
-- `GET|PUT /api/config/feishu`
-- `GET|PUT /api/config/telegram` · `POST /api/config/telegram/test`（系统级 Telegram 配置）
+- `GET|PUT /api/config/feishu`（**deprecated**，使用 `/api/config/user-im/feishu` 代替）
+- `GET|PUT /api/config/telegram` · `POST /api/config/telegram/test`（**deprecated**，使用 `/api/config/user-im/telegram` 代替）
 - `GET|PUT /api/config/appearance` · `GET /api/config/appearance/public`（外观配置，public 端点无需认证）
 - `GET|PUT /api/config/system` — 系统运行参数（容器超时、并发限制等），需要 `manage_system_config` 权限
-- `GET|PUT /api/config/user-im/feishu`（用户级飞书 IM 配置，每个用户独立）
-- `GET|PUT /api/config/user-im/telegram`（用户级 Telegram IM 配置）
-- `POST /api/config/user-im/telegram/test`（Telegram Bot Token 连通性测试）
+- `GET /api/config/user-im/status`（所有渠道连接状态，含 QQ）
+- `GET|PUT /api/config/user-im/feishu`（用户级飞书 IM 配置，GET 返回 `connected` 字段）
+- `GET|PUT /api/config/user-im/telegram`（用户级 Telegram IM 配置，GET 返回 `connected`、`effectiveProxyUrl`、`proxySource`，PUT 支持 `proxyUrl`/`clearProxyUrl`）
+- `POST /api/config/user-im/telegram/test`（Telegram Bot Token 连通性测试，使用 per-user proxyUrl）
+- `GET|PUT /api/config/user-im/qq`（用户级 QQ IM 配置，GET 返回 `connected` 字段）
+- `POST /api/config/user-im/qq/test`（QQ 凭据连通性测试）
+- `POST /api/config/user-im/qq/pairing-code`（生成 QQ 配对码）
+- `GET /api/config/user-im/qq/paired-chats`（已配对的 QQ 聊天列表）
+- `DELETE /api/config/user-im/qq/paired-chats/:jid`（移除 QQ 配对）
 
 ### 任务
 - `GET /api/tasks` · `POST /api/tasks` · `PATCH /api/tasks/:id` · `DELETE /api/tasks/:id`
@@ -438,6 +450,11 @@ scripts/                      # 构建辅助脚本
 - `PATCH /api/mcp-servers/:id` · `DELETE /api/mcp-servers/:id`
 - `POST /api/mcp-servers/sync-host`（从宿主机同步 MCP Server 配置）
 
+### 用量统计
+- `GET /api/usage/stats?days=7&userId=&model=`（从 `usage_daily_summary` 查询，支持用户/模型筛选）
+- `GET /api/usage/models`（去重模型列表）
+- `GET /api/usage/users`（有用量数据的用户列表，admin 可见全部）
+
 ### 监控
 - `GET /api/status` · `GET /api/health`（无需认证）
 
@@ -456,7 +473,7 @@ scripts/                      # 构建辅助脚本
 
 ### 8.2 IM 自动注册
 
-未注册的飞书/Telegram 群组首次发消息时，通过 `onNewChat` 回调自动注册到该用户的主容器（`folder='home-{userId}'`，admin 则为 `folder='main'`）。支持多个 IM 群组映射到同一个 folder。
+未注册的飞书/Telegram/QQ 群组首次发消息时，通过 `onNewChat` 回调自动注册到该用户的主容器（`folder='home-{userId}'`，admin 则为 `folder='main'`）。支持多个 IM 群组映射到同一个 folder。QQ 通道需先通过配对码绑定（`/pair <code>`）。
 
 ### 8.3 无触发词
 
@@ -483,7 +500,7 @@ scripts/                      # 构建辅助脚本
 
 ### 8.6 回复路由
 
-主容器在 Web 与 IM 共用历史（通过 `normalizeHomeJid` 映射飞书/Telegram JID → `web:{folder}`）。IM 来源的消息回复到对应 IM 渠道，Web 来源的消息仅在 Web 展示。
+主容器在 Web 与 IM 共用历史（通过 `normalizeHomeJid` 映射飞书/Telegram/QQ JID → `web:{folder}`）。IM 来源的消息回复到对应 IM 渠道，Web 来源的消息仅在 Web 展示。
 
 ### 8.7 并发控制
 
@@ -512,7 +529,7 @@ scripts/                      # 构建辅助脚本
 
 ### 8.10 IM 通道热管理
 
-通过 `PUT /api/config/user-im/feishu` 或 `PUT /api/config/user-im/telegram` 更新 IM 配置后：
+通过 `PUT /api/config/user-im/feishu`、`PUT /api/config/user-im/telegram` 或 `PUT /api/config/user-im/qq` 更新 IM 配置后：
 - 保存配置到 `data/config/user-im/{userId}/` 目录（AES-256-GCM 加密）
 - 断开该用户的旧连接
 - 如果新配置有效（`enabled=true` 且凭据非空），立即建立新连接
@@ -520,7 +537,7 @@ scripts/                      # 构建辅助脚本
 
 ### 8.11 IM 斜杠命令
 
-飞书/Telegram 中以 `/` 开头的消息会被拦截为斜杠命令（未知命令继续作为普通消息处理）。命令在主服务进程的 `handleCommand()` 中分发，纯函数逻辑在 `im-command-utils.ts` 中（便于单测）。
+飞书/Telegram/QQ 中以 `/` 开头的消息会被拦截为斜杠命令（未知命令继续作为普通消息处理）。命令在主服务进程的 `handleCommand()` 中分发，纯函数逻辑在 `im-command-utils.ts` 中（便于单测）。
 
 | 命令 | 缩写 | 用途 |
 |------|------|------|
@@ -528,7 +545,7 @@ scripts/                      # 构建辅助脚本
 | `/status` | - | 查看当前所在的工作区/对话状态 |
 | `/recall` | `/rc` | 调用 Claude CLI（`--print` 模式）总结最近 10 条消息，API 不可用时 fallback 到原始消息列表 |
 | `/clear` | - | 清除当前对话的会话上下文 |
-| `/activation` | - | 切换群聊响应模式：`/activation always`（全量响应）或 `/activation mention`（需要 @机器人） |
+| `/require_mention` | - | 切换群聊响应模式：`/require_mention true`（需要 @机器人）或 `/require_mention false`（全量响应） |
 
 `/recall` 通过 `execFile('claude', ['--print'])` + stdin 管道调用 Claude CLI，复用与 Agent Runner 相同的 OAuth 认证机制。
 
@@ -536,14 +553,14 @@ scripts/                      # 构建辅助脚本
 
 飞书群聊支持 per-group 的 @mention 控制，类似 OpenClaw 的 `resolveGroupActivationFor()` 机制：
 
-- **默认模式**（`require_mention=true`）：群聊中只有 @机器人 的消息才会被处理
-- **全量模式**（`require_mention=false`）：群聊中所有消息都会被处理
-- 通过 `/activation always|mention` 命令切换
+- **默认模式**（`require_mention=false`）：群聊中所有消息都会被处理
+- **Mention 模式**（`require_mention=true`）：群聊中只有 @机器人 的消息才会被处理
+- 通过 `/require_mention true|false` 命令切换
 - 私聊不受此控制影响，始终响应
 
 **实现原理**：连接飞书时通过 Bot Info API 获取 bot 的 `open_id`，收到群消息后检查 `mentions[].id.open_id` 是否包含 bot。如果 bot 未被 @mention 且该群 `require_mention=true`，则静默丢弃该消息。
 
-**前置条件**：飞书应用需要 `im:message:readonly` 权限（接收群里所有消息），否则平台层只推送 @消息，应用层控制无意义。
+**前置条件**：飞书应用需要 `im:message.group_msg` 敏感权限（实时接收群里所有消息）。`im:message:readonly` 仅控制 REST API 读取历史消息，不影响 WebSocket 实时推送。没有 `im:message.group_msg` 权限时，平台层只推送 @消息，`require_mention=false` 无法生效。
 
 ## 9. 环境变量
 
@@ -572,10 +589,66 @@ scripts/                      # 构建辅助脚本
 - 当前阶段允许不兼容重构，优先代码清晰与行为一致
 - 修改容器 / 调度逻辑时，优先保证：不丢消息、不重复回复、失败可重试
 - **Git commit message 使用简体中文**，格式：`类型: 简要描述`（如 `修复: 侧边栏下拉菜单无法点击`）
+- **Issue / PR 规范**见下方 §10.1
 - 系统路径不可通过文件 API 操作：`logs/`、`CLAUDE.md`、`.claude/`、`conversations/`
 - StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，修改后运行 `make sync-types` 同步（`make build` 自动触发，`make typecheck` 校验一致性）
 - Claude SDK 和 CLI 始终使用最新版本（agent-runner `package.json` 中 `"*"`，通过 `make update-sdk` 更新）
 - 容器内以 `node` 非 root 用户运行，需注意文件权限
+- **关闭服务时禁止 `lsof -ti:PORT | xargs kill`**，该命令会杀掉所有连接到该端口的进程（包括 OrbStack/Docker 网络代理），导致 Docker daemon 崩溃。正确做法：`lsof -ti:PORT -sTCP:LISTEN | xargs kill`（仅杀监听进程）
+
+### 10.1 Issue / PR 规范
+
+**Issue 标题**：`类型: 简要描述`，类型使用小写英文前缀：
+
+| 前缀 | 用途 | 示例 |
+|------|------|------|
+| `bug:` | Bug 报告 | `bug: 已取消的定时任务仍从 GroupQueue 执行` |
+| `feat:` | 功能请求 | `feat: 支持 Latex 渲染` |
+| `perf:` | 性能问题 | `perf: 大量消息时虚拟滚动卡顿` |
+
+**Issue 正文**（Bug）：
+
+```markdown
+## 用户现象
+从用户视角描述看到了什么、体验上有什么异常。
+让不熟悉代码的人也能理解问题的严重性。
+
+## 问题描述
+从技术视角简要说明发生了什么。
+
+## 复现路径
+1. 步骤一
+2. 步骤二
+3. 期望行为 vs 实际行为
+
+## 根因（可选）
+如果已定位，说明代码层面的原因。
+
+## 影响
+对用户体验 / 数据 / 安全的影响。
+
+## 建议修复（可选）
+修复思路或代码片段。
+```
+
+**Issue 正文**（Feature）：自由格式，说清需求背景和预期行为即可。
+
+**PR 标题**：与 commit message 一致，`类型: 简要描述`（如 `修复: 定时任务运行时用户消息被吞掉的问题 (#151)`）。关联 Issue 时在末尾加 `(#issue号)`。
+
+**PR 正文**：
+
+```markdown
+## 问题描述
+关闭 #xxx。（或：关联 #xxx）
+简要说明要解决的问题。
+
+## 修复方案 / 实现方案
+核心思路，按模块分段说明改动：
+
+### `src/affected-file.ts`
+- 改动点一
+- 改动点二
+```
 
 ## 11. 本地开发
 
@@ -659,7 +732,7 @@ make help          # 列出所有可用的 make 命令
 
 ### 新增 IM 集成渠道
 
-1. 在 `src/` 目录下创建新的连接工厂模块（参考 `feishu.ts` 和 `telegram.ts` 的接口模式）
+1. 在 `src/` 目录下创建新的连接工厂模块（参考 `feishu.ts`、`telegram.ts`、`qq.ts` 的接口模式）
 2. 在 `src/im-manager.ts` 中添加 `connectUser{Channel}()` / `disconnectUser{Channel}()` 方法
 3. 在 `src/routes/config.ts` 中添加 `/api/config/user-im/{channel}` 路由（GET/PUT）
 4. 在 `src/index.ts` 的 `loadState()` 和 `connectUserIMChannels()` 中加载新渠道

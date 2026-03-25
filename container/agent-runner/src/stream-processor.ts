@@ -12,9 +12,11 @@
 import type { ContainerOutput, StreamEvent } from './types.js';
 import { extractSkillName, summarizeToolInput } from './utils.js';
 
+/** Tools with specialized input_json_delta handling — generic accumulation is skipped for these. */
+const SPECIAL_TOOLS = ['Skill', 'Task', 'Agent', 'AskUserQuestion', 'TodoWrite'];
+
 type EmitFn = (output: ContainerOutput) => void;
 type LogFn = (message: string) => void;
-
 export class StreamEventProcessor {
   private readonly emit: EmitFn;
   private readonly log: LogFn;
@@ -59,6 +61,13 @@ export class StreamEventProcessor {
     toolUseId: string; inputJson: string; resolved: boolean;
     parentToolUseId: string | null; isNested: boolean;
   }>();
+  // Accumulate generic tool input_json_delta to extract toolInputSummary
+  private readonly pendingGenericInput = new Map<number, {
+    toolUseId: string; inputJson: string; resolved: boolean;
+    parentToolUseId: string | null; isNested: boolean;
+    toolName: string;
+  }>();
+
   // Confirmed teammate Tasks (detected via team_name)
   private readonly teammateTaskToolUseIds = new Set<string>();
 
@@ -71,6 +80,12 @@ export class StreamEventProcessor {
 
   // Background Task tool_use_ids (run_in_background: true)
   private readonly backgroundTaskToolUseIds = new Set<string>();
+
+  // SDK internal task_id → API tool_use_id mapping.
+  // Built from task_started/task_progress system messages so that
+  // task_notification (which carries SDK task_id) can be translated
+  // back to the tool_use_id used at creation time.
+  private readonly sdkTaskIdToToolUseId = new Map<string, string>();
 
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
@@ -254,12 +269,21 @@ export class StreamEventProcessor {
       }
     }
 
-    // Track Task tool
-    if (block.name === 'Task' && block.id) {
+    // Track generic tools for input_json_delta → toolInputSummary
+    if (block.name && !SPECIAL_TOOLS.includes(block.name) && typeof blockIndex === 'number') {
+      this.pendingGenericInput.set(blockIndex, {
+        toolUseId: block.id || '', inputJson: '', resolved: false,
+        parentToolUseId: effectiveParentToolUseId, isNested: effectiveIsNested,
+        toolName: block.name,
+      });
+    }
+
+    // Track Task / Agent tool (both spawn sub-agents whose messages need forwarding)
+    if ((block.name === 'Task' || block.name === 'Agent') && block.id) {
       this.taskToolUseIds.add(block.id);
       this.emit({
         status: 'stream', result: null,
-        streamEvent: { eventType: 'task_start', toolUseId: block.id, toolName: 'Task' },
+        streamEvent: { eventType: 'task_start', toolUseId: block.id, toolName: block.name },
       });
       if (typeof blockIndex === 'number') {
         this.pendingTaskInput.set(blockIndex, {
@@ -422,6 +446,40 @@ export class StreamEventProcessor {
         });
       }
     }
+
+    // Accumulate generic tool input JSON for toolInputSummary.
+    // Only attempt JSON.parse when the accumulated string looks complete (ends with '}')
+    // to avoid O(n^2) repeated parse failures on large tool inputs.
+    // Cap at 10KB to avoid unbounded memory growth on tools with large inputs (Write, Edit).
+    const GENERIC_INPUT_MAX = 10_240;
+    const pendingGeneric = this.pendingGenericInput.get(blockIndex);
+    if (pendingGeneric && !pendingGeneric.resolved) {
+      if (pendingGeneric.inputJson.length >= GENERIC_INPUT_MAX) {
+        pendingGeneric.resolved = true;
+        this.pendingGenericInput.delete(blockIndex);
+        return;
+      }
+      pendingGeneric.inputJson += partialJson;
+      const trimmed = pendingGeneric.inputJson.trimEnd();
+      const summary = trimmed.endsWith('}') ? summarizeToolInput((() => {
+        try { return JSON.parse(pendingGeneric.inputJson); } catch { return null; }
+      })()) : undefined;
+      if (summary) {
+        pendingGeneric.resolved = true;
+        this.pendingGenericInput.delete(blockIndex);
+        this.emit({
+          status: 'stream', result: null,
+          streamEvent: {
+            eventType: 'tool_progress',
+            toolName: pendingGeneric.toolName,
+            toolUseId: pendingGeneric.toolUseId,
+            parentToolUseId: pendingGeneric.parentToolUseId,
+            isNested: pendingGeneric.isNested,
+            toolInputSummary: summary,
+          },
+        });
+      }
+    }
   }
 
   /**
@@ -509,7 +567,45 @@ export class StreamEventProcessor {
       });
       return true;
     }
+    // API retry — emit status so user sees retry progress and activity stays alive
+    if (message.subtype === 'api_retry') {
+      const attempt = message.attempt ?? '?';
+      const max = message.max_retries ?? '?';
+      const delayMs = message.retry_delay_ms ?? 0;
+      const delaySec = Math.round(delayMs / 1000);
+      this.emit({
+        status: 'stream', result: null,
+        streamEvent: { eventType: 'status', statusText: `API 重试中 (${attempt}/${max})，${delaySec}s 后重试` },
+      });
+      return true;
+    }
+    // task_started / task_progress — emit a status event to keep stdout activity alive.
+    // Without this, long-running tasks produce no stdout output, and the host's
+    // stuck-runner detector may kill the process after 6 minutes of silence.
+    // Also build sdkTaskId → toolUseId mapping for task_notification translation.
+    if (message.subtype === 'task_started' || message.subtype === 'task_progress') {
+      if (message.task_id && message.tool_use_id) {
+        this.sdkTaskIdToToolUseId.set(message.task_id, message.tool_use_id);
+      }
+      const desc = message.description || message.summary || '';
+      const toolName = message.last_tool_name || '';
+      const statusText = message.subtype === 'task_started'
+        ? `Task 启动: ${desc.slice(0, 80)}`
+        : `Task 进度${toolName ? ` [${toolName}]` : ''}: ${desc.slice(0, 80)}`;
+      this.emit({
+        status: 'stream', result: null,
+        streamEvent: { eventType: 'status', statusText },
+      });
+      return true;
+    }
     return false;
+  }
+
+  /**
+   * Convenience: emit a status StreamEvent.
+   */
+  emitStatus(statusText: string): void {
+    this.emit({ status: 'stream', result: null, streamEvent: { eventType: 'status', statusText } });
   }
 
   /**
@@ -519,6 +615,9 @@ export class StreamEventProcessor {
   processSubAgentMessage(message: any): boolean {
     const msgParentToolUseId = message.parent_tool_use_id ?? null;
     if (!msgParentToolUseId || !this.taskToolUseIds.has(msgParentToolUseId)) {
+      if (msgParentToolUseId && (message.type === 'assistant' || message.type === 'user')) {
+        this.log(`[WARN] Sub-agent message dropped: parent=${msgParentToolUseId.slice(0, 12)} not in taskToolUseIds=[${[...this.taskToolUseIds].map(id => id.slice(0, 12)).join(',')}]`);
+      }
       return false;
     }
 
@@ -635,7 +734,7 @@ export class StreamEventProcessor {
 
     // Fallback: identify background Tasks and Teammate Tasks from complete input
     for (const block of content) {
-      if (block.type === 'tool_use' && block.name === 'Task' && block.id && block.input) {
+      if (block.type === 'tool_use' && (block.name === 'Task' || block.name === 'Agent') && block.id && block.input) {
         const taskInput = block.input as Record<string, unknown>;
         if (taskInput.run_in_background === true) {
           this.backgroundTaskToolUseIds.add(block.id);
@@ -692,35 +791,48 @@ export class StreamEventProcessor {
     this.pendingTaskInput.clear();
     this.pendingAskUserInput.clear();
     this.pendingTodoInput.clear();
+    this.pendingGenericInput.clear();
+    this.sdkTaskIdToToolUseId.clear();
   }
 
   /**
    * Process a task_notification system message.
+   * The SDK's task_id differs from the API's tool_use_id used at task creation.
+   * We resolve the effective toolUseId via: message.tool_use_id → sdkTaskId map → raw task_id.
    */
-  processTaskNotification(message: { task_id: string; status: string; summary: string }): void {
-    this.log(`Task notification: task=${message.task_id} status=${message.status} summary=${message.summary}`);
+  processTaskNotification(message: { task_id: string; tool_use_id?: string; status: string; summary: string }): void {
+    const effectiveToolUseId = message.tool_use_id
+      || this.sdkTaskIdToToolUseId.get(message.task_id)
+      || message.task_id;
+    if (effectiveToolUseId !== message.task_id) {
+      this.log(`Task notification: sdkTaskId=${message.task_id} → toolUseId=${effectiveToolUseId} status=${message.status}`);
+    } else {
+      this.log(`Task notification: task=${message.task_id} status=${message.status} summary=${message.summary}`);
+    }
     this.emit({
       status: 'stream', result: null,
       streamEvent: {
         eventType: 'task_notification',
-        taskId: message.task_id,
+        taskId: effectiveToolUseId,
         taskStatus: message.status,
         taskSummary: message.summary,
         isBackground: true,
       },
     });
-    this.cleanupTaskTools(message.task_id);
-    this.backgroundTaskToolUseIds.delete(message.task_id);
-    if (this.taskToolUseIds.has(message.task_id)) {
-      this.taskToolUseIds.delete(message.task_id);
+    this.cleanupTaskTools(effectiveToolUseId);
+    this.backgroundTaskToolUseIds.delete(effectiveToolUseId);
+    if (this.taskToolUseIds.has(effectiveToolUseId)) {
+      this.taskToolUseIds.delete(effectiveToolUseId);
       this.emit({
         status: 'stream', result: null,
-        streamEvent: { eventType: 'tool_use_end', toolUseId: message.task_id },
+        streamEvent: { eventType: 'tool_use_end', toolUseId: effectiveToolUseId },
       });
-      if (this.activeTopLevelToolUseId === message.task_id) {
+      if (this.activeTopLevelToolUseId === effectiveToolUseId) {
         this.activeTopLevelToolUseId = null;
       }
     }
+    // Clean up the mapping entry
+    this.sdkTaskIdToToolUseId.delete(message.task_id);
   }
 
   /**

@@ -11,6 +11,7 @@ import type { StreamEvent } from './stream-event.types.js';
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  turnId?: string;
   groupFolder: string;
   chatJid: string;
   /** @deprecated Use isHome + isAdminHome instead. Kept for backward compatibility with older host processes. */
@@ -31,6 +32,11 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   streamEvent?: StreamEvent;
+  turnId?: string;
+  sessionId?: string;
+  sdkMessageUuid?: string;
+  sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy';
+  finalizationReason?: 'completed' | 'interrupted' | 'error';
 }
 
 export interface SessionEntry {
@@ -44,13 +50,15 @@ export interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+export type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+
 export interface SDKUserMessage {
   type: 'user';
   message: {
     role: 'user';
     content:
       | string
-      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }>;
+      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }>;
   };
   parent_tool_use_id: null;
   session_id: string;

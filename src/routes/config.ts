@@ -3,38 +3,49 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
+import QRCode from 'qrcode';
 import { Hono } from 'hono';
+import { updateWeChatNoProxy } from '../config.js';
 import type { Variables } from '../web-context.js';
-import { deleteRegisteredGroup, deleteChatHistory } from '../db.js';
+import { canAccessGroup, getWebDeps } from '../web-context.js';
+import { getChannelType } from '../im-channel.js';
+import {
+  deleteRegisteredGroup,
+  deleteChatHistory,
+  getRegisteredGroup,
+  setRegisteredGroup,
+  getAgent,
+} from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
 import {
-  ClaudeConfigSchema,
-  ClaudeSecretsSchema,
   ClaudeCustomEnvSchema,
-  ClaudeThirdPartyProfileCreateSchema,
-  ClaudeThirdPartyProfilePatchSchema,
-  ClaudeThirdPartyProfileSecretsSchema,
   FeishuConfigSchema,
   TelegramConfigSchema,
+  QQConfigSchema,
+  WeChatConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
   SystemSettingsSchema,
+  UnifiedProviderCreateSchema,
+  UnifiedProviderPatchSchema,
+  UnifiedProviderSecretsSchema,
+  BalancingConfigSchema,
 } from '../schemas.js';
 import {
   getClaudeProviderConfig,
   toPublicClaudeProviderConfig,
-  saveClaudeProviderConfig,
-  saveClaudeOfficialProviderSecrets,
   appendClaudeConfigAudit,
-  listClaudeThirdPartyProfiles,
-  toPublicClaudeThirdPartyProfile,
-  createClaudeThirdPartyProfile,
-  updateClaudeThirdPartyProfile,
-  updateClaudeThirdPartyProfileSecret,
-  activateClaudeThirdPartyProfile,
-  deleteClaudeThirdPartyProfile,
-  getGlobalClaudeCustomEnv,
-  saveGlobalClaudeCustomEnv,
+  getProviders,
+  getEnabledProviders,
+  getBalancingConfig,
+  saveBalancingConfig,
+  createProvider,
+  updateProvider,
+  updateProviderSecrets,
+  toggleProvider,
+  deleteProvider,
+  providerToConfig,
+  toPublicProvider,
   getFeishuProviderConfig,
   getFeishuProviderConfigWithSource,
   toPublicFeishuProviderConfig,
@@ -53,17 +64,43 @@ import {
   saveUserFeishuConfig,
   getUserTelegramConfig,
   saveUserTelegramConfig,
+  getUserQQConfig,
+  saveUserQQConfig,
+  getUserWeChatConfig,
+  saveUserWeChatConfig,
   updateAllSessionCredentials,
-  refreshOAuthCredentials,
-  detectLocalClaudeCode,
-  importLocalClaudeCredentials,
 } from '../runtime-config.js';
 import type { ClaudeOAuthCredentials } from '../runtime-config.js';
-import type { AuthUser } from '../types.js';
+import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
+import {
+  checkImChannelLimit,
+  isBillingEnabled,
+  clearBillingEnabledCache,
+} from '../billing.js';
+import { providerPool } from '../provider-pool.js';
 
 const configRoutes = new Hono<{ Variables: Variables }>();
+
+/**
+ * Count how many IM channels are currently enabled for a user, excluding the given channel.
+ * Used for billing limit checks when enabling a new channel.
+ */
+function countOtherEnabledImChannels(
+  userId: string,
+  excludeChannel: 'feishu' | 'telegram' | 'qq' | 'wechat',
+): number {
+  let count = 0;
+  if (excludeChannel !== 'feishu' && getUserFeishuConfig(userId)?.enabled)
+    count++;
+  if (excludeChannel !== 'telegram' && getUserTelegramConfig(userId)?.enabled)
+    count++;
+  if (excludeChannel !== 'wechat' && getUserWeChatConfig(userId)?.enabled)
+    count++;
+  if (excludeChannel !== 'qq' && getUserQQConfig(userId)?.enabled) count++;
+  return count;
+}
 
 // Inject deps at runtime
 let deps: any = null;
@@ -129,8 +166,34 @@ async function applyClaudeConfigToAllGroups(
   };
 }
 
+// --- OAuth 常量 ---
+
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_REDIRECT_URI =
+  'https://console.anthropic.com/oauth/code/callback';
+const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference';
+const OAUTH_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
+const OAUTH_TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token';
+const OAUTH_FLOW_TTL = 10 * 60 * 1000; // 10 minutes
+
+interface OAuthFlow {
+  codeVerifier: string;
+  expiresAt: number;
+  targetProviderId?: string; // 空 = 创建新供应商
+}
+const oauthFlows = new Map<string, OAuthFlow>();
+
+// Periodic cleanup of expired flows
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, flow] of oauthFlows) {
+    if (flow.expiresAt < now) oauthFlows.delete(key);
+  }
+}, 60_000);
+
 // --- Routes ---
 
+// ─── GET /claude — 兼容：返回第一个启用供应商的公开配置 ─────
 configRoutes.get('/claude', authMiddleware, systemConfigMiddleware, (c) => {
   try {
     return c.json(toPublicClaudeProviderConfig(getClaudeProviderConfig()));
@@ -140,32 +203,45 @@ configRoutes.get('/claude', authMiddleware, systemConfigMiddleware, (c) => {
   }
 });
 
+
+// ─── GET /claude/providers — 列出所有供应商 + 健康 + 负载均衡配置 ─────
 configRoutes.get(
-  '/claude/custom-env',
+  '/claude/providers',
   authMiddleware,
   systemConfigMiddleware,
   (c) => {
     try {
-      const user = c.get('user') as AuthUser;
-      const customEnv = getGlobalClaudeCustomEnv();
-      if (!hasPermission(user, 'manage_system_config')) {
-        return c.json({ customEnv: {} });
-      }
-      return c.json({ customEnv });
+      const providers = getProviders();
+      const balancing = getBalancingConfig();
+      const enabledProviders = getEnabledProviders();
+
+      // Refresh pool state for health info
+      providerPool.refreshFromConfig(enabledProviders, balancing);
+      const healthStatuses = providerPool.getHealthStatuses();
+
+      return c.json({
+        providers: providers.map((p) => ({
+          ...toPublicProvider(p),
+          health: healthStatuses.find((h) => h.profileId === p.id) || null,
+        })),
+        balancing,
+        enabledCount: enabledProviders.length,
+      });
     } catch (err) {
-      logger.error({ err }, 'Failed to load Claude custom env');
-      return c.json({ error: 'Failed to load Claude custom env' }, 500);
+      logger.error({ err }, 'Failed to list providers');
+      return c.json({ error: 'Failed to list providers' }, 500);
     }
   },
 );
 
-configRoutes.put(
-  '/claude',
+// ─── POST /claude/providers — 创建供应商 ─────
+configRoutes.post(
+  '/claude/providers',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
     const body = await c.req.json().catch(() => ({}));
-    const validation = ClaudeConfigSchema.safeParse(body);
+    const validation = UnifiedProviderCreateSchema.safeParse(body);
     if (!validation.success) {
       return c.json(
         { error: 'Invalid request body', details: validation.error.format() },
@@ -174,79 +250,33 @@ configRoutes.put(
     }
 
     const actor = (c.get('user') as AuthUser).username;
-    const current = getClaudeProviderConfig();
-
-    // When clearing baseUrl, also clear anthropicAuthToken since it requires a baseUrl
-    const newBaseUrl = validation.data.anthropicBaseUrl;
-    const keepAuthToken = newBaseUrl ? current.anthropicAuthToken : '';
 
     try {
-      const saved = saveClaudeProviderConfig(
-        {
-          anthropicBaseUrl: newBaseUrl,
-          anthropicAuthToken: keepAuthToken,
-          anthropicApiKey: current.anthropicApiKey,
-          claudeCodeOauthToken: current.claudeCodeOauthToken,
-          claudeOAuthCredentials: current.claudeOAuthCredentials,
-          happyclawModel:
-            validation.data.happyclawModel !== undefined
-              ? validation.data.happyclawModel
-              : current.happyclawModel,
-        },
-        {
-          mode: newBaseUrl ? 'third_party' : 'official',
-        },
-      );
-      appendClaudeConfigAudit(actor, 'update_base_url', [
-        'anthropicBaseUrl',
-        ...(validation.data.happyclawModel !== undefined
-          ? ['happyclawModel']
-          : []),
+      const provider = createProvider(validation.data);
+      appendClaudeConfigAudit(actor, 'create_provider', [
+        `id:${provider.id}`,
+        `type:${provider.type}`,
+        `name:${provider.name}`,
       ]);
-      return c.json(toPublicClaudeProviderConfig(saved));
+      return c.json(toPublicProvider(provider), 201);
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Invalid Claude config payload';
-      logger.warn({ err }, 'Invalid Claude config payload');
+        err instanceof Error ? err.message : 'Failed to create provider';
+      logger.warn({ err }, 'Failed to create provider');
       return c.json({ error: message }, 400);
     }
   },
 );
 
-configRoutes.put(
-  '/claude/custom-env',
+// ─── PATCH /claude/providers/:id — 更新供应商非密钥字段 ─────
+configRoutes.patch(
+  '/claude/providers/:id',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
+    const { id } = c.req.param();
     const body = await c.req.json().catch(() => ({}));
-    const validation = ClaudeCustomEnvSchema.safeParse(body);
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    try {
-      const saved = saveGlobalClaudeCustomEnv(validation.data.customEnv);
-      return c.json({ customEnv: saved });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Invalid custom env payload';
-      logger.warn({ err }, 'Invalid Claude custom env payload');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-configRoutes.put(
-  '/claude/secrets',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-
-    const validation = ClaudeSecretsSchema.safeParse(body);
+    const validation = UnifiedProviderPatchSchema.safeParse(body);
     if (!validation.success) {
       return c.json(
         { error: 'Invalid request body', details: validation.error.format() },
@@ -255,128 +285,225 @@ configRoutes.put(
     }
 
     const actor = (c.get('user') as AuthUser).username;
-    const current = getClaudeProviderConfig();
-
-    const changedFields: string[] = [];
-    const nextOfficial = {
-      anthropicApiKey: current.anthropicApiKey,
-      claudeCodeOauthToken: current.claudeCodeOauthToken,
-      claudeOAuthCredentials: current.claudeOAuthCredentials,
-    };
-    let hasOfficialSecretChanges = false;
-
-    if (typeof validation.data.anthropicApiKey === 'string') {
-      nextOfficial.anthropicApiKey = validation.data.anthropicApiKey;
-      changedFields.push('anthropicApiKey:set');
-      hasOfficialSecretChanges = true;
-    } else if (validation.data.clearAnthropicApiKey === true) {
-      nextOfficial.anthropicApiKey = '';
-      changedFields.push('anthropicApiKey:clear');
-      hasOfficialSecretChanges = true;
-    }
-
-    if (typeof validation.data.claudeCodeOauthToken === 'string') {
-      nextOfficial.claudeCodeOauthToken = validation.data.claudeCodeOauthToken;
-      changedFields.push('claudeCodeOauthToken:set');
-      hasOfficialSecretChanges = true;
-    } else if (validation.data.clearClaudeCodeOauthToken === true) {
-      nextOfficial.claudeCodeOauthToken = '';
-      changedFields.push('claudeCodeOauthToken:clear');
-      hasOfficialSecretChanges = true;
-    }
-
-    if (validation.data.claudeOAuthCredentials) {
-      nextOfficial.claudeOAuthCredentials =
-        validation.data.claudeOAuthCredentials;
-      nextOfficial.claudeCodeOauthToken = '';
-      changedFields.push('claudeOAuthCredentials:set');
-      hasOfficialSecretChanges = true;
-    } else if (validation.data.clearClaudeOAuthCredentials === true) {
-      nextOfficial.claudeOAuthCredentials = null;
-      changedFields.push('claudeOAuthCredentials:clear');
-      hasOfficialSecretChanges = true;
-    }
-
-    const shouldUpdateThirdPartyToken =
-      !hasOfficialSecretChanges &&
-      current.anthropicBaseUrl &&
-      (typeof validation.data.anthropicAuthToken === 'string' ||
-        validation.data.clearAnthropicAuthToken === true);
-
-    if (shouldUpdateThirdPartyToken) {
-      changedFields.push(
-        typeof validation.data.anthropicAuthToken === 'string'
-          ? 'anthropicAuthToken:set'
-          : 'anthropicAuthToken:clear',
-      );
-    }
-
-    // Detect silent discard: user sent anthropicAuthToken/clearAnthropicAuthToken
-    // but we're in official mode (no baseUrl), so shouldUpdateThirdPartyToken is false
-    if (
-      changedFields.length === 0 &&
-      !hasOfficialSecretChanges &&
-      (typeof validation.data.anthropicAuthToken === 'string' ||
-        validation.data.clearAnthropicAuthToken === true)
-    ) {
-      return c.json(
-        {
-          error:
-            '当前为官方 API 模式，无法更新第三方 Auth Token。请先切换到第三方模式或选择一个第三方 Profile',
-        },
-        400,
-      );
-    }
-
-    if (changedFields.length === 0) {
-      return c.json({ error: 'No secret changes provided' }, 400);
-    }
 
     try {
-      let saved = current;
+      const updated = updateProvider(id, validation.data);
+      const changedFields = Object.keys(validation.data).map(
+        (k) => `${k}:updated`,
+      );
+      appendClaudeConfigAudit(actor, 'update_provider', [
+        `id:${id}`,
+        ...changedFields,
+      ]);
 
-      if (hasOfficialSecretChanges) {
-        saved = saveClaudeOfficialProviderSecrets(nextOfficial, {
-          activateOfficial: !current.anthropicBaseUrl,
+      // If this provider is enabled, apply to running containers
+      let applied: ClaudeApplyResultPayload | null = null;
+      if (updated.enabled) {
+        applied = await applyClaudeConfigToAllGroups(actor, {
+          trigger: 'provider_update',
+          providerId: id,
         });
       }
 
-      if (shouldUpdateThirdPartyToken) {
-        saved = saveClaudeProviderConfig(
-          {
-            anthropicBaseUrl: current.anthropicBaseUrl,
-            anthropicAuthToken:
-              typeof validation.data.anthropicAuthToken === 'string'
-                ? validation.data.anthropicAuthToken
-                : '',
-            anthropicApiKey: current.anthropicApiKey,
-            claudeCodeOauthToken: current.claudeCodeOauthToken,
-            claudeOAuthCredentials: current.claudeOAuthCredentials,
-            happyclawModel: current.happyclawModel,
-          },
-          {
-            mode: 'third_party',
-          },
-        );
-      }
-
-      // Update .credentials.json in all session directories when credentials change
-      if (validation.data.claudeOAuthCredentials) {
-        updateAllSessionCredentials(saved);
-        deps?.queue?.closeAllActiveForCredentialRefresh();
-      }
-
-      appendClaudeConfigAudit(actor, 'update_secrets', changedFields);
-      return c.json(toPublicClaudeProviderConfig(saved));
+      return c.json({
+        provider: toPublicProvider(updated),
+        ...(applied ? { applied } : {}),
+      });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Invalid Claude config payload';
-      logger.warn({ err }, 'Invalid Claude secret payload');
+        err instanceof Error ? err.message : 'Failed to update provider';
+      logger.warn({ err }, 'Failed to update provider');
       return c.json({ error: message }, 400);
     }
   },
 );
 
+// ─── PUT /claude/providers/:id/secrets — 更新密钥 ─────
+configRoutes.put(
+  '/claude/providers/:id/secrets',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const validation = UnifiedProviderSecretsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      const updated = updateProviderSecrets(id, validation.data);
+
+      const changedFields: string[] = [];
+      if (validation.data.anthropicAuthToken !== undefined)
+        changedFields.push('anthropicAuthToken:set');
+      if (validation.data.clearAnthropicAuthToken)
+        changedFields.push('anthropicAuthToken:clear');
+      if (validation.data.anthropicApiKey !== undefined)
+        changedFields.push('anthropicApiKey:set');
+      if (validation.data.clearAnthropicApiKey)
+        changedFields.push('anthropicApiKey:clear');
+      if (validation.data.claudeCodeOauthToken !== undefined)
+        changedFields.push('claudeCodeOauthToken:set');
+      if (validation.data.clearClaudeCodeOauthToken)
+        changedFields.push('claudeCodeOauthToken:clear');
+      if (validation.data.claudeOAuthCredentials)
+        changedFields.push('claudeOAuthCredentials:set');
+      if (validation.data.clearClaudeOAuthCredentials)
+        changedFields.push('claudeOAuthCredentials:clear');
+
+      appendClaudeConfigAudit(actor, 'update_provider_secrets', [
+        `id:${id}`,
+        ...changedFields,
+      ]);
+
+      // Update .credentials.json if OAuth credentials changed
+      if (validation.data.claudeOAuthCredentials && updated.enabled) {
+        updateAllSessionCredentials(providerToConfig(updated));
+        deps?.queue?.closeAllActiveForCredentialRefresh();
+      }
+
+      // Apply if enabled
+      let applied: ClaudeApplyResultPayload | null = null;
+      if (updated.enabled) {
+        applied = await applyClaudeConfigToAllGroups(actor, {
+          trigger: 'provider_secrets_update',
+          providerId: id,
+        });
+      }
+
+      return c.json({
+        provider: toPublicProvider(updated),
+        ...(applied ? { applied } : {}),
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to update secrets';
+      logger.warn({ err }, 'Failed to update provider secrets');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── DELETE /claude/providers/:id — 删除供应商 ─────
+configRoutes.delete(
+  '/claude/providers/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const { id } = c.req.param();
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      deleteProvider(id);
+      appendClaudeConfigAudit(actor, 'delete_provider', [`id:${id}`]);
+      return c.json({ ok: true });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to delete provider';
+      logger.warn({ err }, 'Failed to delete provider');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── POST /claude/providers/:id/toggle — 切换 enabled ─────
+configRoutes.post(
+  '/claude/providers/:id/toggle',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      const updated = toggleProvider(id);
+      appendClaudeConfigAudit(actor, 'toggle_provider', [
+        `id:${id}`,
+        `enabled:${updated.enabled}`,
+      ]);
+
+      const applied = await applyClaudeConfigToAllGroups(actor, {
+        trigger: 'provider_toggle',
+        providerId: id,
+      });
+
+      return c.json({
+        provider: toPublicProvider(updated),
+        applied,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to toggle provider';
+      logger.warn({ err }, 'Failed to toggle provider');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── POST /claude/providers/:id/reset-health — 重置健康状态 ─────
+configRoutes.post(
+  '/claude/providers/:id/reset-health',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const { id } = c.req.param();
+    providerPool.resetHealth(id);
+    return c.json({ ok: true });
+  },
+);
+
+// ─── GET /claude/providers/health — 健康状态轮询 ─────
+configRoutes.get(
+  '/claude/providers/health',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    // Refresh pool state
+    const enabledProviders = getEnabledProviders();
+    const balancing = getBalancingConfig();
+    providerPool.refreshFromConfig(enabledProviders, balancing);
+    return c.json({ statuses: providerPool.getHealthStatuses() });
+  },
+);
+
+// ─── PUT /claude/balancing — 更新负载均衡参数 ─────
+configRoutes.put(
+  '/claude/balancing',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = BalancingConfigSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      const saved = saveBalancingConfig(validation.data);
+      appendClaudeConfigAudit(actor, 'update_balancing', [
+        ...Object.keys(validation.data),
+      ]);
+      return c.json(saved);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to update balancing';
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── POST /claude/apply — 应用配置到所有容器 ─────
 configRoutes.post(
   '/claude/apply',
   authMiddleware,
@@ -396,366 +523,18 @@ configRoutes.post(
   },
 );
 
-configRoutes.get(
-  '/claude/third-party/profiles',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    try {
-      const state = listClaudeThirdPartyProfiles();
-      return c.json({
-        activeProfileId: state.activeProfileId,
-        profiles: state.profiles.map((profile) =>
-          toPublicClaudeThirdPartyProfile(profile),
-        ),
-      });
-    } catch (err) {
-      logger.error({ err }, 'Failed to load Claude third-party profiles');
-      return c.json(
-        { error: 'Failed to load Claude third-party profiles' },
-        500,
-      );
-    }
-  },
-);
-
-configRoutes.post(
-  '/claude/third-party/profiles',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const validation = ClaudeThirdPartyProfileCreateSchema.safeParse(body);
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const actor = (c.get('user') as AuthUser).username;
-    try {
-      const profile = createClaudeThirdPartyProfile(validation.data);
-      appendClaudeConfigAudit(
-        actor,
-        'create_third_party_profile',
-        [
-          'name',
-          'anthropicBaseUrl',
-          'anthropicAuthToken:set',
-          'happyclawModel',
-        ],
-        {
-          profileId: profile.id,
-          profileName: profile.name,
-        },
-      );
-      return c.json(toPublicClaudeThirdPartyProfile(profile));
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Invalid Claude third-party profile payload';
-      logger.warn({ err }, 'Invalid Claude third-party profile payload');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-configRoutes.patch(
-  '/claude/third-party/profiles/:id',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const validation = ClaudeThirdPartyProfilePatchSchema.safeParse(body);
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const actor = (c.get('user') as AuthUser).username;
-    const profileId = c.req.param('id');
-    const changedFields: string[] = [];
-    if (validation.data.name !== undefined) changedFields.push('name');
-    if (validation.data.anthropicBaseUrl !== undefined) {
-      changedFields.push('anthropicBaseUrl');
-    }
-    if (validation.data.happyclawModel !== undefined) {
-      changedFields.push('happyclawModel');
-    }
-
-    try {
-      // Check if updating the active profile
-      const currentState = listClaudeThirdPartyProfiles();
-      const isActiveProfile = currentState.activeProfileId === profileId;
-
-      const profile = updateClaudeThirdPartyProfile(profileId, validation.data);
-      appendClaudeConfigAudit(
-        actor,
-        'update_third_party_profile',
-        changedFields,
-        {
-          profileId: profile.id,
-          profileName: profile.name,
-        },
-      );
-
-      // If updated the active profile, apply to all running containers
-      if (isActiveProfile) {
-        const applyResult = await applyClaudeConfigToAllGroups(actor, {
-          trigger: 'update_active_profile',
-          profileId: profile.id,
-          profileName: profile.name,
-          changedFields,
-        });
-
-        return c.json({
-          profile: toPublicClaudeThirdPartyProfile(profile),
-          applied: applyResult,
-        });
-      }
-
-      return c.json(toPublicClaudeThirdPartyProfile(profile));
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Invalid Claude third-party profile payload';
-      logger.warn({ err }, 'Invalid Claude third-party profile patch payload');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-configRoutes.put(
-  '/claude/third-party/profiles/:id/secrets',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const validation = ClaudeThirdPartyProfileSecretsSchema.safeParse(body);
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const actor = (c.get('user') as AuthUser).username;
-    const profileId = c.req.param('id');
-    const changedFields = [
-      validation.data.clearAnthropicAuthToken
-        ? 'anthropicAuthToken:clear'
-        : 'anthropicAuthToken:set',
-    ];
-
-    try {
-      // Check if updating the active profile
-      const currentState = listClaudeThirdPartyProfiles();
-      const isActiveProfile = currentState.activeProfileId === profileId;
-
-      const profile = updateClaudeThirdPartyProfileSecret(
-        profileId,
-        validation.data,
-      );
-      appendClaudeConfigAudit(
-        actor,
-        'update_third_party_profile_secrets',
-        changedFields,
-        {
-          profileId: profile.id,
-          profileName: profile.name,
-        },
-      );
-
-      // If updated the active profile secrets, apply to all running containers
-      if (isActiveProfile) {
-        const applyResult = await applyClaudeConfigToAllGroups(actor, {
-          trigger: 'update_active_profile_secrets',
-          profileId: profile.id,
-          profileName: profile.name,
-          changedFields,
-        });
-
-        return c.json({
-          profile: toPublicClaudeThirdPartyProfile(profile),
-          applied: applyResult,
-        });
-      }
-
-      return c.json(toPublicClaudeThirdPartyProfile(profile));
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Invalid Claude third-party profile secret payload';
-      logger.warn({ err }, 'Invalid Claude third-party profile secret payload');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-configRoutes.post(
-  '/claude/third-party/profiles/:id/activate',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const actor = (c.get('user') as AuthUser).username;
-    const profileId = c.req.param('id');
-
-    try {
-      const currentState = listClaudeThirdPartyProfiles();
-      const previousActiveId = currentState.activeProfileId;
-      const currentActive = currentState.profiles.find(
-        (profile) => profile.id === currentState.activeProfileId,
-      );
-      const nextActive = currentState.profiles.find(
-        (profile) => profile.id === profileId,
-      );
-      if (!nextActive) {
-        return c.json({ error: '未找到指定第三方配置' }, 404);
-      }
-      if (previousActiveId === profileId) {
-        return c.json({
-          success: true,
-          alreadyActive: true,
-          activeProfileId: profileId,
-          profile: toPublicClaudeThirdPartyProfile(nextActive),
-          stoppedCount: 0,
-          failedCount: 0,
-          error: undefined,
-        });
-      }
-
-      activateClaudeThirdPartyProfile(profileId);
-      appendClaudeConfigAudit(
-        actor,
-        'activate_third_party_profile',
-        ['activeProfileId'],
-        {
-          profileId: nextActive.id,
-          profileName: nextActive.name,
-          previousProfileId: previousActiveId,
-          previousProfileName: currentActive?.name ?? null,
-        },
-      );
-
-      const applyResult = await applyClaudeConfigToAllGroups(actor, {
-        trigger: 'activate_third_party_profile',
-        profileId: nextActive.id,
-        profileName: nextActive.name,
-        previousProfileId: previousActiveId,
-      });
-
-      const fresh = listClaudeThirdPartyProfiles();
-      const active = fresh.profiles.find(
-        (profile) => profile.id === fresh.activeProfileId,
-      );
-      return c.json(
-        {
-          success: applyResult.success,
-          activeProfileId: fresh.activeProfileId,
-          profile: active ? toPublicClaudeThirdPartyProfile(active) : null,
-          stoppedCount: applyResult.stoppedCount,
-          failedCount: applyResult.failedCount,
-          error: applyResult.error,
-        },
-        applyResult.success ? 200 : 207,
-      );
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Failed to activate Claude third-party profile';
-      logger.warn({ err }, 'Failed to activate Claude third-party profile');
-      if (message.includes('未找到指定第三方配置')) {
-        return c.json({ error: message }, 404);
-      }
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-configRoutes.delete(
-  '/claude/third-party/profiles/:id',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    const actor = (c.get('user') as AuthUser).username;
-    const profileId = c.req.param('id');
-
-    try {
-      const before = listClaudeThirdPartyProfiles();
-      const target = before.profiles.find(
-        (profile) => profile.id === profileId,
-      );
-      if (!target) {
-        return c.json({ error: '未找到指定第三方配置' }, 404);
-      }
-      if (before.profiles.length <= 1) {
-        return c.json({ error: '至少需要保留一个第三方配置' }, 400);
-      }
-      if (before.activeProfileId === profileId) {
-        return c.json(
-          { error: '当前激活配置不可删除，请先切换到其他配置' },
-          400,
-        );
-      }
-
-      const result = deleteClaudeThirdPartyProfile(profileId);
-      appendClaudeConfigAudit(
-        actor,
-        'delete_third_party_profile',
-        ['profile'],
-        {
-          profileId: result.deletedProfileId,
-          profileName: target.name,
-          activeProfileId: result.activeProfileId,
-        },
-      );
-      return c.json(result);
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Failed to delete Claude third-party profile';
-      logger.warn({ err }, 'Failed to delete Claude third-party profile');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-// ─── Claude OAuth (PKCE) ─────────────────────────────────────────
-
-const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const OAUTH_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
-const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference';
-const OAUTH_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
-const OAUTH_TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token';
-const OAUTH_FLOW_TTL = 10 * 60 * 1000; // 10 minutes
-
-interface OAuthFlow {
-  codeVerifier: string;
-  expiresAt: number;
-}
-const oauthFlows = new Map<string, OAuthFlow>();
-
-// Periodic cleanup of expired flows
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, flow] of oauthFlows) {
-    if (flow.expiresAt < now) oauthFlows.delete(key);
-  }
-}, 60_000);
-
+// ─── POST /claude/oauth/start — 启动 OAuth PKCE 流程 ─────
 configRoutes.post(
   '/claude/oauth/start',
   authMiddleware,
   systemConfigMiddleware,
-  (c) => {
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const targetProviderId =
+      typeof (body as Record<string, unknown>).targetProviderId === 'string'
+        ? (body as Record<string, unknown>).targetProviderId as string
+        : undefined;
+
     const state = randomBytes(32).toString('hex');
     const codeVerifier = randomBytes(32).toString('base64url');
     const codeChallenge = createHash('sha256')
@@ -765,6 +544,7 @@ configRoutes.post(
     oauthFlows.set(state, {
       codeVerifier,
       expiresAt: Date.now() + OAUTH_FLOW_TTL,
+      targetProviderId,
     });
 
     const params = new URLSearchParams({
@@ -784,6 +564,7 @@ configRoutes.post(
   },
 );
 
+// ─── POST /claude/oauth/callback — OAuth 回调 ─────
 configRoutes.post(
   '/claude/oauth/callback',
   authMiddleware,
@@ -796,7 +577,6 @@ configRoutes.post(
       return c.json({ error: 'Missing state or code' }, 400);
     }
 
-    // Clean up code: strip URL fragments and query params that users may accidentally copy
     const cleanedCode = code.trim().split('#')[0]?.split('&')[0] ?? code.trim();
 
     const flow = oauthFlows.get(state);
@@ -827,6 +607,7 @@ configRoutes.post(
           redirect_uri: OAUTH_REDIRECT_URI,
           code_verifier: flow.codeVerifier,
           state,
+          expires_in: 31536000, // 1 year
         }),
       });
 
@@ -856,13 +637,11 @@ configRoutes.post(
 
       const actor = (c.get('user') as AuthUser).username;
 
-      // Build full OAuth credentials when refresh_token is available
       let oauthCredentials: ClaudeOAuthCredentials | null = null;
       if (tokenData.refresh_token) {
-        // expiresAt 计算与 SDK 保持一致：Date.now() + expires_in * 1000
         const expiresAt = tokenData.expires_in
           ? Date.now() + tokenData.expires_in * 1000
-          : Date.now() + 8 * 60 * 60 * 1000; // default 8h
+          : Date.now() + 8 * 60 * 60 * 1000;
         oauthCredentials = {
           accessToken: tokenData.access_token,
           refreshToken: tokenData.refresh_token,
@@ -871,32 +650,41 @@ configRoutes.post(
         };
       }
 
-      const saved = saveClaudeOfficialProviderSecrets(
-        {
-          anthropicApiKey: '',
-          claudeCodeOauthToken: oauthCredentials ? '' : tokenData.access_token,
+      let provider;
+      if (flow.targetProviderId) {
+        // Update existing provider's OAuth credentials
+        provider = updateProviderSecrets(flow.targetProviderId, {
+          claudeOAuthCredentials: oauthCredentials ?? undefined,
+          claudeCodeOauthToken: oauthCredentials
+            ? undefined
+            : tokenData.access_token,
+          clearAnthropicApiKey: true,
+        });
+      } else {
+        // Create new official provider
+        provider = createProvider({
+          name: '官方 Claude (OAuth)',
+          type: 'official',
           claudeOAuthCredentials: oauthCredentials,
-        },
-        {
-          activateOfficial: true,
-        },
-      );
+          claudeCodeOauthToken: oauthCredentials ? '' : tokenData.access_token,
+          enabled: true,
+        });
+      }
 
-      // Write .credentials.json to all session directories
+      // Write .credentials.json to all sessions
       if (oauthCredentials) {
-        updateAllSessionCredentials(saved);
+        updateAllSessionCredentials(providerToConfig(provider));
         deps?.queue?.closeAllActiveForCredentialRefresh();
       }
 
       appendClaudeConfigAudit(actor, 'oauth_login', [
+        `providerId:${provider.id}`,
         oauthCredentials
           ? 'claudeOAuthCredentials:set'
           : 'claudeCodeOauthToken:set',
-        'anthropicApiKey:clear',
-        'providerMode:official',
       ]);
 
-      return c.json(toPublicClaudeProviderConfig(saved));
+      return c.json(toPublicProvider(provider));
     } catch (err) {
       logger.error({ err }, 'OAuth token exchange error');
       const message =
@@ -906,56 +694,76 @@ configRoutes.post(
   },
 );
 
-// ─── Manual OAuth Refresh ────────────────────────────────────────
-
-configRoutes.post(
-  '/claude/oauth/refresh',
+// ─── PUT /claude/custom-env — 更新当前启用供应商的自定义环境变量 ─────
+configRoutes.put(
+  '/claude/custom-env',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
-    const config = getClaudeProviderConfig();
-    const creds = config.claudeOAuthCredentials;
-    if (!creds) {
-      return c.json({ error: 'No OAuth credentials configured' }, 400);
-    }
-
-    const actor = (c.get('user') as AuthUser).username;
-    logger.info({ actor }, 'Manual OAuth token refresh requested');
-
-    const refreshed = await refreshOAuthCredentials(creds);
-    if (!refreshed) {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ClaudeCustomEnvSchema.safeParse(body);
+    if (!validation.success) {
       return c.json(
-        { error: 'OAuth token refresh failed. Please re-login via OAuth.' },
-        500,
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
       );
     }
 
-    // Re-read latest config to avoid overwriting changes made during the async refresh
-    const latestConfig = getClaudeProviderConfig();
-    const saved = saveClaudeOfficialProviderSecrets(
-      {
-        anthropicApiKey: latestConfig.anthropicApiKey,
-        claudeCodeOauthToken: '',
-        claudeOAuthCredentials: refreshed,
-      },
-      {
-        activateOfficial: !latestConfig.anthropicBaseUrl,
-      },
-    );
+    try {
+      // Find first enabled provider and update its customEnv
+      const enabled = getEnabledProviders();
+      if (enabled.length === 0) {
+        return c.json({ error: '没有启用的供应商' }, 400);
+      }
 
-    updateAllSessionCredentials(saved);
-    deps?.queue?.closeAllActiveForCredentialRefresh();
-
-    appendClaudeConfigAudit(actor, 'oauth_refresh_manual', [
-      'claudeOAuthCredentials:refreshed',
-    ]);
-
-    logger.info({ actor }, 'Manual OAuth token refresh successful');
-    return c.json(toPublicClaudeProviderConfig(saved));
+      const updated = updateProvider(enabled[0].id, {
+        customEnv: validation.data.customEnv,
+      });
+      return c.json({ customEnv: updated.customEnv });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Invalid custom env payload';
+      logger.warn({ err }, 'Invalid Claude custom env payload');
+      return c.json({ error: message }, 400);
+    }
   },
 );
 
+// ─── Helpers ────────────────────────────────────────────────────
+
+const _deprecationLogged = new Set<string>();
+function logDeprecationOnce(endpoint: string, replacement: string): void {
+  if (_deprecationLogged.has(endpoint)) return;
+  logger.warn(`Deprecated: ${endpoint} — use ${replacement} instead`);
+  _deprecationLogged.add(endpoint);
+}
+
+function resolveProxyInfo(
+  userProxy: string,
+  sysProxy: string,
+): { effectiveProxyUrl: string; proxySource: 'user' | 'system' | 'none' } {
+  return {
+    effectiveProxyUrl: userProxy || sysProxy,
+    proxySource: userProxy ? 'user' : sysProxy ? 'system' : 'none',
+  };
+}
+
+/** Persist a RegisteredGroup update and sync to the in-memory cache. */
+function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
+  setRegisteredGroup(imJid, updated);
+  const webDeps = getWebDeps();
+  if (webDeps) {
+    const groups = webDeps.getRegisteredGroups();
+    if (groups[imJid]) groups[imJid] = updated;
+    webDeps.clearImFailCounts?.(imJid);
+  }
+}
+
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
+  logDeprecationOnce(
+    'GET /api/config/feishu',
+    'GET /api/config/user-im/feishu',
+  );
   try {
     const { config, source } = getFeishuProviderConfigWithSource();
     const pub = toPublicFeishuProviderConfig(config, source);
@@ -1028,6 +836,10 @@ configRoutes.put(
 // ─── Telegram config ─────────────────────────────────────────────
 
 configRoutes.get('/telegram', authMiddleware, systemConfigMiddleware, (c) => {
+  logDeprecationOnce(
+    'GET /api/config/telegram',
+    'GET /api/config/user-im/telegram',
+  );
   try {
     const { config, source } = getTelegramProviderConfigWithSource();
     const pub = toPublicTelegramProviderConfig(config, source);
@@ -1288,6 +1100,7 @@ configRoutes.put(
 
     try {
       const saved = saveSystemSettings(validation.data);
+      clearBillingEnabledCache();
       return c.json(saved);
     } catch (err) {
       const message =
@@ -1305,6 +1118,8 @@ configRoutes.get('/user-im/status', authMiddleware, (c) => {
   return c.json({
     feishu: deps?.isUserFeishuConnected?.(user.id) ?? false,
     telegram: deps?.isUserTelegramConnected?.(user.id) ?? false,
+    qq: deps?.isUserQQConnected?.(user.id) ?? false,
+    wechat: deps?.isUserWeChatConnected?.(user.id) ?? false,
   });
 });
 
@@ -1314,6 +1129,7 @@ configRoutes.get('/user-im/feishu', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const config = getUserFeishuConfig(user.id);
+    const connected = deps?.isUserFeishuConnected?.(user.id) ?? false;
     if (!config) {
       return c.json({
         appId: '',
@@ -1321,9 +1137,13 @@ configRoutes.get('/user-im/feishu', authMiddleware, (c) => {
         appSecretMasked: null,
         enabled: false,
         updatedAt: null,
+        connected,
       });
     }
-    return c.json(toPublicFeishuProviderConfig(config, 'runtime'));
+    return c.json({
+      ...toPublicFeishuProviderConfig(config, 'runtime'),
+      connected,
+    });
   } catch (err) {
     logger.error({ err }, 'Failed to load user Feishu config');
     return c.json({ error: 'Failed to load user Feishu config' }, 500);
@@ -1339,6 +1159,21 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       { error: 'Invalid request body', details: validation.error.format() },
       400,
     );
+  }
+
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const currentFeishu = getUserFeishuConfig(user.id);
+    if (!currentFeishu?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'feishu'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
   }
 
   const current = getUserFeishuConfig(user.id);
@@ -1384,7 +1219,11 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       }
     }
 
-    return c.json(toPublicFeishuProviderConfig(saved, 'runtime'));
+    const connected = deps?.isUserFeishuConnected?.(user.id) ?? false;
+    return c.json({
+      ...toPublicFeishuProviderConfig(saved, 'runtime'),
+      connected,
+    });
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Invalid Feishu config payload';
@@ -1397,15 +1236,28 @@ configRoutes.get('/user-im/telegram', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const config = getUserTelegramConfig(user.id);
+    const connected = deps?.isUserTelegramConnected?.(user.id) ?? false;
+    const globalConfig = getTelegramProviderConfig();
+    const userProxy = config?.proxyUrl || '';
+    const sysProxy = globalConfig.proxyUrl || '';
+    const proxy = resolveProxyInfo(userProxy, sysProxy);
     if (!config) {
       return c.json({
         hasBotToken: false,
         botTokenMasked: null,
         enabled: false,
         updatedAt: null,
+        connected,
+        proxyUrl: '',
+        ...proxy,
       });
     }
-    return c.json(toPublicTelegramProviderConfig(config, 'runtime'));
+    return c.json({
+      ...toPublicTelegramProviderConfig(config, 'runtime'),
+      connected,
+      proxyUrl: userProxy,
+      ...proxy,
+    });
   } catch (err) {
     logger.error({ err }, 'Failed to load user Telegram config');
     return c.json({ error: 'Failed to load user Telegram config' }, 500);
@@ -1423,9 +1275,25 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
     );
   }
 
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const currentTg = getUserTelegramConfig(user.id);
+    if (!currentTg?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'telegram'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
+  }
+
   const current = getUserTelegramConfig(user.id);
   const next = {
     botToken: current?.botToken || '',
+    proxyUrl: current?.proxyUrl || '',
     enabled: current?.enabled ?? true,
     updatedAt: current?.updatedAt || null,
   };
@@ -1434,6 +1302,11 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
     if (botToken) next.botToken = botToken;
   } else if (validation.data.clearBotToken === true) {
     next.botToken = '';
+  }
+  if (typeof validation.data.proxyUrl === 'string') {
+    next.proxyUrl = validation.data.proxyUrl.trim();
+  } else if (validation.data.clearProxyUrl === true) {
+    next.proxyUrl = '';
   }
   if (typeof validation.data.enabled === 'boolean') {
     next.enabled = validation.data.enabled;
@@ -1445,6 +1318,7 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
   try {
     const saved = saveUserTelegramConfig(user.id, {
       botToken: next.botToken,
+      proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
 
@@ -1460,7 +1334,15 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       }
     }
 
-    return c.json(toPublicTelegramProviderConfig(saved, 'runtime'));
+    const connected = deps?.isUserTelegramConnected?.(user.id) ?? false;
+    const userProxy = saved.proxyUrl || '';
+    const sysProxy = getTelegramProviderConfig().proxyUrl || '';
+    return c.json({
+      ...toPublicTelegramProviderConfig(saved, 'runtime'),
+      connected,
+      proxyUrl: userProxy,
+      ...resolveProxyInfo(userProxy, sysProxy),
+    });
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Invalid Telegram config payload';
@@ -1477,7 +1359,8 @@ configRoutes.post('/user-im/telegram/test', authMiddleware, async (c) => {
   }
 
   const globalTelegramConfig = getTelegramProviderConfig();
-  const agent = createTelegramApiAgent(globalTelegramConfig.proxyUrl);
+  const effectiveProxy = config.proxyUrl || globalTelegramConfig.proxyUrl;
+  const agent = createTelegramApiAgent(effectiveProxy);
   try {
     const { Bot } = await import('grammy');
     const testBot = new Bot(config.botToken, {
@@ -1573,57 +1456,699 @@ configRoutes.delete(
   },
 );
 
-// ─── Local Claude Code detection ──────────────────────────────────
+// ─── QQ User IM Config ──────────────────────────────────────────
 
-configRoutes.get(
-  '/claude/detect-local',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    return c.json(detectLocalClaudeCode());
-  },
-);
+function maskQQAppSecret(secret: string): string | null {
+  if (!secret) return null;
+  if (secret.length <= 8) return '***';
+  return secret.slice(0, 4) + '***' + secret.slice(-4);
+}
 
-configRoutes.post(
-  '/claude/import-local',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    const creds = importLocalClaudeCredentials();
-    if (!creds) {
-      return c.json({ error: '未检测到本机 Claude Code 登录凭据' }, 404);
+configRoutes.get('/user-im/qq', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const config = getUserQQConfig(user.id);
+    const connected = deps?.isUserQQConnected?.(user.id) ?? false;
+    if (!config) {
+      return c.json({
+        appId: '',
+        hasAppSecret: false,
+        appSecretMasked: null,
+        enabled: false,
+        updatedAt: null,
+        connected,
+      });
+    }
+    return c.json({
+      appId: config.appId,
+      hasAppSecret: !!config.appSecret,
+      appSecretMasked: maskQQAppSecret(config.appSecret),
+      enabled: config.enabled ?? false,
+      updatedAt: config.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load user QQ config');
+    return c.json({ error: 'Failed to load user QQ config' }, 500);
+  }
+});
+
+configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const validation = QQConfigSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const currentQQ = getUserQQConfig(user.id);
+    if (!currentQQ?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'qq'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
+  }
+
+  const current = getUserQQConfig(user.id);
+  const next = {
+    appId: current?.appId || '',
+    appSecret: current?.appSecret || '',
+    enabled: current?.enabled ?? true,
+  };
+  if (typeof validation.data.appId === 'string') {
+    next.appId = validation.data.appId.trim();
+  }
+  if (typeof validation.data.appSecret === 'string') {
+    const appSecret = validation.data.appSecret.trim();
+    if (appSecret) next.appSecret = appSecret;
+  } else if (validation.data.clearAppSecret === true) {
+    next.appSecret = '';
+  }
+  if (typeof validation.data.enabled === 'boolean') {
+    next.enabled = validation.data.enabled;
+  } else if (!current && next.appId && next.appSecret) {
+    next.enabled = true;
+  }
+
+  try {
+    const saved = saveUserQQConfig(user.id, {
+      appId: next.appId,
+      appSecret: next.appSecret,
+      enabled: next.enabled,
+    });
+
+    // Hot-reload: reconnect user's QQ channel
+    if (deps?.reloadUserIMConfig) {
+      try {
+        await deps.reloadUserIMConfig(user.id, 'qq');
+      } catch (err) {
+        logger.warn(
+          { err, userId: user.id },
+          'Failed to hot-reload user QQ connection',
+        );
+      }
     }
 
-    const actor = (c.get('user') as AuthUser).username;
+    const connected = deps?.isUserQQConnected?.(user.id) ?? false;
+    return c.json({
+      appId: saved.appId,
+      hasAppSecret: !!saved.appSecret,
+      appSecretMasked: maskQQAppSecret(saved.appSecret),
+      enabled: saved.enabled ?? false,
+      updatedAt: saved.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Invalid QQ config payload';
+    logger.warn({ err }, 'Invalid user QQ config payload');
+    return c.json({ error: message }, 400);
+  }
+});
 
-    try {
-      const saved = saveClaudeOfficialProviderSecrets(
+configRoutes.post('/user-im/qq/test', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const config = getUserQQConfig(user.id);
+  if (!config?.appId || !config?.appSecret) {
+    return c.json({ error: 'QQ App ID and App Secret not configured' }, 400);
+  }
+
+  try {
+    // Test by fetching access token
+    const https = await import('node:https');
+    const body = JSON.stringify({
+      appId: config.appId,
+      clientSecret: config.appSecret,
+    });
+
+    const result = await new Promise<{
+      access_token?: string;
+      expires_in?: number;
+    }>((resolve, reject) => {
+      const url = new URL('https://bots.qq.com/app/getAppAccessToken');
+      const req = https.request(
         {
-          anthropicApiKey: '',
-          claudeCodeOauthToken: '',
-          claudeOAuthCredentials: creds,
+          hostname: url.hostname,
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': String(Buffer.byteLength(body)),
+          },
+          timeout: 15000,
         },
-        {
-          activateOfficial: true,
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => {
+            try {
+              resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+            } catch (err) {
+              reject(err);
+            }
+          });
+          res.on('error', reject);
         },
       );
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy(new Error('Request timeout'));
+      });
+      req.write(body);
+      req.end();
+    });
 
-      updateAllSessionCredentials(saved);
-      deps?.queue?.closeAllActiveForCredentialRefresh();
-      appendClaudeConfigAudit(actor, 'import_local_cc', [
-        'claudeOAuthCredentials:import_local',
-      ]);
+    if (!result.access_token) {
+      return c.json(
+        {
+          error:
+            'Failed to obtain access token. Please check App ID and App Secret.',
+        },
+        400,
+      );
+    }
 
-      return c.json(toPublicClaudeProviderConfig(saved));
+    return c.json({
+      success: true,
+      expires_in: result.expires_in,
+    });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Failed to connect to QQ';
+    logger.warn({ err }, 'Failed to test user QQ connection');
+    return c.json({ error: message }, 400);
+  }
+});
+
+configRoutes.post('/user-im/qq/pairing-code', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const config = getUserQQConfig(user.id);
+  if (!config?.appId || !config?.appSecret) {
+    return c.json({ error: 'QQ App ID and App Secret not configured' }, 400);
+  }
+
+  try {
+    const { generatePairingCode } = await import('../telegram-pairing.js');
+    const result = generatePairingCode(user.id);
+    return c.json(result);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Failed to generate pairing code';
+    logger.warn({ err }, 'Failed to generate QQ pairing code');
+    return c.json({ error: message }, 500);
+  }
+});
+
+// List QQ paired chats for the current user
+configRoutes.get('/user-im/qq/paired-chats', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
+    string,
+    { name: string; added_at: string; created_by?: string }
+  >;
+  const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
+  for (const [jid, group] of Object.entries(groups)) {
+    if (jid.startsWith('qq:') && group.created_by === user.id) {
+      chats.push({ jid, name: group.name, addedAt: group.added_at });
+    }
+  }
+  return c.json({ chats });
+});
+
+// Remove (unpair) a QQ chat
+configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const jid = decodeURIComponent(c.req.param('jid'));
+
+  if (!jid.startsWith('qq:')) {
+    return c.json({ error: 'Invalid QQ chat JID' }, 400);
+  }
+
+  const groups = deps?.getRegisteredGroups() ?? {};
+  const group = groups[jid];
+  if (!group) {
+    return c.json({ error: 'Chat not found' }, 404);
+  }
+  if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to remove this chat' }, 403);
+  }
+
+  deleteRegisteredGroup(jid);
+  deleteChatHistory(jid);
+  delete groups[jid];
+  logger.info({ jid, userId: user.id }, 'QQ chat unpaired');
+  return c.json({ success: true });
+});
+
+// ─── Per-user WeChat IM config ──────────────────────────────────
+
+const WECHAT_API_BASE = 'https://ilinkai.weixin.qq.com';
+const WECHAT_QR_BOT_TYPE = '3';
+
+function randomWechatUin(): string {
+  const uint32 = randomBytes(4).readUInt32BE(0);
+  return Buffer.from(String(uint32), 'utf-8').toString('base64');
+}
+
+function maskBotToken(token: string | undefined): string | null {
+  if (!token) return null;
+  if (token.length <= 8) return '***';
+  return token.slice(0, 4) + '***' + token.slice(-4);
+}
+
+configRoutes.get('/user-im/wechat', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const config = getUserWeChatConfig(user.id);
+    const connected = deps?.isUserWeChatConnected?.(user.id) ?? false;
+    if (!config) {
+      return c.json({
+        ilinkBotId: '',
+        hasBotToken: false,
+        botTokenMasked: null,
+        bypassProxy: true,
+        enabled: false,
+        updatedAt: null,
+        connected,
+      });
+    }
+    return c.json({
+      ilinkBotId: config.ilinkBotId || '',
+      hasBotToken: !!config.botToken,
+      botTokenMasked: maskBotToken(config.botToken),
+      bypassProxy: config.bypassProxy ?? true,
+      enabled: config.enabled ?? false,
+      updatedAt: config.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load user WeChat config');
+    return c.json({ error: 'Failed to load user WeChat config' }, 500);
+  }
+});
+
+configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const validation = WeChatConfigSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const currentWc = getUserWeChatConfig(user.id);
+    if (!currentWc?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'wechat'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
+  }
+
+  const current = getUserWeChatConfig(user.id);
+  const next = {
+    botToken: current?.botToken || '',
+    ilinkBotId: current?.ilinkBotId || '',
+    baseUrl: current?.baseUrl,
+    cdnBaseUrl: current?.cdnBaseUrl,
+    getUpdatesBuf: current?.getUpdatesBuf,
+    bypassProxy: current?.bypassProxy ?? true,
+    enabled: current?.enabled ?? false,
+  };
+
+  if (validation.data.clearBotToken === true) {
+    next.botToken = '';
+    next.ilinkBotId = '';
+  }
+  if (typeof validation.data.enabled === 'boolean') {
+    next.enabled = validation.data.enabled;
+  }
+  if (typeof validation.data.bypassProxy === 'boolean') {
+    next.bypassProxy = validation.data.bypassProxy;
+  }
+
+  try {
+    const saved = saveUserWeChatConfig(user.id, next);
+
+    // Update NO_PROXY based on bypassProxy setting
+    updateWeChatNoProxy(saved.bypassProxy ?? true);
+
+    // Hot-reload: reconnect user's WeChat channel
+    if (deps?.reloadUserIMConfig) {
+      try {
+        await deps.reloadUserIMConfig(user.id, 'wechat');
+      } catch (err) {
+        logger.warn(
+          { err, userId: user.id },
+          'Failed to hot-reload user WeChat connection',
+        );
+      }
+    }
+
+    const connected = deps?.isUserWeChatConnected?.(user.id) ?? false;
+    return c.json({
+      ilinkBotId: saved.ilinkBotId || '',
+      hasBotToken: !!saved.botToken,
+      botTokenMasked: maskBotToken(saved.botToken),
+      bypassProxy: saved.bypassProxy ?? true,
+      enabled: saved.enabled ?? false,
+      updatedAt: saved.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Invalid WeChat config payload';
+    logger.warn({ err }, 'Invalid user WeChat config payload');
+    return c.json({ error: message }, 400);
+  }
+});
+
+// Generate QR code for WeChat iLink login
+configRoutes.post('/user-im/wechat/qrcode', authMiddleware, async (c) => {
+  try {
+    const url = `${WECHAT_API_BASE}/ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(WECHAT_QR_BOT_TYPE)}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      logger.error(
+        { status: res.status, body },
+        'WeChat QR code fetch failed',
+      );
+      return c.json(
+        { error: `Failed to fetch QR code: ${res.status}` },
+        502,
+      );
+    }
+    const data = (await res.json()) as {
+      qrcode?: string;
+      qrcode_img_content?: string;
+    };
+    if (!data.qrcode) {
+      return c.json({ error: 'No QR code in response' }, 502);
+    }
+
+    // qrcode_img_content is a URL string (WeChat deep link) to be encoded
+    // INTO a QR code image, not an image URL itself.
+    let qrcodeDataUri = '';
+    if (data.qrcode_img_content) {
+      try {
+        qrcodeDataUri = await QRCode.toDataURL(data.qrcode_img_content, {
+          width: 512,
+          margin: 2,
+          color: { dark: '#000000', light: '#ffffff' },
+        });
+      } catch (qrErr) {
+        logger.warn({ err: qrErr }, 'Failed to generate QR code image');
+      }
+    }
+
+    return c.json({
+      qrcode: data.qrcode,
+      qrcodeUrl: qrcodeDataUri,
+    });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Failed to generate QR code';
+    logger.error({ err }, 'WeChat QR code generation failed');
+    return c.json({ error: message }, 500);
+  }
+});
+
+// Poll QR code scan status
+configRoutes.get(
+  '/user-im/wechat/qrcode-status',
+  authMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const qrcode = c.req.query('qrcode');
+    if (!qrcode) {
+      return c.json({ error: 'qrcode query parameter required' }, 400);
+    }
+
+    try {
+      const url = `${WECHAT_API_BASE}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
+      const headers: Record<string, string> = {
+        'iLink-App-ClientVersion': '1',
+      };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 35000);
+      let res: Response;
+      try {
+        res = await fetch(url, { headers, signal: controller.signal });
+        clearTimeout(timer);
+      } catch (err) {
+        clearTimeout(timer);
+        if (
+          err instanceof Error &&
+          err.name === 'AbortError'
+        ) {
+          return c.json({ status: 'wait' });
+        }
+        throw err;
+      }
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        return c.json(
+          { error: `QR status poll failed: ${res.status}`, body },
+          502,
+        );
+      }
+
+      const data = (await res.json()) as {
+        status?: 'wait' | 'scaned' | 'confirmed' | 'expired';
+        bot_token?: string;
+        ilink_bot_id?: string;
+        baseurl?: string;
+        ilink_user_id?: string;
+      };
+
+      if (data.status === 'confirmed' && data.bot_token && data.ilink_bot_id) {
+        // Auto-save credentials and connect
+        const saved = saveUserWeChatConfig(user.id, {
+          botToken: data.bot_token,
+          ilinkBotId: data.ilink_bot_id.replace(/[^a-zA-Z0-9@._-]/g, ''),
+          baseUrl: data.baseurl || undefined,
+          enabled: true,
+        });
+
+        // Note: ilink_user_id (the QR scanner) is NOT auto-paired here.
+        // The scanner needs to send a message to the bot and use /pair <code>
+        // to complete pairing, same as QQ/Telegram flow.
+        // This ensures proper group registration via buildOnNewChat/registerGroup.
+
+        // Hot-reload: connect WeChat
+        if (deps?.reloadUserIMConfig) {
+          try {
+            await deps.reloadUserIMConfig(user.id, 'wechat');
+          } catch (err) {
+            logger.warn(
+              { err, userId: user.id },
+              'Failed to hot-reload WeChat after QR login',
+            );
+          }
+        }
+
+        return c.json({
+          status: 'confirmed',
+          ilinkBotId: saved.ilinkBotId,
+        });
+      }
+
+      return c.json({
+        status: data.status || 'wait',
+      });
     } catch (err) {
       const message =
-        err instanceof Error
-          ? err.message
-          : 'Failed to import local credentials';
-      logger.warn({ err }, 'Failed to import local Claude Code credentials');
+        err instanceof Error ? err.message : 'QR status poll failed';
+      logger.error({ err }, 'WeChat QR status poll failed');
       return c.json({ error: message }, 500);
     }
   },
 );
+
+// Disconnect WeChat and clear token
+configRoutes.post('/user-im/wechat/disconnect', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const current = getUserWeChatConfig(user.id);
+    if (current) {
+      saveUserWeChatConfig(user.id, {
+        botToken: '',
+        ilinkBotId: '',
+        enabled: false,
+        getUpdatesBuf: current.getUpdatesBuf,
+      });
+    }
+
+    // Disconnect
+    if (deps?.reloadUserIMConfig) {
+      try {
+        await deps.reloadUserIMConfig(user.id, 'wechat');
+      } catch (err) {
+        logger.warn(
+          { err, userId: user.id },
+          'Failed to disconnect WeChat',
+        );
+      }
+    }
+
+    return c.json({ success: true });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Failed to disconnect WeChat';
+    logger.error({ err }, 'WeChat disconnect failed');
+    return c.json({ error: message }, 500);
+  }
+});
+
+// ─── IM Binding management (bindings panoramic page) ────────────
+
+configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
+  const imJid = decodeURIComponent(c.req.param('imJid'));
+  const user = c.get('user') as AuthUser;
+
+  // Validate IM JID
+  const channelType = getChannelType(imJid);
+  if (!channelType) {
+    return c.json({ error: 'Invalid IM JID' }, 400);
+  }
+
+  const imGroup = getRegisteredGroup(imJid);
+  if (!imGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+
+  // Unbind mode
+  if (body.unbind === true) {
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      target_main_jid: undefined,
+      target_agent_id: undefined,
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info({ imJid, userId: user.id }, 'IM group unbound (bindings page)');
+    return c.json({ success: true });
+  }
+
+  // Bind to agent
+  if (typeof body.target_agent_id === 'string' && body.target_agent_id.trim()) {
+    const agentId = body.target_agent_id.trim();
+    const agent = getAgent(agentId);
+    if (!agent) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+    if (agent.kind !== 'conversation') {
+      return c.json(
+        { error: 'Only conversation agents can bind IM groups' },
+        400,
+      );
+    }
+    // Check user can access the workspace that owns this agent
+    const ownerGroup = getRegisteredGroup(agent.chat_jid);
+    if (
+      !ownerGroup ||
+      !canAccessGroup(user, { ...ownerGroup, jid: agent.chat_jid })
+    ) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+
+    const force = body.force === true;
+    const replyPolicy =
+      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const hasConflict =
+      (imGroup.target_agent_id && imGroup.target_agent_id !== agentId) ||
+      !!imGroup.target_main_jid;
+    if (hasConflict && !force) {
+      return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      target_agent_id: agentId,
+      target_main_jid: undefined,
+      reply_policy: replyPolicy,
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info(
+      { imJid, agentId, userId: user.id },
+      'IM group bound to agent (bindings page)',
+    );
+    return c.json({ success: true });
+  }
+
+  // Bind to workspace main conversation
+  if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
+    const targetMainJid = body.target_main_jid.trim();
+    const targetGroup = getRegisteredGroup(targetMainJid);
+    if (!targetGroup) {
+      return c.json({ error: 'Target workspace not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...targetGroup, jid: targetMainJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (targetGroup.is_home) {
+      return c.json(
+        { error: 'Home workspace main conversation uses default IM routing' },
+        400,
+      );
+    }
+
+    const force = body.force === true;
+    const replyPolicy =
+      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const legacyMainJid = `web:${targetGroup.folder}`;
+    const hasConflict =
+      !!imGroup.target_agent_id ||
+      (imGroup.target_main_jid &&
+        imGroup.target_main_jid !== targetMainJid &&
+        imGroup.target_main_jid !== legacyMainJid);
+    if (hasConflict && !force) {
+      return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      target_main_jid: targetMainJid,
+      target_agent_id: undefined,
+      reply_policy: replyPolicy,
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info(
+      { imJid, targetMainJid, userId: user.id },
+      'IM group bound to workspace (bindings page)',
+    );
+    return c.json({ success: true });
+  }
+
+  return c.json(
+    { error: 'Must provide target_main_jid, target_agent_id, or unbind' },
+    400,
+  );
+});
+
 
 export default configRoutes;

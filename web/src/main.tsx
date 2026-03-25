@@ -3,16 +3,19 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import './styles/globals.css';
 import { shouldUseHashRouter } from './utils/url';
-import { initNotificationSound } from './utils/sound';
 
-// Initialize notification sound (preload audio)
 if (typeof window !== 'undefined') {
-  initNotificationSound();
+  window.__HAPPYCLAW_HASH_ROUTER__ = shouldUseHashRouter();
+
+  // Prevent pinch-to-zoom on iOS (iOS 10+ ignores user-scalable=no)
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
+  document.addEventListener('gesturechange', (e) => e.preventDefault());
+  document.addEventListener('touchmove', (e) => {
+    if (e.touches.length > 1) e.preventDefault();
+  }, { passive: false });
 }
 
-window.__HAPPYCLAW_HASH_ROUTER__ = shouldUseHashRouter();
-
-if (import.meta.env.DEV) {
+if (import.meta.env.DEV && typeof window !== 'undefined') {
   // Avoid stale PWA cache/service worker causing dev UI to hang after backend/API changes.
   window.addEventListener('load', () => {
     if ('serviceWorker' in navigator) {

@@ -1,17 +1,20 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Pause, Play, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, Pause, Play, Trash2, Zap } from 'lucide-react';
 import { ScheduledTask } from '../../stores/tasks';
 import { TaskDetail } from './TaskDetail';
+import { showToast } from '../../utils/toast';
 
 interface TaskCardProps {
   task: ScheduledTask;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
+  onRunNow?: (id: string) => void;
 }
 
-export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
+export function TaskCard({ task, onPause, onResume, onDelete, onRunNow }: TaskCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const [runningNow, setRunningNow] = useState(false);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -20,9 +23,9 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
       case 'paused':
         return 'bg-amber-100 text-amber-600';
       case 'completed':
-        return 'bg-slate-100 text-slate-500';
+        return 'bg-muted text-muted-foreground';
       default:
-        return 'bg-slate-100 text-slate-600';
+        return 'bg-muted text-muted-foreground';
     }
   };
 
@@ -45,6 +48,18 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
       onPause(task.id);
     } else {
       onResume(task.id);
+    }
+  };
+
+  const handleRunNow = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onRunNow || runningNow) return;
+    setRunningNow(true);
+    try {
+      await onRunNow(task.id);
+      showToast('任务已触发', '后台执行中，稍后刷新查看结果');
+    } finally {
+      setTimeout(() => setRunningNow(false), 3000);
     }
   };
 
@@ -77,7 +92,7 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
                 </span>
               )}
               <div className="flex items-center gap-2">
-                <span className="text-slate-500">调度:</span>
+                <span className="text-muted-foreground">调度:</span>
                 <span className="text-foreground font-medium">
                   {task.schedule_type === 'cron' && 'Cron'}
                   {task.schedule_type === 'interval' && '间隔'}
@@ -89,7 +104,7 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
               </div>
 
               <div className="flex items-center gap-2">
-                <span className="text-slate-500">群组:</span>
+                <span className="text-muted-foreground">群组:</span>
                 <span className="text-foreground font-medium">
                   {task.group_folder}
                 </span>
@@ -110,11 +125,27 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
 
           {/* Action Buttons */}
           <div className="flex items-center gap-2 flex-shrink-0">
+            {/* Run Now */}
+            {onRunNow &&
+              (task.status === 'active' || task.status === 'paused') && (
+                <button
+                  onClick={handleRunNow}
+                  disabled={runningNow}
+                  className="p-2 text-muted-foreground hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                  title="立即运行"
+                  aria-label="立即运行任务"
+                >
+                  <Zap
+                    className={`w-5 h-5 ${runningNow ? 'animate-pulse text-amber-500' : ''}`}
+                  />
+                </button>
+              )}
+
             {/* Pause/Resume */}
             {(task.status === 'active' || task.status === 'paused') && (
               <button
                 onClick={handleTogglePause}
-                className="p-2 text-slate-600 hover:text-primary hover:bg-brand-50 rounded-lg transition-colors cursor-pointer"
+                className="p-2 text-muted-foreground hover:text-primary hover:bg-brand-50 rounded-lg transition-colors cursor-pointer"
                 title={task.status === 'active' ? '暂停' : '恢复'}
                 aria-label={task.status === 'active' ? '暂停任务' : '恢复任务'}
               >
@@ -129,7 +160,7 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
             {/* Delete */}
             <button
               onClick={handleDelete}
-              className="p-2 text-slate-600 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+              className="p-2 text-muted-foreground hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
               title="删除"
               aria-label="删除任务"
             >
@@ -139,9 +170,9 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
             {/* Expand Icon */}
             <div className="ml-2">
               {expanded ? (
-                <ChevronUp className="w-5 h-5 text-slate-400" />
+                <ChevronUp className="w-5 h-5 text-muted-foreground" />
               ) : (
-                <ChevronDown className="w-5 h-5 text-slate-400" />
+                <ChevronDown className="w-5 h-5 text-muted-foreground" />
               )}
             </div>
           </div>

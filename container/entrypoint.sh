@@ -20,11 +20,11 @@ if [ -f /workspace/env-dir/env ]; then
   set +a
 fi
 
-# Discover and link skills (project → user, higher priority overwrites)
+# Discover and link skills (builtin → project → user, higher priority overwrites)
 # Only remove entries that conflict with mounted skills (non-symlink with same name),
 # preserving any skills the agent created directly in .claude/skills/.
 mkdir -p /home/node/.claude/skills
-for dir in /workspace/project-skills /workspace/user-skills; do
+for dir in /opt/builtin-skills /workspace/project-skills /workspace/user-skills; do
   if [ -d "$dir" ]; then
     for skill in "$dir"/*/; do
       if [ -d "$skill" ]; then
@@ -44,6 +44,7 @@ chown -R node:node /home/node/.claude/skills 2>/dev/null || true
 # Compile TypeScript (agent-runner source may be hot-mounted from host)
 cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2
 ln -s /app/node_modules /tmp/dist/node_modules
+ln -s /app/prompts /tmp/prompts
 chmod -R a-w /tmp/dist
 
 # Buffer stdin to file (container requires EOF to flush stdin pipe)

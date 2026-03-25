@@ -3,11 +3,11 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { killProcessTree } from './container-runner.js';
+import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
-import { type MessageIntent } from './intent-analyzer.js';
-
-export type SendMessageResult = 'sent' | 'no_active' | 'interrupted_stop' | 'interrupted_correction';
+export type SendMessageResult = 'sent' | 'no_active';
 
 interface QueuedTask {
   id: string;
@@ -20,6 +20,12 @@ const BASE_RETRY_MS = 5000;
 
 interface GroupState {
   active: boolean;
+  /** True when the active runner is executing a scheduled task (not user messages). */
+  activeRunnerIsTask: boolean;
+  /** Last time this runner produced any observable output. */
+  lastActivityAt: number | null;
+  /** True while the runner is inside an active query turn. */
+  queryInFlight: boolean;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -27,9 +33,19 @@ interface GroupState {
   displayName: string | null;
   groupFolder: string | null;
   agentId: string | null;
+  /** Isolated task run ID — used for tasks-run/{taskRunId}/ IPC namespace. */
+  taskRunId: string | null;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
+  /** True when a _drain sentinel has been written for the current active runner. */
+  drainSentinelWritten: boolean;
+  /** True when messages have been IPC-injected into the running agent via sendMessage().
+   *  Used to detect lost messages on abnormal exit: if the agent crashes after IPC
+   *  injection, the caller already advanced the cursor so processGroupMessages won't
+   *  re-read those messages.  The close handler uses this flag to force pendingMessages
+   *  so drainGroup triggers a fresh run. */
+  hasIpcInjectedMessages: boolean;
 }
 
 type ActiveGroupState = GroupState & { groupFolder: string };
@@ -49,12 +65,24 @@ export class GroupQueue {
     null;
   private onMaxRetriesExceededFn: ((groupJid: string) => void) | null = null;
   private onContainerExitFn: ((groupJid: string) => void) | null = null;
+  private onRunnerStateChangeFn:
+    | ((chatJid: string, state: 'idle' | 'running') => void)
+    | null = null;
+  private userConcurrentLimitFn:
+    | ((groupJid: string) => { allowed: boolean })
+    | null = null;
+  private onUnconsumedAgentIpcFn:
+    | ((groupJid: string, agentId: string) => void)
+    | null = null;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
     if (!state) {
       state = {
         active: false,
+        activeRunnerIsTask: false,
+        lastActivityAt: null,
+        queryInFlight: false,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -62,9 +90,12 @@ export class GroupQueue {
         displayName: null,
         groupFolder: null,
         agentId: null,
+        taskRunId: null,
         retryCount: 0,
         retryTimer: null,
         restarting: false,
+        drainSentinelWritten: false,
+        hasIpcInjectedMessages: false,
       };
       this.groups.set(groupJid, state);
     }
@@ -89,6 +120,29 @@ export class GroupQueue {
 
   setOnContainerExit(fn: (groupJid: string) => void): void {
     this.onContainerExitFn = fn;
+  }
+
+  setOnRunnerStateChange(
+    fn: (chatJid: string, state: 'idle' | 'running') => void,
+  ): void {
+    this.onRunnerStateChangeFn = fn;
+  }
+
+  setUserConcurrentLimitChecker(
+    fn: (groupJid: string) => { allowed: boolean },
+  ): void {
+    this.userConcurrentLimitFn = fn;
+  }
+
+  /**
+   * Called when an agent runner exits with unconsumed IPC message files.
+   * The callback should re-enqueue processAgentConversation for the agent.
+   * See GitHub issue #240.
+   */
+  setOnUnconsumedAgentIpc(
+    fn: (groupJid: string, agentId: string) => void,
+  ): void {
+    this.onUnconsumedAgentIpcFn = fn;
   }
 
   /**
@@ -130,9 +184,18 @@ export class GroupQueue {
 
   private hasCapacityFor(groupJid: string): boolean {
     const isHost = this.isHostMode(groupJid);
-    return isHost
-      ? this.activeHostProcessCount < getSystemSettings().maxConcurrentHostProcesses
+    const systemCapacity = isHost
+      ? this.activeHostProcessCount <
+          getSystemSettings().maxConcurrentHostProcesses
       : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
+    if (!systemCapacity) return false;
+
+    // User-level concurrent container limit (billing)
+    if (this.userConcurrentLimitFn) {
+      const result = this.userConcurrentLimitFn(groupJid);
+      if (!result.allowed) return false;
+    }
+    return true;
   }
 
   private resolveActiveState(groupJid: string): ActiveGroupState | null {
@@ -146,10 +209,96 @@ export class GroupQueue {
     return shared as ActiveGroupState;
   }
 
+  /**
+   * Write a single _drain sentinel to the actual active main-agent runner that
+   * owns this serialization key. This must target the runner state rather than
+   * the caller's group state because sibling JIDs can share one process.
+   */
+  private requestDrainForActiveRunner(
+    groupJid: string,
+    reason: string,
+  ): boolean {
+    const activeRunner = this.findActiveRunnerFor(groupJid);
+    if (!activeRunner) return false;
+
+    const runnerState = this.getGroup(activeRunner);
+    if (
+      !runnerState.active ||
+      !runnerState.groupFolder ||
+      runnerState.agentId !== null
+    ) {
+      return false;
+    }
+
+    if (runnerState.drainSentinelWritten) {
+      return true;
+    }
+
+    const wrote = this.writeDrainSentinel(runnerState as ActiveGroupState);
+    if (!wrote) return false;
+    runnerState.drainSentinelWritten = true;
+    logger.info({ groupJid, activeRunner }, reason);
+    return true;
+  }
+
   /** 检查指定 JID 是否有自己直接启动的活跃 runner（非通过 folder 共享匹配） */
   hasDirectActiveRunner(groupJid: string): boolean {
     const state = this.groups.get(groupJid);
     return state?.active === true;
+  }
+
+  /**
+   * Returns true if the active runner for this group (or its serialization
+   * sibling) is currently executing a scheduled task rather than user messages.
+   * Used by the message loop to avoid prematurely interrupting task containers.
+   */
+  isActiveRunnerTask(groupJid: string): boolean {
+    const state = this.resolveActiveState(groupJid);
+    return state?.activeRunnerIsTask === true;
+  }
+
+  markRunnerActivity(groupJid: string): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return;
+    state.lastActivityAt = Date.now();
+  }
+
+  /**
+   * Mark that a message was IPC-injected into the running agent.
+   * The caller (web.ts) has already advanced the per-group cursor for this
+   * message.  If the agent crashes without processing it, the close handler
+   * uses this flag to force pendingMessages so drainGroup re-reads from DB.
+   */
+  markIpcInjectedMessage(groupJid: string): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return;
+    state.hasIpcInjectedMessages = true;
+  }
+
+  markRunnerQueryIdle(groupJid: string): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return;
+    state.queryInFlight = false;
+  }
+
+  getStuckPendingGroups(
+    idleThresholdMs: number,
+  ): Array<{ jid: string; idleMs: number }> {
+    const now = Date.now();
+    const stuck: Array<{ jid: string; idleMs: number }> = [];
+    for (const [jid, state] of this.groups.entries()) {
+      if (!state.active) continue;
+      if (state.activeRunnerIsTask) continue;
+      if (!state.pendingMessages) continue;
+      if (state.agentId !== null) continue;
+      if (state.restarting) continue;
+      const lastActivityAt = state.lastActivityAt ?? 0;
+      if (lastActivityAt <= 0) continue;
+      const idleMs = now - lastActivityAt;
+      if (idleMs < idleThresholdMs) continue;
+      stuck.push({ jid, idleMs });
+    }
+    return stuck;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -161,6 +310,12 @@ export class GroupQueue {
     if (state.active || (activeRunner && activeRunner !== groupJid)) {
       state.pendingMessages = true;
       this.waitingGroups.add(groupJid);
+      // Write _drain to the actual active runner so sibling JIDs sharing one
+      // folder also unblock immediately instead of waiting for idle timeout.
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Drain sentinel written during enqueueMessageCheck to unblock pending messages',
+      );
       logger.debug(
         { groupJid, activeRunner: activeRunner || groupJid },
         'Group runner active, message queued',
@@ -239,6 +394,7 @@ export class GroupQueue {
     groupFolder?: string,
     displayName?: string,
     agentId?: string,
+    taskRunId?: string,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
@@ -246,6 +402,7 @@ export class GroupQueue {
     state.displayName = displayName || null;
     if (groupFolder) state.groupFolder = groupFolder;
     state.agentId = agentId || null;
+    state.taskRunId = taskRunId || null;
   }
 
   /**
@@ -253,42 +410,69 @@ export class GroupQueue {
    * Sub-agents use a nested path: data/ipc/{folder}/agents/{agentId}/input/
    */
   private resolveIpcInputDir(state: ActiveGroupState): string {
+    if (state.taskRunId) {
+      return path.join(
+        DATA_DIR,
+        'ipc',
+        state.groupFolder,
+        'tasks-run',
+        state.taskRunId,
+        'input',
+      );
+    }
     if (state.agentId) {
-      return path.join(DATA_DIR, 'ipc', state.groupFolder, 'agents', state.agentId, 'input');
+      return path.join(
+        DATA_DIR,
+        'ipc',
+        state.groupFolder,
+        'agents',
+        state.agentId,
+        'input',
+      );
     }
     return path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
   }
 
   /**
    * Send a follow-up message to the active container via IPC file.
-   * Analyzes message intent and may interrupt the current query.
    *
    * Returns:
-   * - 'sent': message written to IPC (continue intent)
+   * - 'sent': message written to IPC (包括 queryInFlight 时的排队写入)
    * - 'no_active': no active container/process for this group
-   * - 'interrupted_stop': stop intent detected, query interrupted, message NOT written
-   * - 'interrupted_correction': correction intent detected, query interrupted, message written
    */
   sendMessage(
     groupJid: string,
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
-    intent: MessageIntent = 'continue',
+    onInjected?: () => void,
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
 
-    if (intent === 'stop') {
-      this.interruptQuery(groupJid);
-      logger.info({ groupJid, intent }, 'Stop intent detected, interrupting query without IPC message');
-      return 'interrupted_stop';
+    // If the active runner is a scheduled task (not a user-message handler),
+    // do NOT pipe user messages into it.  The task container has no knowledge
+    // of the user conversation context, so any IPC message injected here would
+    // be silently consumed (or confusingly processed) by the task agent and the
+    // reply would never reach the user.  Returning 'no_active' causes the
+    // caller to enqueue a fresh message-processing run that will execute once
+    // the task finishes.  See GitHub issue riba2534/happyclaw#151.
+    //
+    // Exception: conversation agent tasks (virtual JIDs with #agent:) are
+    // user-message handlers started via enqueueTask.  They DO accept IPC
+    // messages — blocking them causes a deadlock where the agent waits for
+    // IPC input that never arrives.
+    if (state.activeRunnerIsTask && !groupJid.includes('#agent:')) {
+      logger.debug(
+        { groupJid },
+        'Active runner is a scheduled task; deferring user message until task completes',
+      );
+      return 'no_active';
     }
 
-    if (intent === 'correction') {
-      this.interruptQuery(groupJid);
-      logger.info({ groupJid, intent }, 'Correction intent detected, interrupting query and writing IPC message');
-      // Fall through to write the IPC message so the agent sees the correction after restart
-    }
+    // queryInFlight=true：当前 query 正在执行，将消息写入 IPC 文件排队。
+    // 当前 query 完成后 waitForIpcMessage() → drainIpcInput() 会合并所有
+    // 待处理的 IPC 消息为一个 prompt，实现自然聚合（如飞书转发+评论场景）。
+    // 不再写 _drain：容器无需退出重启，复用当前进程即可。
 
     const inputDir = this.resolveIpcInputDir(state);
     try {
@@ -301,7 +485,9 @@ export class GroupQueue {
         JSON.stringify({ type: 'message', text, images }),
       );
       fs.renameSync(tempPath, filepath);
-      return intent === 'correction' ? 'interrupted_correction' : 'sent';
+      state.queryInFlight = true;
+      onInjected?.();
+      return 'sent';
     } catch {
       return 'no_active';
     }
@@ -320,6 +506,104 @@ export class GroupQueue {
       fs.writeFileSync(path.join(inputDir, '_close'), '');
     } catch {
       // ignore
+    }
+  }
+
+  /**
+   * Remove leftover _drain and _close sentinel files from the IPC input
+   * directory.  Called in finally blocks after a runner exits so that a
+   * subsequent runner for the same folder does not immediately see stale
+   * sentinels and exit prematurely.
+   */
+  private cleanupIpcSentinels(
+    groupFolder: string,
+    agentId?: string | null,
+    taskRunId?: string | null,
+  ): void {
+    const inputDir = taskRunId
+      ? path.join(DATA_DIR, 'ipc', groupFolder, 'tasks-run', taskRunId, 'input')
+      : agentId
+        ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
+        : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    for (const name of ['_drain', '_close']) {
+      try {
+        fs.unlinkSync(path.join(inputDir, name));
+      } catch {
+        // file may not exist – that's fine
+      }
+    }
+  }
+
+  /**
+   * Check if there are unconsumed IPC message files (.json) in the input directory.
+   * Called after process exit to detect messages written via sendMessage() that were
+   * never consumed due to a race condition (process exiting before reading IPC).
+   * See GitHub issue #240.
+   */
+  /**
+   * Check for unconsumed IPC messages after agent/task exit and recover.
+   * Handles the race where sendMessage() wrote a file but the process
+   * exited before reading it (issue #240).
+   */
+  private recoverUnconsumedIpc(
+    groupJid: string,
+    state: GroupState,
+    context: string,
+  ): void {
+    if (!state.groupFolder) return;
+    try {
+      if (!this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) return;
+
+      if (state.agentId && this.onUnconsumedAgentIpcFn) {
+        logger.warn(
+          { groupJid, agentId: state.agentId },
+          `Unconsumed IPC messages found after ${context}, re-enqueuing`,
+        );
+        this.onUnconsumedAgentIpcFn(groupJid, state.agentId);
+      } else if (!state.taskRunId) {
+        state.pendingMessages = true;
+        logger.warn(
+          { groupJid },
+          `Unconsumed IPC messages found after ${context}, marking pending`,
+        );
+      }
+    } catch (err) {
+      logger.warn({ groupJid, err }, 'Failed to check remaining IPC messages');
+    }
+  }
+
+  private hasRemainingIpcMessages(
+    groupFolder: string,
+    agentId?: string | null,
+    taskRunId?: string | null,
+  ): boolean {
+    const inputDir = taskRunId
+      ? path.join(DATA_DIR, 'ipc', groupFolder, 'tasks-run', taskRunId, 'input')
+      : agentId
+        ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
+        : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    try {
+      const files = fs.readdirSync(inputDir);
+      return files.some(f => f.endsWith('.json'));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Signal the active container to finish the current query and then exit.
+   * Unlike _close which exits immediately from waitForIpcMessage, _drain
+   * is only checked after the current query completes, ensuring one-question-
+   * one-answer semantics.
+   */
+  private writeDrainSentinel(state: ActiveGroupState): boolean {
+    const inputDir = this.resolveIpcInputDir(state);
+    try {
+      fs.mkdirSync(inputDir, { recursive: true });
+      fs.writeFileSync(path.join(inputDir, '_drain'), '');
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -346,7 +630,10 @@ export class GroupQueue {
       }
     }
     if (closed > 0) {
-      logger.info({ closed }, 'Closed active containers/processes for credential refresh');
+      logger.info(
+        { closed },
+        'Closed active containers/processes for credential refresh',
+      );
     }
     return closed;
   }
@@ -369,46 +656,33 @@ export class GroupQueue {
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
-      try { fs.chmodSync(inputDir, 0o777); } catch { /* ignore */ }
+      try {
+        fs.chmodSync(inputDir, 0o777);
+      } catch {
+        /* ignore */
+      }
       fs.writeFileSync(path.join(inputDir, '_interrupt'), '');
       logger.info({ groupJid, inputDir }, 'Interrupt sentinel written');
       return true;
     } catch (err) {
-      logger.warn({ groupJid, inputDir, err }, 'Failed to write interrupt sentinel');
+      logger.warn(
+        { groupJid, inputDir, err },
+        'Failed to write interrupt sentinel',
+      );
       return false;
     }
   }
 
-  /**
-   * Send a permission mode change command to a running container/process via IPC.
-   * Returns true if the command was written successfully.
-   */
-  setPermissionMode(groupJid: string, mode: string): boolean {
-    const state = this.resolveActiveState(groupJid);
-    if (!state) return false;
-
-    const inputDir = this.resolveIpcInputDir(state);
-    try {
-      fs.mkdirSync(inputDir, { recursive: true });
-      const filename = `${Date.now()}-mode-${Math.random().toString(36).slice(2, 6)}.json`;
-      const filepath = path.join(inputDir, filename);
-      const tempPath = `${filepath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify({ type: 'set_mode', mode }));
-      fs.renameSync(tempPath, filepath);
-      logger.info({ groupJid, mode }, 'Permission mode change IPC written');
-      return true;
-    } catch (err) {
-      logger.warn({ groupJid, mode, err }, 'Failed to write mode change IPC');
-      return false;
-    }
-  }
 
   /**
    * Force-stop a group's active container and clear queued work.
    * Returns a promise that resolves when the container has fully exited
    * (state.active becomes false), not just when docker stop completes.
    */
-  async stopGroup(groupJid: string, options?: { force?: boolean }): Promise<void> {
+  async stopGroup(
+    groupJid: string,
+    options?: { force?: boolean },
+  ): Promise<void> {
     const force = options?.force ?? false;
     const requestedState = this.getGroup(groupJid);
     requestedState.pendingMessages = false;
@@ -435,14 +709,12 @@ export class GroupQueue {
       if (state.containerName) {
         const name = state.containerName;
         await new Promise<void>((resolve) => {
-          execFile('docker', ['kill', name], { timeout: 5000 }, () => resolve());
+          execFile('docker', ['kill', name], { timeout: 5000 }, () =>
+            resolve(),
+          );
         });
       } else if (state.process && !state.process.killed) {
-        try {
-          state.process.kill('SIGKILL');
-        } catch {
-          // ignore
-        }
+        killProcessTree(state.process, 'SIGKILL');
       }
 
       if (state.active) {
@@ -456,14 +728,12 @@ export class GroupQueue {
       if (state.containerName) {
         const name = state.containerName;
         await new Promise<void>((resolve) => {
-          execFile('docker', ['stop', name], { timeout: 10000 }, () => resolve());
+          execFile('docker', ['stop', name], { timeout: 10000 }, () =>
+            resolve(),
+          );
         });
       } else if (state.process && !state.process.killed) {
-        try {
-          state.process.kill('SIGTERM');
-        } catch {
-          // ignore
-        }
+        killProcessTree(state.process, 'SIGTERM');
       }
 
       // Wait for state.active to become false (runForGroup/runTask finally block)
@@ -492,11 +762,7 @@ export class GroupQueue {
           await new Promise((r) => setTimeout(r, 100));
         }
       } else if (state.active && state.process) {
-        try {
-          state.process.kill('SIGKILL');
-        } catch {
-          // ignore
-        }
+        killProcessTree(state.process, 'SIGKILL');
         const killStart = Date.now();
         while (state.active && Date.now() - killStart < 5000) {
           await new Promise((r) => setTimeout(r, 100));
@@ -522,7 +788,10 @@ export class GroupQueue {
     const state = this.getGroup(targetJid);
 
     if (state.restarting) {
-      logger.warn({ groupJid: targetJid }, 'Restart already in progress, skipping');
+      logger.warn(
+        { groupJid: targetJid },
+        'Restart already in progress, skipping',
+      );
       return;
     }
     state.restarting = true;
@@ -532,7 +801,18 @@ export class GroupQueue {
         this.closeStdin(targetJid);
       }
 
-      // Stop docker container and wait for it
+      // Give agent-runner time to detect _close sentinel and exit gracefully
+      // before sending SIGTERM.  The IPC poll interval is 500ms, so 2s is
+      // generous enough for the agent to finish its current operation and
+      // emit the final session ID.
+      if (state.groupFolder && !state.containerName) {
+        const graceStart = Date.now();
+        while (state.active && Date.now() - graceStart < 2000) {
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+
+      // Stop docker container / host process
       if (state.containerName) {
         const name = state.containerName;
         await new Promise<void>((resolve) => {
@@ -540,12 +820,8 @@ export class GroupQueue {
             resolve(),
           );
         });
-      } else if (state.process && !state.process.killed) {
-        try {
-          state.process.kill('SIGTERM');
-        } catch {
-          // ignore
-        }
+      } else if (state.active && state.process && !state.process.killed) {
+        killProcessTree(state.process, 'SIGTERM');
       }
 
       // Wait for runForGroup to finish and reset state
@@ -574,11 +850,7 @@ export class GroupQueue {
             await new Promise((r) => setTimeout(r, 200));
           }
         } else if (state.process) {
-          try {
-            state.process.kill('SIGKILL');
-          } catch {
-            // ignore
-          }
+          killProcessTree(state.process, 'SIGKILL');
           const killStart = Date.now();
           while (state.active && Date.now() - killStart < 5000) {
             await new Promise((r) => setTimeout(r, 200));
@@ -609,6 +881,9 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
+    state.activeRunnerIsTask = false;
+    state.lastActivityAt = Date.now();
+    state.queryInFlight = true;
     state.pendingMessages = false;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
@@ -629,10 +904,19 @@ export class GroupQueue {
     );
 
     try {
+      this.onRunnerStateChangeFn?.(groupJid, 'running');
+    } catch (err) {
+      logger.error({ groupJid, err }, 'onRunnerStateChange(running) failed');
+    }
+
+    try {
       if (this.processMessagesFn) {
         const success = await this.processMessagesFn(groupJid);
         if (success) {
           state.retryCount = 0;
+          // Defensive: clear any lingering retry timer from a previous failed
+          // run that was superseded by a successful drain-triggered run.
+          this.clearRetryTimer(state);
         } else {
           this.scheduleRetry(groupJid, state);
         }
@@ -641,17 +925,48 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
+      // Clean up stale sentinel files before clearing groupFolder/agentId
+      if (state.groupFolder) {
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
+        this.recoverUnconsumedIpc(groupJid, state, 'agent exit');
+      }
+      // If messages were IPC-injected during this run, always mark pending
+      // so drainGroup triggers a fresh processGroupMessages.  If the agent
+      // already replied to them, processGroupMessages will find 0 new messages
+      // (cursor was committed) and return immediately — harmless.  If the
+      // agent crashed, this ensures the messages are re-read from DB.
+      if (state.hasIpcInjectedMessages) {
+        state.pendingMessages = true;
+        logger.debug(
+          { groupJid },
+          'IPC-injected messages detected, marking pending for safety re-check',
+        );
+      }
       state.active = false;
+      state.drainSentinelWritten = false;
+      state.hasIpcInjectedMessages = false;
+      state.lastActivityAt = null;
+      state.queryInFlight = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
       state.groupFolder = null;
       state.agentId = null;
+      state.taskRunId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
       } else {
         this.activeContainerCount--;
+      }
+      try {
+        this.onRunnerStateChangeFn?.(groupJid, 'idle');
+      } catch (err) {
+        logger.error({ groupJid, err }, 'onRunnerStateChange(idle) failed');
       }
       try {
         this.onContainerExitFn?.(groupJid);
@@ -670,6 +985,9 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
+    state.activeRunnerIsTask = true;
+    state.lastActivityAt = Date.now();
+    state.queryInFlight = false;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
     if (isHostMode) {
@@ -689,21 +1007,46 @@ export class GroupQueue {
     );
 
     try {
+      this.onRunnerStateChangeFn?.(groupJid, 'running');
+    } catch (err) {
+      logger.error({ groupJid, err }, 'onRunnerStateChange(running) failed');
+    }
+
+    try {
       await task.fn();
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
+      // Clean up stale sentinel files before clearing groupFolder/agentId
+      if (state.groupFolder) {
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
+        this.recoverUnconsumedIpc(groupJid, state, 'task exit');
+      }
       state.active = false;
+      state.activeRunnerIsTask = false;
+      state.drainSentinelWritten = false;
+      state.lastActivityAt = null;
+      state.queryInFlight = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
       state.groupFolder = null;
       state.agentId = null;
+      state.taskRunId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
       } else {
         this.activeContainerCount--;
+      }
+      try {
+        this.onRunnerStateChangeFn?.(groupJid, 'idle');
+      } catch (err) {
+        logger.error({ groupJid, err }, 'onRunnerStateChange(idle) failed');
       }
       try {
         this.onContainerExitFn?.(groupJid);
@@ -779,14 +1122,29 @@ export class GroupQueue {
     }
 
     // Tasks first (they won't be re-discovered from SQLite like messages)
-    if (state.pendingTasks.length > 0) {
+    while (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
+      // Check if scheduled task is still active before occupying a slot.
+      // Only skip tasks that exist in the DB and are no longer active.
+      // Dynamic tasks (agent conversations, etc.) don't have DB entries
+      // and must always be allowed to run.
+      const dbTask = getTaskById(task.id);
+      if (dbTask && dbTask.status !== 'active') {
+        logger.info(
+          { groupJid, taskId: task.id },
+          'Skipping cancelled/deleted task during drain',
+        );
+        continue;
+      }
       this.runTask(groupJid, task);
       return;
     }
 
-    // Then pending messages
-    if (state.pendingMessages) {
+    // Then pending messages — but NOT if a retry timer is already scheduled.
+    // When processMessagesFn() fails, both scheduleRetry() and drainGroup() fire.
+    // Without this guard, drainGroup would start a new container while the retry
+    // timer later starts another, causing duplicate processing of the same messages.
+    if (state.pendingMessages && !state.retryTimer) {
       this.runForGroup(groupJid, 'drain');
       return;
     }
@@ -813,9 +1171,31 @@ export class GroupQueue {
 
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {
-        const task = state.pendingTasks.shift()!;
-        this.runTask(jid, task);
-      } else if (state.pendingMessages) {
+        // Skip cancelled/deleted scheduled tasks (but allow dynamic tasks
+        // like agent conversations that have no DB entry).
+        let validTask: QueuedTask | undefined;
+        while (state.pendingTasks.length > 0) {
+          const candidate = state.pendingTasks.shift()!;
+          const dbTask = getTaskById(candidate.id);
+          if (dbTask && dbTask.status !== 'active') {
+            logger.info(
+              { groupJid: jid, taskId: candidate.id },
+              'Skipping cancelled/deleted task during drainWaiting',
+            );
+            continue;
+          }
+          validTask = candidate;
+          break;
+        }
+        if (validTask) {
+          this.runTask(jid, validTask);
+        } else if (state.pendingMessages && !state.retryTimer) {
+          // All tasks were stale, fall through to messages
+          // (skip if retry timer is pending to avoid duplicate processing)
+          this.runForGroup(jid, 'drain');
+        }
+      } else if (state.pendingMessages && !state.retryTimer) {
+        // Skip if retry timer is pending to avoid duplicate processing
         this.runForGroup(jid, 'drain');
       }
       // If neither pending, skip this group
@@ -924,19 +1304,13 @@ export class GroupQueue {
         } else if (state.process && !state.process.killed) {
           const proc = state.process;
           const promise = new Promise<void>((resolve) => {
-            try {
-              proc.kill('SIGTERM');
-            } catch {
+            if (!killProcessTree(proc, 'SIGTERM')) {
               resolve();
               return;
             }
             setTimeout(() => {
               if (proc.exitCode === null && proc.signalCode === null) {
-                try {
-                  proc.kill('SIGKILL');
-                } catch {
-                  // ignore
-                }
+                killProcessTree(proc, 'SIGKILL');
               }
               resolve();
             }, 3000);

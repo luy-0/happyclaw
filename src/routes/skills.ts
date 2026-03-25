@@ -10,7 +10,14 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
-import { getNormalUserSkillsDir } from '../user-detection.js';
+import { getSystemSettings, saveSystemSettings, type SystemSettings } from '../runtime-config.js';
+import {
+  parseFrontmatter,
+  validateSkillId,
+  validateSkillPath,
+  listFiles,
+  scanSkillDirectory,
+} from '../skill-utils.js';
 
 const execFileAsync = promisify(execFile);
 let skillInstallLock: Promise<void> = Promise.resolve();
@@ -45,11 +52,14 @@ interface HostSyncManifest {
 }
 
 interface SkillsManifest {
-  skills: Record<string, {
-    packageName: string;
-    installedAt: string;
-    source: string;
-  }>;
+  skills: Record<
+    string,
+    {
+      packageName: string;
+      installedAt: string;
+      source: string;
+    }
+  >;
 }
 
 interface SearchResult {
@@ -68,8 +78,7 @@ function getUserSkillsDir(userId: string): string {
 }
 
 function getGlobalSkillsDir(): string {
-  // 使用检测到的普通用户 home 目录，而非当前进程（可能是 root）的 home
-  return getNormalUserSkillsDir();
+  return path.join(os.homedir(), '.claude', 'skills');
 }
 
 function getProjectSkillsDir(): string {
@@ -89,7 +98,10 @@ function readHostSyncManifest(userId: string): HostSyncManifest {
   }
 }
 
-function writeHostSyncManifest(userId: string, manifest: HostSyncManifest): void {
+function writeHostSyncManifest(
+  userId: string,
+  manifest: HostSyncManifest,
+): void {
   const manifestPath = getHostSyncManifestPath(userId);
   fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -118,7 +130,11 @@ function writeSkillsManifest(userId: string, manifest: SkillsManifest): void {
  * Update the skills manifest after installing skills.
  * Records packageName, installedAt, and source for each installed skill.
  */
-function updateSkillsManifest(userId: string, packageName: string, installedSkillIds: string[]): void {
+function updateSkillsManifest(
+  userId: string,
+  packageName: string,
+  installedSkillIds: string[],
+): void {
   const manifest = readSkillsManifest(userId);
   const now = new Date().toISOString();
   for (const id of installedSkillIds) {
@@ -142,158 +158,11 @@ function removeFromSkillsManifest(userId: string, skillId: string): void {
   }
 }
 
-function validateSkillId(id: string): boolean {
-  return /^[\w\-]+$/.test(id);
-}
+// validateSkillId, validateSkillPath, parseFrontmatter, listFiles, scanSkillDirectory
+// are imported from '../skill-utils.js'
 
-function validateSkillPath(skillsRoot: string, skillDir: string): boolean {
-  try {
-    const realSkillsRoot = fs.realpathSync(skillsRoot);
-    const realSkillDir = fs.realpathSync(skillDir);
-    const relative = path.relative(realSkillsRoot, realSkillDir);
-    return !relative.startsWith('..') && !path.isAbsolute(relative);
-  } catch {
-    return false;
-  }
-}
-
-function parseFrontmatter(content: string): Record<string, string> {
-  const lines = content.split('\n');
-  if (lines[0]?.trim() !== '---') return {};
-
-  const endIndex = lines.slice(1).findIndex((line) => line.trim() === '---');
-  if (endIndex === -1) return {};
-
-  const frontmatterLines = lines.slice(1, endIndex + 1);
-  const result: Record<string, string> = {};
-  let currentKey: string | null = null;
-  let currentValue: string[] = [];
-  let multilineMode: 'folded' | 'literal' | null = null;
-
-  for (const line of frontmatterLines) {
-    const keyMatch = line.match(/^([\w\-]+):\s*(.*)$/);
-    if (keyMatch) {
-      // Save previous key if exists
-      if (currentKey) {
-        result[currentKey] = currentValue.join(
-          multilineMode === 'literal' ? '\n' : ' ',
-        );
-      }
-
-      currentKey = keyMatch[1];
-      const value = keyMatch[2].trim();
-
-      if (value === '>') {
-        multilineMode = 'folded';
-        currentValue = [];
-      } else if (value === '|') {
-        multilineMode = 'literal';
-        currentValue = [];
-      } else {
-        result[currentKey] = value;
-        currentKey = null;
-        currentValue = [];
-        multilineMode = null;
-      }
-    } else if (currentKey && multilineMode) {
-      const trimmedLine = line.trimStart();
-      if (trimmedLine) {
-        currentValue.push(trimmedLine);
-      }
-    }
-  }
-
-  // Save last key
-  if (currentKey) {
-    result[currentKey] = currentValue.join(
-      multilineMode === 'literal' ? '\n' : ' ',
-    );
-  }
-
-  return result;
-}
-
-function listFiles(
-  dir: string,
-): Array<{ name: string; type: 'file' | 'directory'; size: number }> {
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    return entries
-      .filter((entry) => !entry.name.startsWith('.'))
-      .map((entry) => {
-        const fullPath = path.join(dir, entry.name);
-        const stats = fs.statSync(fullPath);
-        return {
-          name: entry.name,
-          type: entry.isDirectory() ? 'directory' : 'file',
-          size: entry.isDirectory() ? 0 : stats.size,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-function scanDirectory(
-  rootDir: string,
-  source: 'user' | 'project',
-): Skill[] {
-  const skills: Skill[] = [];
-  if (!fs.existsSync(rootDir)) return skills;
-
-  try {
-    const entries = fs.readdirSync(rootDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-
-      const skillDir = path.join(rootDir, entry.name);
-      const skillMdPath = path.join(skillDir, 'SKILL.md');
-      const skillMdDisabledPath = path.join(skillDir, 'SKILL.md.disabled');
-
-      let enabled = false;
-      let skillFilePath: string | null = null;
-
-      if (fs.existsSync(skillMdPath)) {
-        enabled = true;
-        skillFilePath = skillMdPath;
-      } else if (fs.existsSync(skillMdDisabledPath)) {
-        enabled = false;
-        skillFilePath = skillMdDisabledPath;
-      } else {
-        continue;
-      }
-
-      try {
-        const content = fs.readFileSync(skillFilePath, 'utf-8');
-        const frontmatter = parseFrontmatter(content);
-        const stats = fs.statSync(skillDir);
-
-        skills.push({
-          id: entry.name,
-          name: frontmatter.name || entry.name,
-          description: frontmatter.description || '',
-          source,
-          enabled,
-          userInvocable:
-            frontmatter['user-invocable'] === undefined
-              ? true
-              : frontmatter['user-invocable'] !== 'false',
-          allowedTools: frontmatter['allowed-tools']
-            ? frontmatter['allowed-tools'].split(',').map((t) => t.trim())
-            : [],
-          argumentHint: frontmatter['argument-hint'] || null,
-          updatedAt: stats.mtime.toISOString(),
-          files: listFiles(skillDir),
-        });
-      } catch {
-        // Skip malformed skills
-      }
-    }
-  } catch {
-    // Skip if directory is not readable
-  }
-
-  return skills;
+function scanDirectory(rootDir: string, source: 'user' | 'project'): Skill[] {
+  return scanSkillDirectory(rootDir, source) as Skill[];
 }
 
 function discoverSkills(userId: string): Skill[] {
@@ -410,7 +279,10 @@ function parseSearchOutput(output: string): SearchResult[] {
   const clean = output.replace(/\x1b\[[0-9;]*m/g, '');
   const results: SearchResult[] = [];
 
-  const lines = clean.split('\n').map((l) => l.trim()).filter(Boolean);
+  const lines = clean
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -541,7 +413,7 @@ async function searchSkillsApi(query: string): Promise<SearchResult[]> {
     );
     if (!resp.ok) throw new Error(`skills.sh returned ${resp.status}`);
 
-    const data = await resp.json() as {
+    const data = (await resp.json()) as {
       skills?: Array<{
         id: string;
         skillId: string;
@@ -552,9 +424,10 @@ async function searchSkillsApi(query: string): Promise<SearchResult[]> {
     };
 
     const results: SearchResult[] = (data.skills || []).map((s) => ({
-      package: s.source === s.skillId || !s.skillId
-        ? s.source
-        : `${s.source}@${s.skillId}`,
+      package:
+        s.source === s.skillId || !s.skillId
+          ? s.source
+          : `${s.source}@${s.skillId}`,
       url: `https://skills.sh/s/${s.id}`,
       description: '',
       installs: s.installs,
@@ -697,11 +570,17 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
       const parsed = new URL(url);
       if (parsed.hostname === 'skills.sh') {
         // URL pattern: https://skills.sh/s/{owner}/{repo}/{skillId}
-        const segments = parsed.pathname.replace(/^\/s\//, '').split('/').filter(Boolean);
+        const segments = parsed.pathname
+          .replace(/^\/s\//, '')
+          .split('/')
+          .filter(Boolean);
         if (segments.length >= 3) {
           const srcFromUrl = `${segments[0]}/${segments[1]}`;
           const skillIdFromUrl = segments[2];
-          const result = await fetchSkillMdFromGitHub(srcFromUrl, skillIdFromUrl);
+          const result = await fetchSkillMdFromGitHub(
+            srcFromUrl,
+            skillIdFromUrl,
+          );
           if (result) {
             return c.json({
               detail: {
@@ -722,6 +601,40 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
   }
 
   return c.json({ detail: null });
+});
+
+// Get sync status (last sync time + auto-sync config)
+skillsRoutes.get('/sync-status', authMiddleware, (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const manifest = readHostSyncManifest(authUser.id);
+  const settings = getSystemSettings();
+  return c.json({
+    lastSyncAt: manifest.lastSyncAt || null,
+    syncedCount: manifest.syncedSkills.length,
+    autoSyncEnabled: settings.skillAutoSyncEnabled,
+    autoSyncIntervalMinutes: settings.skillAutoSyncIntervalMinutes,
+  });
+});
+
+// Toggle auto-sync on/off (admin only)
+skillsRoutes.put('/sync-settings', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  if (authUser.role !== 'admin') {
+    return c.json({ error: 'Only admin can change sync settings' }, 403);
+  }
+  const body = await c.req.json().catch(() => ({}));
+  const updates: Partial<SystemSettings> = {};
+  if (typeof body.autoSyncEnabled === 'boolean') {
+    updates.skillAutoSyncEnabled = body.autoSyncEnabled;
+  }
+  if (typeof body.autoSyncIntervalMinutes === 'number' && body.autoSyncIntervalMinutes >= 1) {
+    updates.skillAutoSyncIntervalMinutes = body.autoSyncIntervalMinutes;
+  }
+  const saved = saveSystemSettings(updates);
+  return c.json({
+    autoSyncEnabled: saved.skillAutoSyncEnabled,
+    autoSyncIntervalMinutes: saved.skillAutoSyncIntervalMinutes,
+  });
 });
 
 skillsRoutes.get('/:id', authMiddleware, (c) => {
@@ -749,17 +662,29 @@ skillsRoutes.patch('/:id', authMiddleware, async (c) => {
   const skillDir = path.join(userDir, id);
 
   if (!fs.existsSync(skillDir)) {
-    return c.json({ error: 'Skill not found or is not a user-level skill' }, 404);
+    return c.json(
+      { error: 'Skill not found or is not a user-level skill' },
+      404,
+    );
   }
   if (!validateSkillPath(userDir, skillDir)) {
     return c.json({ error: 'Invalid skill path' }, 400);
   }
 
-  const srcPath = path.join(skillDir, enabled ? 'SKILL.md.disabled' : 'SKILL.md');
-  const dstPath = path.join(skillDir, enabled ? 'SKILL.md' : 'SKILL.md.disabled');
+  const srcPath = path.join(
+    skillDir,
+    enabled ? 'SKILL.md.disabled' : 'SKILL.md',
+  );
+  const dstPath = path.join(
+    skillDir,
+    enabled ? 'SKILL.md' : 'SKILL.md.disabled',
+  );
 
   if (!fs.existsSync(srcPath)) {
-    return c.json({ error: 'Skill not found or already in desired state' }, 404);
+    return c.json(
+      { error: 'Skill not found or already in desired state' },
+      404,
+    );
   }
 
   fs.renameSync(srcPath, dstPath);
@@ -782,7 +707,10 @@ function deleteSkillForUser(
   const skillDir = path.join(userDir, skillId);
 
   if (!fs.existsSync(skillDir)) {
-    return { success: false, error: 'Skill not found or is a project-level skill' };
+    return {
+      success: false,
+      error: 'Skill not found or is a project-level skill',
+    };
   }
 
   if (!validateSkillPath(userDir, skillDir)) {
@@ -807,8 +735,13 @@ skillsRoutes.delete('/:id', authMiddleware, async (c) => {
   const result = deleteSkillForUser(authUser.id, id);
 
   if (!result.success) {
-    const status = result.error === 'Invalid skill ID' || result.error === 'Invalid skill path' ? 400
-      : result.error?.includes('not found') ? 404 : 500;
+    const status =
+      result.error === 'Invalid skill ID' ||
+      result.error === 'Invalid skill path'
+        ? 400
+        : result.error?.includes('not found')
+          ? 404
+          : 500;
     return c.json({ error: result.error }, status);
   }
 
@@ -825,7 +758,10 @@ async function installSkillForUser(
   userId: string,
   pkg: string,
 ): Promise<{ success: boolean; installed?: string[]; error?: string }> {
-  if (!/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg) && !/^https?:\/\//.test(pkg)) {
+  if (
+    !/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg) &&
+    !/^https?:\/\//.test(pkg)
+  ) {
     return { success: false, error: 'Invalid package name format' };
   }
 
@@ -849,7 +785,9 @@ async function installSkillForUser(
     // Discover all skill directories installed into the temp location
     const installedEntries: string[] = [];
     if (fs.existsSync(tempSkillsDir)) {
-      for (const entry of fs.readdirSync(tempSkillsDir, { withFileTypes: true })) {
+      for (const entry of fs.readdirSync(tempSkillsDir, {
+        withFileTypes: true,
+      })) {
         if (entry.isDirectory() || entry.isSymbolicLink()) {
           installedEntries.push(entry.name);
         }
@@ -857,7 +795,10 @@ async function installSkillForUser(
     }
 
     if (installedEntries.length === 0) {
-      return { success: false, error: 'No skills were installed — package may be invalid' };
+      return {
+        success: false,
+        error: 'No skills were installed — package may be invalid',
+      };
     }
 
     // Copy resolved skill content to per-user directory
@@ -886,21 +827,22 @@ async function installSkillForUser(
     // Always clean up the temp directory
     try {
       fs.rmSync(tempHome, { recursive: true, force: true });
-    } catch { /* ignore cleanup errors */ }
+    } catch {
+      /* ignore cleanup errors */
+    }
   }
 }
 
-// Sync host-level skills (~/.claude/skills/) to admin's user-level directory.
-// Only admin can use this endpoint.
-skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
-  const authUser = c.get('user') as AuthUser;
-  if (authUser.role !== 'admin') {
-    return c.json({ error: 'Only admin can sync host skills' }, 403);
-  }
-
+/**
+ * Sync host-level skills (~/.claude/skills/) to a user's directory.
+ * Standalone function usable from both the API route and the auto-sync timer.
+ */
+async function syncHostSkillsForUser(
+  userId: string,
+): Promise<{ stats: { added: number; updated: number; deleted: number; skipped: number }; total: number }> {
   return withSkillInstallLock(async () => {
     const hostDir = getGlobalSkillsDir();
-    const userDir = getUserSkillsDir(authUser.id);
+    const userDir = getUserSkillsDir(userId);
     fs.mkdirSync(userDir, { recursive: true });
 
     // 1. 扫描宿主机 skills
@@ -909,7 +851,6 @@ skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
       for (const entry of fs.readdirSync(hostDir, { withFileTypes: true })) {
         if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
         const skillDir = path.join(hostDir, entry.name);
-        // 验证包含 SKILL.md 或 SKILL.md.disabled
         try {
           const realPath = fs.realpathSync(skillDir);
           if (
@@ -925,7 +866,7 @@ skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
     }
 
     // 2. 读取 manifest
-    const manifest = readHostSyncManifest(authUser.id);
+    const manifest = readHostSyncManifest(userId);
     const previouslySynced = new Set(manifest.syncedSkills);
 
     // 3. 检测用户目录中手动安装的 skills
@@ -941,9 +882,9 @@ skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
 
     // 4. 同步：新增/更新
     for (const name of hostSkillNames) {
-      const isManuallyInstalled = existingUserSkills.has(name) && !previouslySynced.has(name);
+      const isManuallyInstalled =
+        existingUserSkills.has(name) && !previouslySynced.has(name);
       if (isManuallyInstalled) {
-        // 手动安装的 skill，跳过不覆盖
         stats.skipped++;
         continue;
       }
@@ -952,12 +893,10 @@ skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
       const dest = path.join(userDir, name);
 
       if (existingUserSkills.has(name)) {
-        // 已存在且之前是同步来的 → 更新
         fs.rmSync(dest, { recursive: true, force: true });
         copySkillToUser(src, dest);
         stats.updated++;
       } else {
-        // 全新的 → 新增
         copySkillToUser(src, dest);
         stats.added++;
       }
@@ -975,40 +914,46 @@ skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
     }
 
     // 6. 更新 manifest
-    writeHostSyncManifest(authUser.id, {
+    writeHostSyncManifest(userId, {
       syncedSkills: newSyncedList,
       lastSyncAt: new Date().toISOString(),
     });
 
-    const total = hostSkillNames.length;
-    return c.json({ stats, total });
+    return { stats, total: hostSkillNames.length };
   });
+}
+
+// Sync host-level skills — API endpoint (admin only).
+skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  if (authUser.role !== 'admin') {
+    return c.json({ error: 'Only admin can sync host skills' }, 403);
+  }
+
+  const result = await syncHostSkillsForUser(authUser.id);
+  return c.json(result);
 });
 
-skillsRoutes.post(
-  '/install',
-  authMiddleware,
-  async (c) => {
-    const authUser = c.get('user') as AuthUser;
-    const body = await c.req.json().catch(() => ({}));
+skillsRoutes.post('/install', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
 
-    if (typeof body.package !== 'string') {
-      return c.json({ error: 'package field must be string' }, 400);
-    }
+  if (typeof body.package !== 'string') {
+    return c.json({ error: 'package field must be string' }, 400);
+  }
 
-    const pkg = body.package.trim();
-    const result = await installSkillForUser(authUser.id, pkg);
+  const pkg = body.package.trim();
+  const result = await installSkillForUser(authUser.id, pkg);
 
-    if (!result.success) {
-      return c.json(
-        { error: 'Failed to install skill', details: result.error },
-        result.error === 'Invalid package name format' ? 400 : 500,
-      );
-    }
+  if (!result.success) {
+    return c.json(
+      { error: 'Failed to install skill', details: result.error },
+      result.error === 'Invalid package name format' ? 400 : 500,
+    );
+  }
 
-    return c.json({ success: true, installed: result.installed });
-  },
-);
+  return c.json({ success: true, installed: result.installed });
+});
 
 // Reinstall a skill by its ID — requires the skill to have a packageName in the manifest.
 skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
@@ -1022,16 +967,25 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
   const manifest = readSkillsManifest(authUser.id);
   const meta = manifest.skills[id];
   if (!meta?.packageName) {
-    return c.json({ error: 'Skill has no package info — cannot reinstall' }, 400);
+    return c.json(
+      { error: 'Skill has no package info — cannot reinstall' },
+      400,
+    );
   }
 
   // Delete then reinstall
   const deleteResult = deleteSkillForUser(authUser.id, id);
   if (!deleteResult.success) {
-    return c.json({ error: 'Failed to delete old skill', details: deleteResult.error }, 500);
+    return c.json(
+      { error: 'Failed to delete old skill', details: deleteResult.error },
+      500,
+    );
   }
 
-  const installResult = await installSkillForUser(authUser.id, meta.packageName);
+  const installResult = await installSkillForUser(
+    authUser.id,
+    meta.packageName,
+  );
   if (!installResult.success) {
     return c.json(
       { error: 'Failed to reinstall skill', details: installResult.error },
@@ -1042,5 +996,5 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
   return c.json({ success: true, installed: installResult.installed });
 });
 
-export { getUserSkillsDir, installSkillForUser, deleteSkillForUser };
+export { getUserSkillsDir, installSkillForUser, deleteSkillForUser, syncHostSkillsForUser };
 export default skillsRoutes;
