@@ -3,8 +3,11 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import './styles/globals.css';
 import { shouldUseHashRouter } from './utils/url';
+import { initNotificationSound } from './utils/sound';
 
+// Initialize notification sound (preload audio)
 if (typeof window !== 'undefined') {
+  initNotificationSound();
   window.__HAPPYCLAW_HASH_ROUTER__ = shouldUseHashRouter();
 
   // Prevent pinch-to-zoom on iOS (iOS 10+ ignores user-scalable=no)

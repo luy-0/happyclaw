@@ -1239,17 +1239,27 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string): string {
 
   const action = rawArgs.trim().toLowerCase();
   if (action === 'true') {
-    const updated: RegisteredGroup = { ...group, require_mention: true };
+    const updated: RegisteredGroup = {
+      ...group,
+      require_mention: true,
+      activation_mode: 'when_mentioned',
+    };
     setRegisteredGroup(chatJid, updated);
     registeredGroups[chatJid] = updated;
     return '已开启：群聊中需要 @机器人 才会响应';
   } else if (action === 'false') {
-    const updated: RegisteredGroup = { ...group, require_mention: false };
+    const updated: RegisteredGroup = {
+      ...group,
+      require_mention: false,
+      activation_mode: 'always',
+    };
     setRegisteredGroup(chatJid, updated);
     registeredGroups[chatJid] = updated;
     return '已关闭：群聊中所有消息都会响应，无需 @机器人';
   } else if (!action) {
-    const current = group.require_mention === true;
+    const current =
+      group.activation_mode === 'when_mentioned' ||
+      (group.activation_mode === 'auto' && group.require_mention === true);
     return `当前 require_mention: ${current}\n\n用法:\n/require_mention true — 需要 @机器人\n/require_mention false — 全量响应`;
   }
   return '用法: /require_mention true|false';
@@ -5746,10 +5756,11 @@ function buildOnNewChat(
       folder: homeFolder,
       added_at: new Date().toISOString(),
       created_by: userId,
+      require_mention: true, // IM 群聊默认需要 @机器人 才响应
     });
     logger.info(
       { chatJid, chatName, userId, homeFolder },
-      'Auto-registered IM chat',
+      'Auto-registered IM chat (require_mention=true)',
     );
   };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Loader2, Upload, Trash2, User, Bot, Lock, Palette, Sun, Moon, Monitor } from 'lucide-react';
+import { Loader2, Upload, Trash2, User, Bot, Lock, Palette, Sun, Moon, Monitor, Volume2 } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { useAuthStore } from '../../stores/auth';
@@ -7,9 +7,14 @@ import { useTheme, type Theme, type ColorScheme, type FontStyle } from '../../ho
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
 import { EmojiAvatar } from '@/components/common/EmojiAvatar';
 import { EmojiPicker } from '@/components/common/EmojiPicker';
 import { ColorPicker } from '@/components/common/ColorPicker';
+import {
+  isNotificationSoundEnabled,
+  setNotificationSoundEnabled,
+} from '../../utils/sound';
 import { getErrorMessage } from './types';
 import { SettingsCard as Section } from './SettingsCard';
 
@@ -76,6 +81,9 @@ export function ProfileSection() {
   const [aiAppearanceSaving, setAiAppearanceSaving] = useState(false);
   const [avatarUploading, setAvatarUploading] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+
+  // Preferences
+  const [soundEnabled, setSoundEnabled] = useState(() => isNotificationSoundEnabled());
 
   // Password
   const [currentPwd, setCurrentPwd] = useState('');
@@ -199,6 +207,11 @@ export function ProfileSection() {
     } catch (err) {
       toast.error(getErrorMessage(err, '移除头像失败'));
     }
+  };
+
+  const handleSoundToggle = (enabled: boolean) => {
+    setSoundEnabled(enabled);
+    setNotificationSoundEnabled(enabled);
   };
 
   return (
@@ -365,7 +378,22 @@ export function ProfileSection() {
         </Button>
       </Section>
 
-      {/* ── 4. Password ── */}
+      {/* ── 4. Preferences ── */}
+      <Section icon={Volume2} title="偏好设置">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-medium text-foreground">任务完成提示音</div>
+            <div className="text-xs text-muted-foreground mt-0.5">Agent 回复完成时播放提示音</div>
+          </div>
+          <Switch
+            checked={soundEnabled}
+            onCheckedChange={handleSoundToggle}
+            aria-label="任务完成提示音"
+          />
+        </div>
+      </Section>
+
+      {/* ── 5. Password ── */}
       <Section icon={Lock} title="修改密码">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
