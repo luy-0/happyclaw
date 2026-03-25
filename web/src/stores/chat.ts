@@ -1649,9 +1649,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
 
     // 播放提示音（仅在页面不可见且为 Agent 回复完成时）
-    const isAgentReply = msg.is_from_me && msg.sender !== '__system__' && source !== 'scheduled_task' && msg.source_kind !== 'sdk_send_message';
-    const shouldPlaySound = isAgentReply && !alreadyExists;
-    if (shouldPlaySound && typeof document !== 'undefined' && document.hidden) {
+    const isNewAgentReply = msg.is_from_me && msg.sender !== '__system__' && source !== 'scheduled_task' && msg.source_kind !== 'sdk_send_message';
+    if (isNewAgentReply && typeof document !== 'undefined' && document.hidden) {
       playNotificationSound();
     }
 
