@@ -18,6 +18,14 @@ if [ -f /workspace/env-dir/env ]; then
   set -a
   source /workspace/env-dir/env
   set +a
+  # Also write to node user's profile so that Bash tool (which spawns
+  # independent shell processes initialized from the user's profile)
+  # can access the same environment variables.
+  {
+    echo ''
+    echo '# HappyClaw injected environment variables'
+    echo 'if [ -f /workspace/env-dir/env ]; then set -a; source /workspace/env-dir/env; set +a; fi'
+  } >> /home/node/.bashrc
 fi
 
 # Discover and link skills (builtin → project → user, higher priority overwrites)
