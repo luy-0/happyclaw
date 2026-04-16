@@ -109,6 +109,11 @@ ARG CACHEBUST=1
 RUN npm install -g agent-browser
 RUN npm install
 
+# Install Tailscale (userspace networking for SSH to Mac)
+# Non-fatal: network issues may cause transient failures
+RUN curl -fsSL https://tailscale.com/install.sh | sh 2>&1 | tail -5 \
+    || echo "WARNING: Failed to install Tailscale, skipping"
+
 # Install feishu-cli (pre-compiled binary from GitHub Releases)
 # Non-fatal: GitHub API rate limits may cause transient failures
 ARG TARGETARCH

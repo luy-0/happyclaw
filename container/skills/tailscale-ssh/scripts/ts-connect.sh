@@ -19,20 +19,14 @@ fi
 ACTION="${1:-status}"
 shift 2>/dev/null || true
 
-# === 确保 tailscale 已安装 ===
+# === 确保 tailscale 已安装（镜像预装，此处仅做检查）===
 ensure_installed() {
+  export PATH="/usr/sbin:/usr/bin:$HOME/bin:$PATH"
   if command -v tailscale &>/dev/null; then
     return 0
   fi
-  echo "📦 安装 Tailscale..."
-  curl -fsSL https://tailscale.com/install.sh | sh 2>&1 | tail -5
-  # 刷新 PATH
-  export PATH="$HOME/bin:/usr/sbin:/usr/bin:$PATH"
-  if ! command -v tailscale &>/dev/null; then
-    echo "❌ Tailscale 安装失败"
-    exit 1
-  fi
-  echo "✅ Tailscale 已安装"
+  echo "❌ Tailscale 未安装。请重建容器镜像（make build-container）"
+  exit 1
 }
 
 # === 确保 tailscaled 运行中（仅容器模式）===
