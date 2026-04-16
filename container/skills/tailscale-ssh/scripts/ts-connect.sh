@@ -19,6 +19,17 @@ fi
 ACTION="${1:-status}"
 shift 2>/dev/null || true
 
+# === SSH 命令：容器用 tailscale ssh，宿主机用普通 ssh ===
+ssh_cmd() {
+  local user="$1" host="$2"
+  shift 2
+  if [ "$MODE" = "container" ]; then
+    $TS_CMD ssh "$user@$host" "$@"
+  else
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$user@$host" "$@"
+  fi
+}
+
 # === 确保 tailscale 已安装（镜像预装，此处仅做检查）===
 ensure_installed() {
   export PATH="/usr/sbin:/usr/bin:$HOME/bin:$PATH"
@@ -99,7 +110,7 @@ case "$ACTION" in
       exit 1
     fi
     echo "🖥️  在 Mac ($MAC_IP) 上执行: $CMD"
-    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "river@$MAC_IP" "$CMD"
+    ssh_cmd river "$MAC_IP" "$CMD"
     ;;
   screenshot)
     MAC_IP=$($TS_CMD status 2>&1 | grep -i "macos\|macbook\|river" | awk '{print $1}' | head -1)
@@ -109,8 +120,7 @@ case "$ACTION" in
     fi
     OUTFILE="${1:-/workspace/group/mac-screenshot.png}"
     echo "📸 截取 Mac 屏幕..."
-    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "river@$MAC_IP" "screencapture -x /tmp/screen.png"
-    scp -o StrictHostKeyChecking=no "river@$MAC_IP:/tmp/screen.png" "$OUTFILE"
+    ssh_cmd river "$MAC_IP" "screencapture -x /tmp/screen.png && cat /tmp/screen.png" > "$OUTFILE"
     echo "✅ 截图已保存: $OUTFILE"
     ;;
   *)
