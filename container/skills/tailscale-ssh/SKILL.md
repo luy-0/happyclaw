@@ -5,9 +5,16 @@
 触发词：连接 Mac、SSH 到 Mac、远程 Mac、tailscale、/tailscale-ssh。
 当用户需要"在 Mac 上执行命令"、"看 Mac 屏幕"、"操作 Mac"时也应触发此 Skill。
 
+## 前提条件（已满足）
+
+- **Tailscale 已预装在 Docker 镜像中**（`/usr/bin/tailscale`、`/usr/sbin/tailscaled`），无需安装
+- `tailscaled` 支持 userspace 模式，**不需要 root/sudo 权限**，node 用户可直接运行
+- 脚本自动处理 daemon 启动和状态持久化，无需手动干预
+
 ## 快速使用（容器内）
 
 辅助脚本位于 `/workspace/project-skills/tailscale-ssh/scripts/ts-connect.sh`，一键完成全流程。
+**直接执行即可，不要假设"无法启动"——所有依赖已预装。**
 
 ```bash
 TS="/workspace/project-skills/tailscale-ssh/scripts/ts-connect.sh"
