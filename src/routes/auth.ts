@@ -52,50 +52,15 @@ import {
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
 import { lastActiveCache, invalidateSessionCache, invalidateUserSessions } from '../web-context.js';
-import {
-  SESSION_COOKIE_NAME_SECURE,
-  SESSION_COOKIE_NAME_PLAIN,
-  TRUST_PROXY,
-} from '../config.js';
 import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
 
 // --- Helper Functions ---
 
-/** Detect if the current request arrived over HTTPS (direct or behind proxy) */
-function isSecureRequest(c: any): boolean {
-  if (TRUST_PROXY) {
-    const proto = c.req.header('x-forwarded-proto');
-    if (proto === 'https') return true;
-  }
-  // Hono / node-server: URL scheme
-  try {
-    const url = new URL(c.req.url, 'http://localhost');
-    if (url.protocol === 'https:') return true;
-  } catch {
-    /* ignore */
-  }
-  return false;
-}
-
-function getSessionCookieName(secure: boolean): string {
-  return secure ? SESSION_COOKIE_NAME_SECURE : SESSION_COOKIE_NAME_PLAIN;
-}
-
-export function setSessionCookie(c: any, token: string): string {
-  const secure = isSecureRequest(c);
-  const name = getSessionCookieName(secure);
-  const secureSuffix = secure ? '; Secure' : '';
-  return `${name}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 24 * 60 * 60}${secureSuffix}`;
-}
-
-export function clearSessionCookie(c: any): string {
-  const secure = isSecureRequest(c);
-  const name = getSessionCookieName(secure);
-  const secureSuffix = secure ? '; Secure' : '';
-  return `${name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureSuffix}`;
-}
+// Cookie helpers live in auth.ts (single source of truth, also used by middleware).
+import { setSessionCookie, clearSessionCookie } from '../auth.js';
+export { setSessionCookie, clearSessionCookie };
 
 export function isUsernameConflictError(err: unknown): boolean {
   return (
@@ -122,6 +87,7 @@ export function toUserPublic(u: User): UserPublic {
     ai_avatar_emoji: u.ai_avatar_emoji ?? null,
     ai_avatar_color: u.ai_avatar_color ?? null,
     ai_avatar_url: u.ai_avatar_url ?? null,
+    default_require_mention: u.default_require_mention,
     created_at: u.created_at,
     last_login_at: u.last_login_at,
     last_active_at: null,
@@ -166,17 +132,19 @@ authRoutes.get('/status', (c) => {
 // Public: initial admin setup (only when no users exist)
 authRoutes.post('/setup', async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const { username, password } = body as {
+  const { username: rawUsername, password } = body as {
     username?: string;
     password?: string;
   };
 
-  if (!username || !password) {
+  if (!rawUsername || !password) {
     return c.json({ error: 'Username and password are required' }, 400);
   }
 
-  const usernameError = validateUsername(username);
+  const usernameError = validateUsername(rawUsername);
   if (usernameError) return c.json({ error: usernameError }, 400);
+  // 归一化大小写（与 login / register 一致）。
+  const username = rawUsername.toLowerCase();
 
   const passwordError = validatePassword(password);
   if (passwordError) return c.json({ error: passwordError }, 400);
@@ -262,7 +230,9 @@ authRoutes.post('/login', async (c) => {
     return c.json({ error: 'Invalid credentials' }, 401);
   }
 
-  const { username, password } = validation.data;
+  // Username 归一化（与 register / setup / admin create 保持一致）。
+  const username = validation.data.username.toLowerCase();
+  const { password } = validation.data;
   const ip = getClientIp(c);
   const ua = c.req.header('user-agent') || null;
 
@@ -414,7 +384,11 @@ authRoutes.post('/register', async (c) => {
     );
   }
 
-  const { username, password, display_name, invite_code } = validation.data;
+  // Username 大小写归一化：避免 'admin' / 'Admin' / 'ADMIN' 是三个独立账号
+  // （审计 / 聊天 / 提及视觉混淆）。统一以小写存储，登录、查找、显示都按
+  // 小写比较。display_name 仍可保留用户的原始大小写偏好。
+  const username = validation.data.username.toLowerCase();
+  const { password, display_name, invite_code } = validation.data;
 
   // If invite code is required but not provided, reject
   if (regConfig.requireInviteCode && !invite_code) {
@@ -503,6 +477,10 @@ authRoutes.post('/register', async (c) => {
     user_agent: ua,
     details: { role: result.role, with_invite: withInvite },
   });
+  // 计入注册成功次数：registerLimit 仅记录失败时，攻击者可用同 IP 不停换合法
+  // username 无限创建账号（auto-create home group / IM channel 槽位 / 数据库
+  // 行）。把成功也计入同一个 bucket，让 maxLoginAttempts 同时约束失败 + 成功。
+  recordLoginAttempt(`register:${ip}`, ip);
 
   // Create home group for new user
   try {
@@ -567,6 +545,11 @@ authRoutes.get('/me', authMiddleware, (c) => {
   const userPublic = toUserPublic(fullUser);
   const appearance = getAppearanceConfig();
 
+  // Per-user identity must never be cached by intermediaries (proxies, CDNs)
+  // or browser HTTP cache.  PWA service worker explicitly opts in via its
+  // own cache strategy (NetworkFirst + auth-store delete on login/logout).
+  c.header('Cache-Control', 'private, no-store');
+
   // Admin users get setup status for the onboarding wizard
   if (fullUser.role === 'admin') {
     return c.json({
@@ -597,13 +580,15 @@ authRoutes.put('/profile', authMiddleware, async (c) => {
   if (validation.data.username !== undefined) {
     const usernameError = validateUsername(validation.data.username);
     if (usernameError) return c.json({ error: usernameError }, 400);
-    if (validation.data.username !== fullUser.username) {
-      const existed = getUserByUsername(validation.data.username);
+    // 大小写归一化（与 login / register / setup 一致）。
+    const newUsername = validation.data.username.toLowerCase();
+    if (newUsername !== fullUser.username) {
+      const existed = getUserByUsername(newUsername);
       if (existed && existed.id !== fullUser.id) {
         return c.json({ error: 'Username already taken' }, 409);
       }
     }
-    updates.username = validation.data.username;
+    updates.username = newUsername;
   }
   if (validation.data.display_name !== undefined) {
     updates.display_name = validation.data.display_name;
@@ -628,6 +613,9 @@ authRoutes.put('/profile', authMiddleware, async (c) => {
   }
   if (validation.data.ai_avatar_url !== undefined) {
     updates.ai_avatar_url = validation.data.ai_avatar_url;
+  }
+  if (validation.data.default_require_mention !== undefined) {
+    updates.default_require_mention = validation.data.default_require_mention;
   }
   if (Object.keys(updates).length === 0) {
     return c.json({ error: 'No fields to update' }, 400);
@@ -801,19 +789,24 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
 
   fs.mkdirSync(AVATARS_DIR, { recursive: true });
 
-  // Delete old avatar files for this user
-  try {
-    const existing = fs
-      .readdirSync(AVATARS_DIR)
-      .filter((f) => f.startsWith(`${user.id}-`));
-    for (const f of existing) {
-      fs.unlinkSync(path.join(AVATARS_DIR, f));
-    }
-  } catch {
-    /* ignore */
-  }
+  // user vs AI avatar are stored separately; use distinct filename prefixes so
+  // uploading one doesn't delete the other (which left the other field's
+  // DB url dangling → 404).
+  const target = c.req.query('target');
+  const field = target === 'user' ? 'avatar_url' : 'ai_avatar_url';
+  const prefix = target === 'user' ? `${user.id}-user-` : `${user.id}-ai-`;
 
-  const filename = `${user.id}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+  // The file the OTHER avatar field currently points at must be preserved when
+  // we reap stale files below — uploading the user avatar must not delete the
+  // AI avatar, and vice-versa.
+  const current = getUserById(user.id);
+  const otherUrl =
+    target === 'user' ? current?.ai_avatar_url : current?.avatar_url;
+  const otherFilename = otherUrl
+    ? otherUrl.replace(/^\/api\/auth\/avatars\//, '')
+    : null;
+
+  const filename = `${prefix}${crypto.randomBytes(4).toString('hex')}${ext}`;
   const filePath = path.join(AVATARS_DIR, filename);
   const buffer = Buffer.from(await file.arrayBuffer());
   const tmpPath = filePath + '.tmp';
@@ -822,9 +815,29 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
 
   const avatarUrl = `/api/auth/avatars/${filename}`;
 
-  // Update user profile — target=user stores as avatar_url, otherwise ai_avatar_url
-  const target = c.req.query('target');
-  const field = target === 'user' ? 'avatar_url' : 'ai_avatar_url';
+  // Reap this user's stale avatar files: same-target leftovers plus legacy
+  // `${user.id}-{hex}` files (uploaded before the user-/ai- split), EXCEPT the
+  // file we just wrote and the one the other avatar field still references.
+  // The other target's files are skipped STRUCTURALLY (by prefix), not just via
+  // otherFilename: a concurrent upload of the other avatar may have already
+  // written its file, and that file's DB url isn't visible here yet (we read
+  // otherFilename before the async body), so a prefix skip is what prevents
+  // reaping a concurrent upload out from under its own dangling url (→ 404).
+  try {
+    const keep = new Set(
+      [filename, otherFilename].filter((x): x is string => !!x),
+    );
+    const otherPrefix =
+      target === 'user' ? `${user.id}-ai-` : `${user.id}-user-`;
+    for (const f of fs.readdirSync(AVATARS_DIR)) {
+      if (!f.startsWith(`${user.id}-`) || keep.has(f)) continue;
+      if (f.startsWith(otherPrefix)) continue;
+      fs.unlinkSync(path.join(AVATARS_DIR, f));
+    }
+  } catch {
+    /* ignore */
+  }
+
   updateUserFields(user.id, { [field]: avatarUrl });
 
   const updated = getUserById(user.id)!;

@@ -3,16 +3,14 @@
  * enter the normal message pipeline.
  */
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 import {
   deleteSession,
   getJidsByFolder,
   storeMessageDirect,
   ensureChatExists,
 } from './db.js';
-import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import { clearSessionFiles } from './session-files.js';
 import type { NewMessage, MessageCursor } from './types.js';
 
 // ─── Types ──────────────────────────────────────────────────────
@@ -24,41 +22,30 @@ export interface CommandDeps {
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
 }
 
-// ─── Session file cleanup (mirrors groups.ts clearSessionJsonlFiles) ────
+// ─── Command parsing ────────────────────────────────────────────
 
-function clearSessionFiles(folder: string, agentId?: string): void {
-  const claudeDir = agentId
-    ? path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude')
-    : path.join(DATA_DIR, 'sessions', folder, '.claude');
-  if (!fs.existsSync(claudeDir)) return;
-
-  const keep = new Set(['settings.json']);
-  const entries = fs.readdirSync(claudeDir);
-  for (const entry of entries) {
-    if (keep.has(entry)) continue;
-    try {
-      fs.rmSync(path.join(claudeDir, entry), { recursive: true, force: true });
-    } catch (err) {
-      logger.warn(
-        { entry, folder, agentId, err },
-        'Failed to remove session file, skipping',
-      );
-    }
-  }
+export function isClearCommand(content: string): boolean {
+  return content.trim().toLowerCase() === '/clear';
 }
+
+export const SESSION_RESET_FAILURE_MESSAGE =
+  'system_error:清除上下文失败，请稍后重试';
 
 // ─── Core reset ─────────────────────────────────────────────────
 
 export async function executeSessionReset(
-  chatJid: string,
+  baseChatJid: string,
   folder: string,
   deps: CommandDeps,
   agentId?: string,
 ): Promise<void> {
+  const targetJid = agentId
+    ? `${baseChatJid}#agent:${agentId}`
+    : baseChatJid;
+
   if (agentId) {
     // Agent-specific reset: only stop the agent's virtual JID process
-    const virtualJid = `web:${folder}#agent:${agentId}`;
-    await deps.queue.stopGroup(virtualJid, { force: true });
+    await deps.queue.stopGroup(targetJid, { force: true });
   } else {
     // Main session reset: stop all processes for this folder
     const siblingJids = getJidsByFolder(folder);
@@ -77,7 +64,6 @@ export async function executeSessionReset(
   }
 
   // 4. Insert context_reset divider message into the correct JID
-  const targetJid = agentId ? `web:${folder}#agent:${agentId}` : chatJid;
   const dividerMessageId = crypto.randomUUID();
   const timestamp = new Date().toISOString();
   ensureChatExists(targetJid);
@@ -104,8 +90,7 @@ export async function executeSessionReset(
   // 5. Advance lastAgentTimestamp so old messages before the reset are not
   //    re-sent to the next fresh agent session.
   if (agentId) {
-    const virtualJid = `web:${folder}#agent:${agentId}`;
-    deps.setLastAgentTimestamp(virtualJid, { timestamp, id: dividerMessageId });
+    deps.setLastAgentTimestamp(targetJid, { timestamp, id: dividerMessageId });
   } else {
     const siblingJids = getJidsByFolder(folder);
     for (const siblingJid of siblingJids) {
@@ -116,5 +101,8 @@ export async function executeSessionReset(
     }
   }
 
-  logger.info({ chatJid, folder, agentId }, 'Session reset via /clear command');
+  logger.info(
+    { baseChatJid, targetJid, folder, agentId },
+    'Session reset via /clear command',
+  );
 }

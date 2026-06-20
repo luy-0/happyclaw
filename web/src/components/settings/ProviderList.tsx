@@ -13,9 +13,12 @@ import {
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import type { ProviderWithHealth, ProviderHealthStatus } from './types';
+import { UsageBars } from './UsageBars';
 
 interface ProviderListProps {
   providers: ProviderWithHealth[];
+  /** 当前负载均衡策略，决定权重徽标是否显示 */
+  balancingStrategy?: 'round-robin' | 'weighted-round-robin' | 'failover';
   onEdit: (provider: ProviderWithHealth) => void;
   onDelete: (provider: ProviderWithHealth) => void;
   onToggle: (provider: ProviderWithHealth) => void;
@@ -100,6 +103,7 @@ function CredentialBadges({ provider }: { provider: ProviderWithHealth }) {
 
 export function ProviderList({
   providers,
+  balancingStrategy,
   onEdit,
   onDelete,
   onToggle,
@@ -110,6 +114,7 @@ export function ProviderList({
   deletingId,
   disabled,
 }: ProviderListProps) {
+  const showWeight = balancingStrategy === 'weighted-round-robin';
   return (
     <div className="space-y-4">
       <div className="rounded-xl border border-border overflow-hidden">
@@ -154,6 +159,14 @@ export function ProviderList({
                       >
                         {provider.type === 'official' ? '官方' : '第三方'}
                       </span>
+                      {showWeight && (
+                        <span
+                          className="text-[11px] px-1.5 py-0.5 rounded shrink-0 bg-teal-100 dark:bg-teal-900/40 text-teal-700 dark:text-teal-300 font-mono"
+                          title="当前负载均衡策略为加权轮询，点击编辑可调整权重"
+                        >
+                          权重 {provider.weight}
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
@@ -257,6 +270,11 @@ export function ProviderList({
                       <Activity className="w-3 h-3 inline mr-0.5" />
                       {health.activeSessionCount} 活跃会话
                     </div>
+                  )}
+
+                  {/* OAuth 用量 */}
+                  {provider.hasClaudeOAuthCredentials && (
+                    <UsageBars providerId={provider.id} />
                   )}
                 </div>
               );

@@ -10,7 +10,8 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
-import { getSystemSettings, saveSystemSettings, type SystemSettings } from '../runtime-config.js';
+import { getEffectiveExternalDir } from '../runtime-config.js';
+import { validateSafeHttpsUrl } from '../url-safety.js';
 import {
   parseFrontmatter,
   validateSkillId,
@@ -30,9 +31,8 @@ interface Skill {
   id: string;
   name: string;
   description: string;
-  source: 'user' | 'project';
+  source: 'user' | 'project' | 'external';
   enabled: boolean;
-  syncedFromHost?: boolean;
   packageName?: string;
   installedAt?: string;
   userInvocable: boolean;
@@ -44,11 +44,6 @@ interface Skill {
 
 interface SkillDetail extends Skill {
   content: string;
-}
-
-interface HostSyncManifest {
-  syncedSkills: string[];
-  lastSyncAt: string;
 }
 
 interface SkillsManifest {
@@ -77,34 +72,8 @@ function getUserSkillsDir(userId: string): string {
   return path.join(DATA_DIR, 'skills', userId);
 }
 
-function getGlobalSkillsDir(): string {
-  return path.join(os.homedir(), '.claude', 'skills');
-}
-
 function getProjectSkillsDir(): string {
   return path.resolve(process.cwd(), 'container', 'skills');
-}
-
-function getHostSyncManifestPath(userId: string): string {
-  return path.join(DATA_DIR, 'skills', userId, '.host-sync.json');
-}
-
-function readHostSyncManifest(userId: string): HostSyncManifest {
-  try {
-    const data = fs.readFileSync(getHostSyncManifestPath(userId), 'utf-8');
-    return JSON.parse(data);
-  } catch {
-    return { syncedSkills: [], lastSyncAt: '' };
-  }
-}
-
-function writeHostSyncManifest(
-  userId: string,
-  manifest: HostSyncManifest,
-): void {
-  const manifestPath = getHostSyncManifestPath(userId);
-  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 }
 
 function getSkillsManifestPath(userId: string): string {
@@ -165,21 +134,27 @@ function scanDirectory(rootDir: string, source: 'user' | 'project'): Skill[] {
   return scanSkillDirectory(rootDir, source) as Skill[];
 }
 
-function discoverSkills(userId: string): Skill[] {
+function discoverSkills(userId: string, userRole?: string): Skill[] {
   const userSkills = scanDirectory(getUserSkillsDir(userId), 'user');
   const projectSkills = scanDirectory(getProjectSkillsDir(), 'project');
 
-  // 读取 host sync manifest 标记同步来源
-  const hostManifest = readHostSyncManifest(userId);
-  const syncedSet = new Set(hostManifest.syncedSkills);
+  // 宿主机 ~/.claude/skills（仅 admin 可见）
+  const externalSkills: Skill[] = [];
+  if (userRole === 'admin') {
+    const extSkillsDir = path.join(getEffectiveExternalDir(), 'skills');
+    if (fs.existsSync(extSkillsDir)) {
+      const scanned = scanDirectory(extSkillsDir, 'project');
+      for (const s of scanned) {
+        (s as any).source = 'external';
+      }
+      externalSkills.push(...scanned);
+    }
+  }
 
   // 读取 skills manifest 补充安装元数据
   const skillsManifest = readSkillsManifest(userId);
 
   for (const skill of userSkills) {
-    if (syncedSet.has(skill.id)) {
-      skill.syncedFromHost = true;
-    }
     const meta = skillsManifest.skills[skill.id];
     if (meta) {
       skill.packageName = meta.packageName;
@@ -187,19 +162,32 @@ function discoverSkills(userId: string): Skill[] {
     }
   }
 
-  return [...userSkills, ...projectSkills];
+  // 按优先级去重（user > project > external），同 ID 高优先级覆盖低优先级
+  const seen = new Set<string>();
+  const result: Skill[] = [];
+  for (const skill of [...userSkills, ...projectSkills, ...externalSkills]) {
+    if (!seen.has(skill.id)) {
+      seen.add(skill.id);
+      result.push(skill);
+    }
+  }
+  return result;
 }
 
-function getSkillDetail(skillId: string, userId: string): SkillDetail | null {
+function getSkillDetail(skillId: string, userId: string, userRole?: string): SkillDetail | null {
   if (!validateSkillId(skillId)) return null;
 
-  const searchDirs: Array<{ rootDir: string; source: 'user' | 'project' }> = [
+  const searchDirs: Array<{ rootDir: string; source: 'user' | 'project' | 'external' }> = [
     { rootDir: getUserSkillsDir(userId), source: 'user' },
     { rootDir: getProjectSkillsDir(), source: 'project' },
   ];
+  if (userRole === 'admin') {
+    const extSkillsDir = path.join(getEffectiveExternalDir(), 'skills');
+    if (fs.existsSync(extSkillsDir)) {
+      searchDirs.push({ rootDir: extSkillsDir, source: 'external' });
+    }
+  }
 
-  const hostManifest = readHostSyncManifest(userId);
-  const syncedSet = new Set(hostManifest.syncedSkills);
   const skillsManifest = readSkillsManifest(userId);
 
   for (const { rootDir, source } of searchDirs) {
@@ -249,9 +237,6 @@ function getSkillDetail(skillId: string, userId: string): SkillDetail | null {
       };
 
       if (source === 'user') {
-        if (syncedSet.has(skillId)) {
-          detail.syncedFromHost = true;
-        }
         const meta = skillsManifest.skills[skillId];
         if (meta) {
           detail.packageName = meta.packageName;
@@ -524,7 +509,7 @@ async function withSkillInstallLock<T>(fn: () => Promise<T>): Promise<T> {
 
 skillsRoutes.get('/', authMiddleware, (c) => {
   const authUser = c.get('user') as AuthUser;
-  const skills = discoverSkills(authUser.id);
+  const skills = discoverSkills(authUser.id, authUser.role);
   return c.json({ skills });
 });
 
@@ -603,44 +588,11 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
   return c.json({ detail: null });
 });
 
-// Get sync status (last sync time + auto-sync config)
-skillsRoutes.get('/sync-status', authMiddleware, (c) => {
-  const authUser = c.get('user') as AuthUser;
-  const manifest = readHostSyncManifest(authUser.id);
-  const settings = getSystemSettings();
-  return c.json({
-    lastSyncAt: manifest.lastSyncAt || null,
-    syncedCount: manifest.syncedSkills.length,
-    autoSyncEnabled: settings.skillAutoSyncEnabled,
-    autoSyncIntervalMinutes: settings.skillAutoSyncIntervalMinutes,
-  });
-});
-
-// Toggle auto-sync on/off (admin only)
-skillsRoutes.put('/sync-settings', authMiddleware, async (c) => {
-  const authUser = c.get('user') as AuthUser;
-  if (authUser.role !== 'admin') {
-    return c.json({ error: 'Only admin can change sync settings' }, 403);
-  }
-  const body = await c.req.json().catch(() => ({}));
-  const updates: Partial<SystemSettings> = {};
-  if (typeof body.autoSyncEnabled === 'boolean') {
-    updates.skillAutoSyncEnabled = body.autoSyncEnabled;
-  }
-  if (typeof body.autoSyncIntervalMinutes === 'number' && body.autoSyncIntervalMinutes >= 1) {
-    updates.skillAutoSyncIntervalMinutes = body.autoSyncIntervalMinutes;
-  }
-  const saved = saveSystemSettings(updates);
-  return c.json({
-    autoSyncEnabled: saved.skillAutoSyncEnabled,
-    autoSyncIntervalMinutes: saved.skillAutoSyncIntervalMinutes,
-  });
-});
 
 skillsRoutes.get('/:id', authMiddleware, (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
-  const skill = getSkillDetail(id, authUser.id);
+  const skill = getSkillDetail(id, authUser.id, authUser.role);
 
   if (!skill) {
     return c.json({ error: 'Skill not found' }, 404);
@@ -654,7 +606,13 @@ skillsRoutes.get('/:id', authMiddleware, (c) => {
 skillsRoutes.patch('/:id', authMiddleware, async (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
-  const { enabled } = await c.req.json<{ enabled: boolean }>();
+  // 防 invalid JSON 把 hono 默认错误处理器返回 500 + 暴露栈。Catch 后单独
+  // 校验 enabled 是 boolean。
+  const body = (await c.req.json().catch(() => ({}))) as { enabled?: unknown };
+  if (typeof body.enabled !== 'boolean') {
+    return c.json({ error: 'enabled must be a boolean' }, 400);
+  }
+  const enabled = body.enabled;
 
   if (!validateSkillId(id)) return c.json({ error: 'Invalid skill ID' }, 400);
 
@@ -729,6 +687,28 @@ function deleteSkillForUser(
   }
 }
 
+// 批量删除所有用户级技能（清理旧的同步副本）
+skillsRoutes.delete('/user-all', authMiddleware, (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const userDir = getUserSkillsDir(authUser.id);
+  let deleted = 0;
+  try {
+    if (fs.existsSync(userDir)) {
+      for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.')) continue;
+        const p = path.join(userDir, entry.name);
+        try {
+          fs.rmSync(p, { recursive: true, force: true });
+          deleted++;
+        } catch { /* ignore */ }
+      }
+    }
+  } catch {
+    return c.json({ error: 'Failed to delete user skills' }, 500);
+  }
+  return c.json({ success: true, deleted });
+});
+
 skillsRoutes.delete('/:id', authMiddleware, async (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
@@ -758,11 +738,18 @@ async function installSkillForUser(
   userId: string,
   pkg: string,
 ): Promise<{ success: boolean; installed?: string[]; error?: string }> {
-  if (
-    !/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg) &&
-    !/^https?:\/\//.test(pkg)
-  ) {
+  const isNpmName = /^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg);
+  const isUrl = /^https?:\/\//.test(pkg);
+  if (!isNpmName && !isUrl) {
     return { success: false, error: 'Invalid package name format' };
+  }
+  // SSRF 防护：URL 形式的 skill package 必须是 HTTPS + 非内网 hostname。
+  // 仅以 npm `<scope>/<name>` 形式不需要这层校验（npm 注册中心走 npx 自带管线）。
+  if (isUrl) {
+    const reason = validateSafeHttpsUrl(pkg);
+    if (reason) {
+      return { success: false, error: `Refused skill URL: ${reason}` };
+    }
   }
 
   // Create an isolated temp directory to act as HOME so `--global` installs
@@ -837,103 +824,6 @@ async function installSkillForUser(
  * Sync host-level skills (~/.claude/skills/) to a user's directory.
  * Standalone function usable from both the API route and the auto-sync timer.
  */
-async function syncHostSkillsForUser(
-  userId: string,
-): Promise<{ stats: { added: number; updated: number; deleted: number; skipped: number }; total: number }> {
-  return withSkillInstallLock(async () => {
-    const hostDir = getGlobalSkillsDir();
-    const userDir = getUserSkillsDir(userId);
-    fs.mkdirSync(userDir, { recursive: true });
-
-    // 1. 扫描宿主机 skills
-    const hostSkillNames: string[] = [];
-    if (fs.existsSync(hostDir)) {
-      for (const entry of fs.readdirSync(hostDir, { withFileTypes: true })) {
-        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-        const skillDir = path.join(hostDir, entry.name);
-        try {
-          const realPath = fs.realpathSync(skillDir);
-          if (
-            fs.existsSync(path.join(realPath, 'SKILL.md')) ||
-            fs.existsSync(path.join(realPath, 'SKILL.md.disabled'))
-          ) {
-            hostSkillNames.push(entry.name);
-          }
-        } catch {
-          // 跳过 broken symlinks
-        }
-      }
-    }
-
-    // 2. 读取 manifest
-    const manifest = readHostSyncManifest(userId);
-    const previouslySynced = new Set(manifest.syncedSkills);
-
-    // 3. 检测用户目录中手动安装的 skills
-    const existingUserSkills = new Set<string>();
-    if (fs.existsSync(userDir)) {
-      for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
-        if (entry.isDirectory()) existingUserSkills.add(entry.name);
-      }
-    }
-
-    const stats = { added: 0, updated: 0, deleted: 0, skipped: 0 };
-    const newSyncedList: string[] = [];
-
-    // 4. 同步：新增/更新
-    for (const name of hostSkillNames) {
-      const isManuallyInstalled =
-        existingUserSkills.has(name) && !previouslySynced.has(name);
-      if (isManuallyInstalled) {
-        stats.skipped++;
-        continue;
-      }
-
-      const src = path.join(hostDir, name);
-      const dest = path.join(userDir, name);
-
-      if (existingUserSkills.has(name)) {
-        fs.rmSync(dest, { recursive: true, force: true });
-        copySkillToUser(src, dest);
-        stats.updated++;
-      } else {
-        copySkillToUser(src, dest);
-        stats.added++;
-      }
-      newSyncedList.push(name);
-    }
-
-    // 5. 删除宿主机已移除的（仅清理之前同步来的）
-    const hostSkillSet = new Set(hostSkillNames);
-    for (const name of previouslySynced) {
-      if (!hostSkillSet.has(name) && existingUserSkills.has(name)) {
-        const dest = path.join(userDir, name);
-        fs.rmSync(dest, { recursive: true, force: true });
-        stats.deleted++;
-      }
-    }
-
-    // 6. 更新 manifest
-    writeHostSyncManifest(userId, {
-      syncedSkills: newSyncedList,
-      lastSyncAt: new Date().toISOString(),
-    });
-
-    return { stats, total: hostSkillNames.length };
-  });
-}
-
-// Sync host-level skills — API endpoint (admin only).
-skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
-  const authUser = c.get('user') as AuthUser;
-  if (authUser.role !== 'admin') {
-    return c.json({ error: 'Only admin can sync host skills' }, 403);
-  }
-
-  const result = await syncHostSkillsForUser(authUser.id);
-  return c.json(result);
-});
-
 skillsRoutes.post('/install', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const body = await c.req.json().catch(() => ({}));
@@ -973,11 +863,76 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     );
   }
 
-  // Delete then reinstall
-  const deleteResult = deleteSkillForUser(authUser.id, id);
-  if (!deleteResult.success) {
+  // A package can install MULTIPLE sibling skills, and installSkillForUser
+  // rewrites EVERY skill dir the package ships (it rm's each destination before
+  // copying). Backing up only `id` would let a failed reinstall permanently
+  // destroy the live siblings it deleted. So back up every skill that shares
+  // this packageName (including `id`) and restore them all on failure.
+  const userDir = getUserSkillsDir(authUser.id);
+  const siblingIds = Object.keys(manifest.skills).filter(
+    (sid) => manifest.skills[sid]?.packageName === meta.packageName,
+  );
+  if (!siblingIds.includes(id)) siblingIds.push(id);
+
+  for (const sid of siblingIds) {
+    if (!validateSkillPath(userDir, path.join(userDir, sid))) {
+      return c.json({ error: 'Invalid skill path' }, 400);
+    }
+  }
+
+  type SkillBackup = {
+    sid: string;
+    dir: string;
+    // null when the sibling had a manifest entry but no on-disk dir (desync):
+    // there is nothing to rename back, only the manifest entry to restore.
+    backupDir: string | null;
+    meta: SkillsManifest['skills'][string];
+  };
+  const backups: SkillBackup[] = [];
+  // Restore every backed-up sibling (dir + manifest entry). Best-effort: a
+  // failure here leaves the *.reinstall-bak dir on disk for manual recovery.
+  const restoreBackups = (): void => {
+    for (const b of backups) {
+      try {
+        if (b.backupDir) {
+          fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
+          fs.renameSync(b.backupDir, b.dir);
+        }
+        const m = readSkillsManifest(authUser.id);
+        m.skills[b.sid] = b.meta;
+        writeSkillsManifest(authUser.id, m);
+      } catch {
+        /* best-effort rollback */
+      }
+    }
+  };
+
+  // Back up each sibling dir (rename, don't delete) so a failed reinstall can
+  // roll back instead of permanently destroying the user's skills. The manifest
+  // entry is recorded for backup whenever it exists — even if its dir is already
+  // missing (manifest/dir desync) — so removeFromSkillsManifest below is always
+  // recoverable on a failed reinstall.
+  try {
+    for (const sid of siblingIds) {
+      const entry = manifest.skills[sid];
+      const dir = path.join(userDir, sid);
+      const backupDir = `${dir}.reinstall-bak`;
+      let savedBackupDir: string | null = null;
+      if (fs.existsSync(dir)) {
+        fs.rmSync(backupDir, { recursive: true, force: true }); // clear stale backup
+        fs.renameSync(dir, backupDir);
+        savedBackupDir = backupDir;
+      }
+      if (entry) backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
+      removeFromSkillsManifest(authUser.id, sid);
+    }
+  } catch (err) {
+    restoreBackups();
     return c.json(
-      { error: 'Failed to delete old skill', details: deleteResult.error },
+      {
+        error: 'Failed to back up old skill',
+        details: err instanceof Error ? err.message : 'Unknown error',
+      },
       500,
     );
   }
@@ -987,14 +942,27 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     meta.packageName,
   );
   if (!installResult.success) {
+    // Roll back: restoreBackups removes any partial install dirs and restores
+    // every sibling so nothing is lost.
+    restoreBackups();
     return c.json(
       { error: 'Failed to reinstall skill', details: installResult.error },
       500,
     );
   }
 
+  // Success — drop all backups (skip entries that had no on-disk dir to back up).
+  for (const b of backups) {
+    if (!b.backupDir) continue;
+    try {
+      fs.rmSync(b.backupDir, { recursive: true, force: true });
+    } catch {
+      /* leftover backup is harmless */
+    }
+  }
+
   return c.json({ success: true, installed: installResult.installed });
 });
 
-export { getUserSkillsDir, installSkillForUser, deleteSkillForUser, syncHostSkillsForUser };
+export { getUserSkillsDir, installSkillForUser, deleteSkillForUser };
 export default skillsRoutes;

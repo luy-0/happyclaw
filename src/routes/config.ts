@@ -7,14 +7,18 @@ import QRCode from 'qrcode';
 import { Hono } from 'hono';
 import { updateWeChatNoProxy } from '../config.js';
 import type { Variables } from '../web-context.js';
-import { canAccessGroup, getWebDeps } from '../web-context.js';
+import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
 import { getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
   getRegisteredGroup,
   setRegisteredGroup,
+  updateChatName,
   getAgent,
+  clearSenderAllowlist,
+  deleteSessionsByProviderId,
+  VALID_ACTIVATION_MODES,
 } from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
 import {
@@ -24,6 +28,8 @@ import {
   QQConfigSchema,
   WeChatConfigSchema,
   DingTalkConfigSchema,
+  DiscordConfigSchema,
+  WhatsAppConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
   SystemSettingsSchema,
@@ -60,6 +66,7 @@ import {
   getAppearanceConfig,
   saveAppearanceConfig,
   getSystemSettings,
+  getEffectiveExternalDir,
   saveSystemSettings,
   getUserFeishuConfig,
   saveUserFeishuConfig,
@@ -71,9 +78,20 @@ import {
   saveUserWeChatConfig,
   getUserDingTalkConfig,
   saveUserDingTalkConfig,
+  getUserDiscordConfig,
+  saveUserDiscordConfig,
+  getUserWhatsAppConfig,
+  saveUserWhatsAppConfig,
   updateAllSessionCredentials,
+  appendImConfigAudit,
 } from '../runtime-config.js';
-import type { ClaudeOAuthCredentials } from '../runtime-config.js';
+import type {
+  ClaudeOAuthCredentials,
+  CachedOAuthUsage,
+  OAuthUsageResponse,
+  OAuthUsageBucket,
+} from '../runtime-config.js';
+import { parseOAuthUsageBucket } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
@@ -83,6 +101,8 @@ import {
   clearBillingEnabledCache,
 } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
+import fs from 'fs';
+import path from 'path';
 
 const configRoutes = new Hono<{ Variables: Variables }>();
 
@@ -92,7 +112,14 @@ const configRoutes = new Hono<{ Variables: Variables }>();
  */
 function countOtherEnabledImChannels(
   userId: string,
-  excludeChannel: 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk',
+  excludeChannel:
+    | 'feishu'
+    | 'telegram'
+    | 'qq'
+    | 'wechat'
+    | 'dingtalk'
+    | 'discord'
+    | 'whatsapp',
 ): number {
   let count = 0;
   if (excludeChannel !== 'feishu' && getUserFeishuConfig(userId)?.enabled)
@@ -103,6 +130,10 @@ function countOtherEnabledImChannels(
     count++;
   if (excludeChannel !== 'qq' && getUserQQConfig(userId)?.enabled) count++;
   if (excludeChannel !== 'dingtalk' && getUserDingTalkConfig(userId)?.enabled)
+    count++;
+  if (excludeChannel !== 'discord' && getUserDiscordConfig(userId)?.enabled)
+    count++;
+  if (excludeChannel !== 'whatsapp' && getUserWhatsAppConfig(userId)?.enabled)
     count++;
   return count;
 }
@@ -131,12 +162,23 @@ interface ClaudeApplyResultPayload {
   success: boolean;
   stoppedCount: number;
   failedCount: number;
+  clearedSessionsCount?: number;
   error?: string;
+}
+
+interface ApplyOptions {
+  /**
+   * If set, drop only sticky session bindings that point to this provider —
+   * preserves bindings to unrelated providers. Used when a provider's
+   * protocol-level fields (anthropicBaseUrl / anthropicModel) change.
+   */
+  clearSessionsForProviderId?: string;
 }
 
 async function applyClaudeConfigToAllGroups(
   actor: string,
   metadata?: Record<string, unknown>,
+  options?: ApplyOptions,
 ): Promise<ClaudeApplyResultPayload> {
   if (!deps) {
     throw new Error('Server not initialized');
@@ -149,9 +191,24 @@ async function applyClaudeConfigToAllGroups(
   const failedCount = results.filter((r) => r.status === 'rejected').length;
   const stoppedCount = groupJids.length - failedCount;
 
+  // Narrowed session cleanup: only drop sticky bindings for the provider whose
+  // protocol-level fields actually changed. Bindings to other providers stay
+  // intact so a routine update doesn't reset the entire pool. See issue #476.
+  let clearedSessionsCount: number | undefined;
+  if (options?.clearSessionsForProviderId) {
+    const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
+      options.clearSessionsForProviderId,
+    );
+    clearedSessionsCount = deletedCount;
+    for (const folder of affectedFolders) {
+      delete deps.sessions[folder];
+    }
+  }
+
   appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
     stoppedCount,
     failedCount,
+    ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
     ...(metadata || {}),
   });
 
@@ -160,6 +217,7 @@ async function applyClaudeConfigToAllGroups(
       success: false,
       stoppedCount,
       failedCount,
+      ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
       error: `${failedCount} container(s) failed to stop`,
     };
   }
@@ -168,6 +226,7 @@ async function applyClaudeConfigToAllGroups(
     success: true,
     stoppedCount,
     failedCount: 0,
+    ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
   };
 }
 
@@ -194,6 +253,83 @@ setInterval(() => {
     if (flow.expiresAt < now) oauthFlows.delete(key);
   }
 }, 60_000);
+
+// --- OAuth Usage Cache ---
+
+const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const usageCache = new Map<string, CachedOAuthUsage>();
+const inFlightUsageRequests = new Map<string, Promise<CachedOAuthUsage>>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of usageCache) {
+    if (now - entry.fetchedAt >= USAGE_CACHE_TTL_MS) {
+      usageCache.delete(key);
+    }
+  }
+}, 5 * 60_000);
+
+async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
+  const cached = usageCache.get(providerId);
+  if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  // Deduplicate concurrent requests for the same provider
+  const inFlight = inFlightUsageRequests.get(providerId);
+  if (inFlight) return inFlight;
+
+  const providers = getProviders();
+  const provider = providers.find((p) => p.id === providerId);
+  if (!provider) {
+    throw new Error('Provider not found');
+  }
+  if (!provider.claudeOAuthCredentials) {
+    throw new Error('Provider has no OAuth credentials');
+  }
+
+  const requestPromise = (async () => {
+    try {
+      const resp = await fetch(OAUTH_USAGE_API, {
+        headers: {
+          Authorization: `Bearer ${provider.claudeOAuthCredentials!.accessToken}`,
+          'anthropic-beta': 'oauth-2025-04-20',
+        },
+      });
+
+      if (!resp.ok) {
+        // Return stale cache if available, otherwise throw
+        if (cached) {
+          const stale: CachedOAuthUsage = {
+            ...cached,
+            error: `HTTP ${resp.status}`,
+          };
+          usageCache.set(providerId, stale);
+          return stale;
+        }
+        throw new Error(`Usage API returned ${resp.status}`);
+      }
+
+      const raw = (await resp.json()) as Record<string, unknown>;
+      const data: OAuthUsageResponse = {
+        five_hour: parseOAuthUsageBucket(raw.five_hour),
+        seven_day: parseOAuthUsageBucket(raw.seven_day),
+        seven_day_opus: parseOAuthUsageBucket(raw.seven_day_opus),
+        seven_day_sonnet: parseOAuthUsageBucket(raw.seven_day_sonnet),
+      };
+
+      const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
+      usageCache.set(providerId, result);
+      return result;
+    } finally {
+      inFlightUsageRequests.delete(providerId);
+    }
+  })();
+
+  inFlightUsageRequests.set(providerId, requestPromise);
+  return requestPromise;
+}
 
 // --- Routes ---
 
@@ -290,22 +426,43 @@ configRoutes.patch(
     const actor = (c.get('user') as AuthUser).username;
 
     try {
+      const previous = getProviders().find((p) => p.id === id);
       const updated = updateProvider(id, validation.data);
       const changedFields = Object.keys(validation.data).map(
         (k) => `${k}:updated`,
       );
+      // Protocol-level fields are the ones that, if changed, can break
+      // resumption of an existing Claude session (different model framing /
+      // different signing authority for thinking blocks). Other fields
+      // (name, weight, customEnv) only affect routing or environment and are
+      // safe to apply mid-session.
+      const protocolFieldChanged = !!(
+        previous &&
+        ((validation.data.anthropicBaseUrl !== undefined &&
+          validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl) ||
+          (validation.data.anthropicModel !== undefined &&
+            validation.data.anthropicModel !== previous.anthropicModel))
+      );
       appendClaudeConfigAudit(actor, 'update_provider', [
         `id:${id}`,
         ...changedFields,
+        ...(protocolFieldChanged ? ['protocolFieldChanged'] : []),
       ]);
 
       // If this provider is enabled, apply to running containers
       let applied: ClaudeApplyResultPayload | null = null;
       if (updated.enabled) {
-        applied = await applyClaudeConfigToAllGroups(actor, {
-          trigger: 'provider_update',
-          providerId: id,
-        });
+        applied = await applyClaudeConfigToAllGroups(
+          actor,
+          {
+            trigger: 'provider_update',
+            providerId: id,
+            protocolFieldChanged,
+          },
+          protocolFieldChanged
+            ? { clearSessionsForProviderId: id }
+            : undefined,
+        );
       }
 
       return c.json({
@@ -472,6 +629,24 @@ configRoutes.get(
     const balancing = getBalancingConfig();
     providerPool.refreshFromConfig(enabledProviders, balancing);
     return c.json({ statuses: providerPool.getHealthStatuses() });
+  },
+);
+
+// ─── GET /claude/providers/:id/usage — OAuth 用量数据 ─────
+configRoutes.get(
+  '/claude/providers/:id/usage',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    try {
+      const usage = await fetchOAuthUsage(id);
+      return c.json(usage);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      logger.warn({ err, providerId: id }, 'Failed to fetch OAuth usage');
+      return c.json({ error: msg }, 400);
+    }
   },
 );
 
@@ -1101,6 +1276,22 @@ configRoutes.put(
       );
     }
 
+    // 启用「禁用 HappyClaw 记忆层」开关前必须给 admin 主容器配 customCwd，
+    // 否则 CLAUDE_CONFIG_DIR 仍指向 data/sessions/main/.claude，SDK 读不到 ~/.claude/
+    // 又没有 HappyClaw 记忆层注入，agent 会变成空白沙箱。
+    if (validation.data.disableMemoryLayerForAdminHost === true) {
+      const adminMain = getRegisteredGroup('web:main');
+      if (!adminMain || !adminMain.customCwd) {
+        return c.json(
+          {
+            error:
+              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则 SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，会是空白沙箱。',
+          },
+          400,
+        );
+      }
+    }
+
     try {
       const saved = saveSystemSettings(validation.data);
       clearBillingEnabledCache();
@@ -1114,6 +1305,73 @@ configRoutes.put(
   },
 );
 
+// ─── External Claude resources (admin only) ─────────────────────────
+
+configRoutes.get('/external-resources', authMiddleware, systemConfigMiddleware, (c) => {
+  // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
+  const user = c.get('user') as AuthUser;
+  if (user.role !== 'admin') {
+    return c.json({ dir: '', rules: [], claudeMd: null });
+  }
+  const effectiveDir = getEffectiveExternalDir();
+
+  const result: {
+    dir: string;
+    rules: Array<{ name: string; size: number }>;
+    claudeMd: string | null;
+  } = { dir: effectiveDir, rules: [], claudeMd: null };
+
+  // Rules
+  const rulesDir = path.join(effectiveDir, 'rules');
+  try {
+    if (fs.existsSync(rulesDir)) {
+      for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+        try {
+          const st = fs.statSync(path.join(rulesDir, entry.name));
+          result.rules.push({ name: entry.name, size: st.size });
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // CLAUDE.md
+  const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
+  try {
+    if (fs.existsSync(claudeMdPath)) {
+      const content = fs.readFileSync(claudeMdPath, 'utf-8');
+      result.claudeMd = content.length > 10000 ? content.slice(0, 10000) + '\n...(截断)' : content;
+    }
+  } catch { /* ignore */ }
+
+  return c.json(result);
+});
+
+// Read a single rule file content (admin only)
+configRoutes.get('/external-resources/rule', authMiddleware, systemConfigMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  if (user.role !== 'admin') {
+    return c.text('Forbidden', 403);
+  }
+  const name = c.req.query('name');
+  if (!name || name.includes('/') || name.includes('..')) {
+    return c.text('Invalid name', 400);
+  }
+  const effectiveDir = getEffectiveExternalDir();
+  const filePath = path.join(effectiveDir, 'rules', name);
+  try {
+    const resolved = fs.realpathSync(filePath);
+    // 确保解析后的路径仍在 rules 目录内
+    if (!resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))) {
+      return c.text('Forbidden', 403);
+    }
+    const content = fs.readFileSync(resolved, 'utf-8');
+    return c.text(content);
+  } catch {
+    return c.text('Not found', 404);
+  }
+});
+
 // ─── Per-user IM connection status ──────────────────────────────────
 
 configRoutes.get('/user-im/status', authMiddleware, (c) => {
@@ -1124,6 +1382,7 @@ configRoutes.get('/user-im/status', authMiddleware, (c) => {
     qq: deps?.isUserQQConnected?.(user.id) ?? false,
     wechat: deps?.isUserWeChatConnected?.(user.id) ?? false,
     dingtalk: deps?.isUserDingTalkConnected?.(user.id) ?? false,
+    discord: deps?.isUserDiscordConnected?.(user.id) ?? false,
   });
 });
 
@@ -1142,11 +1401,13 @@ configRoutes.get('/user-im/feishu', authMiddleware, (c) => {
         enabled: false,
         updatedAt: null,
         connected,
+        autoIsolateContext: false,
       });
     }
     return c.json({
       ...toPublicFeishuProviderConfig(config, 'runtime'),
       connected,
+      autoIsolateContext: config.autoIsolateContext ?? false,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load user Feishu config');
@@ -1181,11 +1442,16 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
   }
 
   const current = getUserFeishuConfig(user.id);
-  const next = {
+  const next: Record<string, unknown> = {
     appId: current?.appId || '',
     appSecret: current?.appSecret || '',
     enabled: current?.enabled ?? true,
     updatedAt: current?.updatedAt || null,
+    autoIsolateContext: current?.autoIsolateContext ?? false,
+    // Preserve the auto-learned owner open_id — saveUserFeishuConfig does a full
+    // rewrite, so omitting it here would wipe the owner_mentioned activation and
+    // sender_allowlist seed on every settings save.
+    ownerOpenId: current?.ownerOpenId,
   };
   if (typeof validation.data.appId === 'string') {
     const appId = validation.data.appId.trim();
@@ -1203,13 +1469,32 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
     // First-time config with credentials should connect immediately.
     next.enabled = true;
   }
+  if (typeof validation.data.autoIsolateContext === 'boolean') {
+    next.autoIsolateContext = validation.data.autoIsolateContext;
+  }
 
   try {
     const saved = saveUserFeishuConfig(user.id, {
-      appId: next.appId,
-      appSecret: next.appSecret,
-      enabled: next.enabled,
+      appId: next.appId as string,
+      appSecret: next.appSecret as string,
+      enabled: next.enabled as boolean | undefined,
+      autoIsolateContext: next.autoIsolateContext as boolean | undefined,
+      ownerOpenId: next.ownerOpenId as string | undefined,
     });
+    appendImConfigAudit(user.username, 'feishu', 'update', Object.keys(validation.data), {
+      userId: user.id,
+    });
+
+    // Migrate existing Feishu chats when autoIsolateContext toggle changes
+    const oldAutoIsolate = current?.autoIsolateContext ?? false;
+    const newAutoIsolate = saved.autoIsolateContext ?? false;
+    if (oldAutoIsolate !== newAutoIsolate && deps?.applyAutoIsolateContext) {
+      const migrated = deps.applyAutoIsolateContext(user.id, newAutoIsolate);
+      logger.info(
+        { userId: user.id, enable: newAutoIsolate, migrated },
+        'Applied autoIsolateContext to existing Feishu chats',
+      );
+    }
 
     // Hot-reload: reconnect user's Feishu channel
     if (deps?.reloadUserIMConfig) {
@@ -1227,6 +1512,7 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
     return c.json({
       ...toPublicFeishuProviderConfig(saved, 'runtime'),
       connected,
+      autoIsolateContext: saved.autoIsolateContext ?? false,
     });
   } catch (err) {
     const message =
@@ -1325,6 +1611,7 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
+    appendImConfigAudit(user.username, 'telegram', 'update', Object.keys(validation.data), { userId: user.id });
 
     // Hot-reload: reconnect user's Telegram channel
     if (deps?.reloadUserIMConfig) {
@@ -1550,6 +1837,7 @@ configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
       appSecret: next.appSecret,
       enabled: next.enabled,
     });
+    appendImConfigAudit(user.username, 'qq', 'update', Object.keys(validation.data), { userId: user.id });
 
     // Hot-reload: reconnect user's QQ channel
     if (deps?.reloadUserIMConfig) {
@@ -1689,6 +1977,43 @@ configRoutes.get('/user-im/qq/paired-chats', authMiddleware, (c) => {
   return c.json({ chats });
 });
 
+// Rename a QQ paired chat
+configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const jid = decodeURIComponent(c.req.param('jid'));
+
+  if (!jid.startsWith('qq:')) {
+    return c.json({ error: 'Invalid QQ chat JID' }, 400);
+  }
+
+  const groups = deps?.getRegisteredGroups() ?? {};
+  const group = groups[jid];
+  if (!group) {
+    return c.json({ error: 'Chat not found' }, 404);
+  }
+  if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to rename this chat' }, 403);
+  }
+
+  const body = await c.req
+    .json<{ name?: unknown }>()
+    .catch(() => ({} as { name?: unknown }));
+  const rawName = typeof body.name === 'string' ? body.name : '';
+  const name = rawName.trim();
+  if (!name) {
+    return c.json({ error: 'Name is required' }, 400);
+  }
+  if (name.length > 256) {
+    return c.json({ error: 'Name too long (max 256 chars)' }, 400);
+  }
+
+  group.name = name;
+  setRegisteredGroup(jid, group);
+  updateChatName(jid, name);
+  logger.info({ jid, name, userId: user.id }, 'QQ chat renamed');
+  return c.json({ success: true });
+});
+
 // Remove (unpair) a QQ chat
 configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
@@ -1727,6 +2052,7 @@ configRoutes.get('/user-im/dingtalk', authMiddleware, (c) => {
         hasClientSecret: false,
         clientSecretMasked: null,
         enabled: false,
+        streamingMode: 'card',
         updatedAt: null,
         connected,
       });
@@ -1740,6 +2066,7 @@ configRoutes.get('/user-im/dingtalk', authMiddleware, (c) => {
           config.clientSecret.slice(-4)
         : null,
       enabled: config.enabled ?? false,
+      streamingMode: config.streamingMode ?? 'card',
       updatedAt: config.updatedAt,
       connected,
     });
@@ -1780,6 +2107,7 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
     clientId: current?.clientId || '',
     clientSecret: current?.clientSecret || '',
     enabled: current?.enabled ?? true,
+    streamingMode: current?.streamingMode ?? 'card',
   };
 
   if (typeof validation.data.clientId === 'string') {
@@ -1796,9 +2124,13 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
   } else if (!current && (next.clientId || next.clientSecret)) {
     next.enabled = true;
   }
+  if (typeof validation.data.streamingMode === 'string') {
+    next.streamingMode = validation.data.streamingMode;
+  }
 
   try {
     const saved = saveUserDingTalkConfig(user.id, next);
+    appendImConfigAudit(user.username, 'dingtalk', 'update', Object.keys(validation.data), { userId: user.id });
 
     // Hot-reload: reconnect user's DingTalk channel
     if (deps?.reloadUserIMConfig) {
@@ -1817,6 +2149,7 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
         ? saved.clientSecret.slice(0, 4) + '***' + saved.clientSecret.slice(-4)
         : null,
       enabled: saved.enabled ?? false,
+      streamingMode: saved.streamingMode ?? 'card',
       updatedAt: saved.updatedAt,
       connected,
     });
@@ -1857,6 +2190,172 @@ configRoutes.post('/user-im/dingtalk/test', authMiddleware, async (c) => {
       err instanceof Error ? err.message : 'Connection test failed';
     logger.warn({ err }, 'DingTalk connection test failed');
     return c.json({ error: message }, 400);
+  }
+});
+
+// ─── Per-user Discord IM config ──────────────────────────────────
+
+configRoutes.get('/user-im/discord', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const config = getUserDiscordConfig(user.id);
+    const connected = deps?.isUserDiscordConnected?.(user.id) ?? false;
+    if (!config) {
+      return c.json({
+        hasBotToken: false,
+        botTokenMasked: null,
+        enabled: false,
+        streamingMode: 'off',
+        updatedAt: null,
+        connected,
+      });
+    }
+    return c.json({
+      hasBotToken: !!config.botToken,
+      botTokenMasked: config.botToken
+        ? config.botToken.slice(0, 4) + '***' + config.botToken.slice(-4)
+        : null,
+      enabled: config.enabled ?? false,
+      streamingMode: config.streamingMode ?? 'off',
+      updatedAt: config.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load user Discord config');
+    return c.json({ error: 'Failed to load Discord config' }, 500);
+  }
+});
+
+configRoutes.put('/user-im/discord', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const validation = DiscordConfigSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const current = getUserDiscordConfig(user.id);
+    if (!current?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'discord'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
+  }
+
+  const current = getUserDiscordConfig(user.id);
+  const next = {
+    botToken: current?.botToken || '',
+    enabled: current?.enabled ?? true,
+    streamingMode: current?.streamingMode ?? ('off' as const),
+  };
+
+  if (typeof validation.data.botToken === 'string') {
+    const token = validation.data.botToken.trim();
+    if (token) next.botToken = token;
+  } else if (validation.data.clearBotToken === true) {
+    next.botToken = '';
+  }
+  if (typeof validation.data.enabled === 'boolean') {
+    next.enabled = validation.data.enabled;
+  } else if (!current && next.botToken) {
+    next.enabled = true;
+  }
+  if (typeof validation.data.streamingMode === 'string') {
+    next.streamingMode = validation.data.streamingMode;
+  }
+
+  try {
+    const saved = saveUserDiscordConfig(user.id, next);
+    appendImConfigAudit(user.username, 'discord', 'update', Object.keys(validation.data), { userId: user.id });
+
+    // Hot-reload: reconnect user's Discord channel
+    if (deps?.reloadUserIMConfig) {
+      try {
+        await deps.reloadUserIMConfig(user.id, 'discord');
+      } catch (err) {
+        logger.warn({ err, userId: user.id }, 'Failed to hot-reload Discord');
+      }
+    }
+
+    const connected = deps?.isUserDiscordConnected?.(user.id) ?? false;
+    return c.json({
+      hasBotToken: !!saved.botToken,
+      botTokenMasked: saved.botToken
+        ? saved.botToken.slice(0, 4) + '***' + saved.botToken.slice(-4)
+        : null,
+      enabled: saved.enabled ?? false,
+      streamingMode: saved.streamingMode ?? 'off',
+      updatedAt: saved.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Invalid config';
+    logger.warn({ err }, 'Invalid Discord config');
+    return c.json({ error: message }, 400);
+  }
+});
+
+configRoutes.post('/user-im/discord/test', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const config = getUserDiscordConfig(user.id);
+
+  if (!config?.botToken) {
+    return c.json({ error: 'Discord Bot Token not configured' }, 400);
+  }
+
+  let timeoutId: NodeJS.Timeout | undefined;
+  try {
+    // Test by creating a temporary Client and logging in
+    const { Client, GatewayIntentBits } = await import('discord.js');
+    const testClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+    const result = await Promise.race([
+      new Promise<{ success: true; bot_username: string; bot_name: string }>(
+        (resolve, reject) => {
+          testClient.once('ready', () => {
+            const username = testClient.user?.username || 'unknown';
+            const name = testClient.user?.displayName || username;
+            testClient.destroy();
+            resolve({ success: true, bot_username: username, bot_name: name });
+          });
+          testClient.once('error', (err) => {
+            testClient.destroy();
+            reject(err);
+          });
+          testClient.login(config.botToken).catch((err) => {
+            testClient.destroy();
+            reject(err);
+          });
+        },
+      ),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          testClient.destroy();
+          reject(new Error('Connection test timed out (10s)'));
+        }, 10000);
+      }),
+    ]);
+
+    return c.json(result);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Connection test failed';
+    logger.warn({ err }, 'Discord connection test failed');
+    return c.json({ error: message }, 400);
+  } finally {
+    // Defense-in-depth: clear the race timer in both success and failure paths
+    // so the process doesn't keep an active handle for up to 10s after the test.
+    if (timeoutId) clearTimeout(timeoutId);
   }
 });
 
@@ -1957,6 +2456,7 @@ configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWeChatConfig(user.id, next);
+    appendImConfigAudit(user.username, 'wechat', 'update', Object.keys(validation.data), { userId: user.id });
 
     // Update NO_PROXY based on bypassProxy setting
     updateWeChatNoProxy(saved.bypassProxy ?? true);
@@ -2087,6 +2587,7 @@ configRoutes.get('/user-im/wechat/qrcode-status', authMiddleware, async (c) => {
         baseUrl: data.baseurl || undefined,
         enabled: true,
       });
+    appendImConfigAudit(user.username, 'wechat', 'oauth_qr_confirmed', ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'], { userId: user.id });
 
       // Note: ilink_user_id (the QR scanner) is NOT auto-paired here.
       // The scanner needs to send a message to the bot and use /pair <code>
@@ -2154,6 +2655,174 @@ configRoutes.post('/user-im/wechat/disconnect', authMiddleware, async (c) => {
   }
 });
 
+// ─── WhatsApp (Baileys-based, M1: QR login + connection state) ──
+
+configRoutes.get('/user-im/whatsapp', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const config = getUserWhatsAppConfig(user.id);
+    const connected = deps?.isUserWhatsAppConnected?.(user.id) ?? false;
+    const state = deps?.getUserWhatsAppState?.(user.id) ?? {
+      status: 'disconnected' as const,
+    };
+    if (!config) {
+      return c.json({
+        accountId: 'default',
+        phoneNumber: '',
+        enabled: false,
+        paired: false,
+        updatedAt: null,
+        connected,
+        state,
+      });
+    }
+    return c.json({
+      accountId: config.accountId || 'default',
+      phoneNumber: config.phoneNumber || '',
+      enabled: config.enabled ?? false,
+      paired: config.paired ?? false,
+      updatedAt: config.updatedAt,
+      connected,
+      state,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load user WhatsApp config');
+    return c.json({ error: 'Failed to load user WhatsApp config' }, 500);
+  }
+});
+
+configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const validation = WhatsAppConfigSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const currentWa = getUserWhatsAppConfig(user.id);
+    if (!currentWa?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'whatsapp'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
+  }
+
+  const current = getUserWhatsAppConfig(user.id);
+  const next = {
+    accountId: current?.accountId || 'default',
+    phoneNumber: current?.phoneNumber || '',
+    enabled: current?.enabled ?? false,
+    paired: current?.paired ?? false,
+  };
+
+  if (typeof validation.data.accountId === 'string') {
+    next.accountId = validation.data.accountId.trim() || 'default';
+  }
+  if (typeof validation.data.phoneNumber === 'string') {
+    next.phoneNumber = validation.data.phoneNumber.trim();
+  }
+  if (typeof validation.data.enabled === 'boolean') {
+    next.enabled = validation.data.enabled;
+  }
+  // paired 已从 schema 移除：由 saveUserWhatsAppConfig 在 Baileys 登录回调
+  // 中写入，前端 PUT 不再接受该字段（防止用户伪装扫码完成）。
+
+  try {
+    const saved = saveUserWhatsAppConfig(user.id, next);
+    appendImConfigAudit(user.username, 'whatsapp', 'update', Object.keys(validation.data), { userId: user.id });
+
+    // Hot-reload: reconnect user's WhatsApp channel (skeleton always returns false)
+    if (deps?.reloadUserIMConfig) {
+      try {
+        await deps.reloadUserIMConfig(user.id, 'whatsapp');
+      } catch (err) {
+        logger.warn(
+          { err, userId: user.id },
+          'Failed to hot-reload user WhatsApp connection',
+        );
+      }
+    }
+
+    const connected = deps?.isUserWhatsAppConnected?.(user.id) ?? false;
+    const state = deps?.getUserWhatsAppState?.(user.id) ?? {
+      status: 'disconnected' as const,
+    };
+    return c.json({
+      accountId: saved.accountId,
+      phoneNumber: saved.phoneNumber,
+      enabled: saved.enabled ?? false,
+      paired: saved.paired ?? false,
+      updatedAt: saved.updatedAt,
+      connected,
+      state,
+    });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Invalid WhatsApp config payload';
+    logger.warn({ err }, 'Invalid WhatsApp config');
+    return c.json({ error: message }, 400);
+  }
+});
+
+/**
+ * Hard logout: tell WhatsApp servers, drop the socket, wipe local auth state,
+ * and persist `enabled=false`/`paired=false`. Next enable forces a fresh QR.
+ *
+ * Distinct from PUT /user-im/whatsapp { enabled: false }, which only stops the
+ * socket but keeps the noise/Signal pre-keys on disk for silent reconnect.
+ */
+configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const current = getUserWhatsAppConfig(user.id);
+  const accountId = current?.accountId || 'default';
+
+  if (deps?.logoutUserWhatsApp) {
+    try {
+      await deps.logoutUserWhatsApp(user.id, accountId);
+    } catch (err) {
+      logger.warn(
+        { err, userId: user.id },
+        'WhatsApp logout deps call failed',
+      );
+    }
+  }
+
+  try {
+    const saved = saveUserWhatsAppConfig(user.id, {
+      accountId,
+      phoneNumber: current?.phoneNumber || '',
+      enabled: false,
+      paired: false,
+    });
+    appendImConfigAudit(user.username, 'whatsapp', 'logout', ['enabled', 'paired'], { userId: user.id, accountId });
+    const state = deps?.getUserWhatsAppState?.(user.id) ?? {
+      status: 'logged_out' as const,
+    };
+    return c.json({
+      accountId: saved.accountId,
+      phoneNumber: saved.phoneNumber,
+      enabled: saved.enabled ?? false,
+      paired: saved.paired ?? false,
+      updatedAt: saved.updatedAt,
+      connected: false,
+      state,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to persist WhatsApp logout state');
+    return c.json({ error: 'Failed to save logout state' }, 500);
+  }
+});
+
 // ─── IM Binding management (bindings panoramic page) ────────────
 
 configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
@@ -2170,7 +2839,14 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   if (!imGroup) {
     return c.json({ error: 'IM group not found' }, 404);
   }
+  // IM-binding 改的是 imGroup 行（target_agent_id / target_main_jid /
+  // activation_mode 等），与 agents.ts 的 4 个 IM-binding 路由对齐：
+  // 非成员用 access 检查隐藏存在性（404），成员但非 owner 拒绝写（403）。
+  // 否则共享工作区里的 member 可以劫持 owner 的 IM 路由到自己 agent。
   if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
 
@@ -2234,6 +2910,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     return c.json({ success: true });
   }
 
+  // Parse activation_mode for activation-only update
+  const rawActivationMode = body.activation_mode;
+  const activationMode =
+    typeof rawActivationMode === 'string' &&
+    VALID_ACTIVATION_MODES.has(rawActivationMode)
+      ? (rawActivationMode as typeof rawActivationMode &
+          'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled')
+      : undefined;
+
+  // Parse owner_im_id for owner_mentioned mode
+  const ownerImId =
+    typeof body.owner_im_id === 'string' && body.owner_im_id.trim()
+      ? body.owner_im_id.trim()
+      : undefined;
+
   // Bind to workspace main conversation
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
@@ -2269,6 +2960,8 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       target_main_jid: targetMainJid,
       target_agent_id: undefined,
       reply_policy: replyPolicy,
+      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
     };
     applyBindingUpdate(imJid, updated);
     logger.info(
@@ -2278,10 +2971,78 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     return c.json({ success: true });
   }
 
+  // Activation-only update (no target, just update activation_mode and/or owner_im_id)
+  if (activationMode !== undefined || ownerImId !== undefined) {
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info(
+      { imJid, activationMode, ownerImId, userId: user.id },
+      'IM group activation_mode updated (bindings page)',
+    );
+    return c.json({ success: true });
+  }
+
   return c.json(
-    { error: 'Must provide target_main_jid, target_agent_id, or unbind' },
+    { error: 'Must provide target_main_jid, target_agent_id, activation_mode, or unbind' },
     400,
   );
 });
+
+// Reset sender_allowlist to NULL (unrestricted) — escape hatch for the
+// "owner-locked trap" where buildOnNewChat registered the group with `[]`
+// because the Feishu owner had not DM'd the bot yet. After reset, anyone
+// in the group can trigger the bot.
+configRoutes.post(
+  '/user-im/bindings/:imJid/reset-allowlist',
+  authMiddleware,
+  (c) => {
+    const imJid = decodeURIComponent(c.req.param('imJid'));
+    const user = c.get('user') as AuthUser;
+
+    const channelType = getChannelType(imJid);
+    if (!channelType) {
+      return c.json({ error: 'Invalid IM JID' }, 400);
+    }
+    if (channelType !== 'feishu') {
+      return c.json({ error: 'Only Feishu groups are supported' }, 400);
+    }
+
+    const imGroup = getRegisteredGroup(imJid);
+    if (!imGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (imGroup.created_by !== user.id) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (
+      !Array.isArray(imGroup.sender_allowlist) ||
+      imGroup.sender_allowlist.length !== 0
+    ) {
+      return c.json({ error: 'Group is not in locked allowlist state' }, 400);
+    }
+
+    clearSenderAllowlist(imJid);
+
+    const updated = { ...imGroup, sender_allowlist: undefined };
+    const webDeps = getWebDeps();
+    if (webDeps) {
+      const groups = webDeps.getRegisteredGroups();
+      if (groups[imJid]) groups[imJid] = updated;
+    }
+
+    logger.info(
+      { imJid, userId: user.id },
+      'Sender allowlist cleared (manual reset from bindings page)',
+    );
+    return c.json({ success: true });
+  },
+);
 
 export default configRoutes;

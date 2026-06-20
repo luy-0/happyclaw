@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
@@ -10,6 +11,46 @@ const CURRENT_CONFIG_VERSION = 3;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
 const DEFAULT_THIRD_PARTY_PROFILE_NAME = '默认第三方';
 const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
+
+/**
+ * 写加密 / OAuth / IM 凭据等含敏感数据的 JSON 配置文件。
+ * 即便外层 AES-256-GCM 已加密 ciphertext，密文 + IV + auth tag 仍不应让
+ * 同主机其他本地账号读到（旧版默认 0o644 在多租户场景下泄漏整套 IM/OAuth 凭据
+ * 的 ciphertext，配合 key 文件泄漏即可解密）。统一走该 helper：tmp 文件以
+ * 0o600 创建，rename 后再次 chmod 防御 APFS 上 mode 不跟随 inode 的边角情况。
+ */
+function writeSecretFile(targetPath: string, data: string): void {
+  const tmp = `${targetPath}.tmp`;
+  // 先 unlink stale tmp，避免 fs.writeFileSync 在文件已存在时复用旧 mode
+  // (Node 文档：mode 仅在 on-create 时应用)。残留 0o644 会让我们这次写入
+  // 落到 0o644 ciphertext，rename 后即便 chmod 0o600 也有 race 窗口。
+  try {
+    fs.unlinkSync(tmp);
+  } catch (err: any) {
+    if (err && err.code !== 'ENOENT') {
+      // 罕见路径权限错：让外层捕捉到，避免静默把 secret 落到 0o644。
+      throw err;
+    }
+  }
+  // 用 fd 路径强制 0o600 创建：fs.openSync 的 mode 在 O_CREAT 时一定生效，
+  // fs.writeFileSync(fd, ...) 内部循环处理 short-write。
+  const fd = fs.openSync(
+    tmp,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC,
+    0o600,
+  );
+  try {
+    fs.writeFileSync(fd, data);
+  } finally {
+    try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+  fs.renameSync(tmp, targetPath);
+  try {
+    fs.chmodSync(targetPath, 0o600);
+  } catch {
+    /* best effort */
+  }
+}
 
 const CLAUDE_CONFIG_DIR = path.join(DATA_DIR, 'config');
 const CLAUDE_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'claude-provider.json');
@@ -101,6 +142,24 @@ export interface ClaudeOAuthCredentials {
   expiresAt: number; // Unix timestamp (ms)
   scopes: string[];
   subscriptionType?: string; // e.g. 'max', 'pro' — written to .credentials.json if present
+}
+
+export interface OAuthUsageBucket {
+  utilization: number; // 0-100
+  resets_at: string; // ISO 8601
+}
+
+export interface OAuthUsageResponse {
+  five_hour: OAuthUsageBucket | null;
+  seven_day: OAuthUsageBucket | null;
+  seven_day_opus: OAuthUsageBucket | null;
+  seven_day_sonnet: OAuthUsageBucket | null;
+}
+
+export interface CachedOAuthUsage {
+  data: OAuthUsageResponse;
+  fetchedAt: number; // Unix timestamp ms
+  error?: string;
 }
 
 export interface ClaudeProviderConfig {
@@ -211,6 +270,8 @@ interface StoredFeishuProviderConfigV1 {
   appId: string;
   enabled?: boolean;
   updatedAt: string;
+  ownerOpenId?: string;
+  autoIsolateContext?: boolean;
   secret: EncryptedSecrets;
 }
 
@@ -362,10 +423,16 @@ function normalizeSecret(input: unknown, fieldName: string): string {
   if (typeof input !== 'string') {
     throw new Error(`Invalid field: ${fieldName}`);
   }
-  // Strip ALL whitespace and non-ASCII characters — API keys/tokens are always ASCII;
-  // users often paste with accidental spaces, line breaks, or smart quotes (e.g. U+2019).
   // eslint-disable-next-line no-control-regex
-  const value = input.replace(/\s+/g, '').replace(/[^\x00-\x7F]/g, '');
+  const ascii = input.replace(/[^\x00-\x7F]/g, '').trim();
+  // An ANTHROPIC_AUTH_TOKEN may intentionally be an Authorization header value
+  // ("Bearer <token>"); collapse internal whitespace to a single space so the
+  // prefix survives. Every other secret — API keys, OAuth tokens, and bare
+  // auth tokens — stays compact so an accidental pasted space can't break auth.
+  const value =
+    fieldName === 'anthropicAuthToken' && /^Bearer\s/i.test(ascii)
+      ? ascii.replace(/\s+/g, ' ')
+      : ascii.replace(/\s+/g, '');
   if (value.length > MAX_FIELD_LENGTH) {
     throw new Error(`Field too long: ${fieldName}`);
   }
@@ -486,7 +553,8 @@ function sanitizeCustomEnvMap(
     if (options?.skipReservedClaudeKeys && RESERVED_CLAUDE_ENV_KEYS.has(key)) {
       continue;
     }
-    out[key] = sanitizeEnvValue(
+    out[key] = sanitizeCustomEnvValue(
+      key,
       typeof rawValue === 'string' ? rawValue : String(rawValue),
     );
   }
@@ -959,9 +1027,7 @@ function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  const tmp = `${CLAUDE_CONFIG_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, CLAUDE_CONFIG_FILE);
+  writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
 }
 
 // ─── V4 统一供应商 Read / Write / CRUD ──────────────────────────
@@ -1175,9 +1241,7 @@ function writeStoredStateV4(
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  const tmp = `${CLAUDE_CONFIG_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, CLAUDE_CONFIG_FILE);
+  writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
 }
 
 // ─── V4 公开 API ─────────────────────────────────────────────
@@ -1651,13 +1715,13 @@ export function saveFeishuProviderConfig(
     appId: normalized.appId,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<FeishuSecretPayload>({ appSecret: normalized.appSecret }),
+    secret: encryptChannelSecret<FeishuSecretPayload>({
+      appSecret: normalized.appSecret,
+    }),
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  const tmp = `${FEISHU_CONFIG_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, FEISHU_CONFIG_FILE);
+  writeSecretFile(FEISHU_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
 }
 
@@ -1746,13 +1810,13 @@ export function saveTelegramProviderConfig(
     proxyUrl: normalized.proxyUrl,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<TelegramSecretPayload>({ botToken: normalized.botToken }),
+    secret: encryptChannelSecret<TelegramSecretPayload>({
+      botToken: normalized.botToken,
+    }),
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  const tmp = `${TELEGRAM_CONFIG_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, TELEGRAM_CONFIG_FILE);
+  writeSecretFile(TELEGRAM_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
 }
 
@@ -2266,6 +2330,13 @@ function sanitizeEnvValue(value: string): string {
   return value.replace(/[\r\n\0]/g, '');
 }
 
+function sanitizeCustomEnvValue(key: string, value: string): string {
+  if (key === 'ANTHROPIC_CUSTOM_HEADERS') {
+    return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\0/g, '');
+  }
+  return sanitizeEnvValue(value);
+}
+
 /** Convert KEY=value lines to shell-safe format by single-quoting values.
  *  Used when writing env files that are `source`d by bash. */
 export function shellQuoteEnvLines(lines: string[]): string[] {
@@ -2302,9 +2373,22 @@ export function buildClaudeEnvLines(
     );
   }
   if (config.anthropicAuthToken) {
-    lines.push(
-      `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-    );
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(config.anthropicAuthToken);
+    if (config.anthropicBaseUrl && !bearerMatch) {
+      // Most third-party Anthropic-compatible endpoints expect API-key style
+      // auth (the SDK sends a bare token as `X-Api-Key`). A plain token maps to
+      // ANTHROPIC_API_KEY so non-Anthropic endpoints don't 404 on the OAuth path.
+      lines.push(
+        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
+      );
+    } else {
+      // An explicit `Bearer <token>` (or first-party usage) goes to
+      // ANTHROPIC_AUTH_TOKEN so the SDK emits `Authorization: Bearer <token>`.
+      // The SDK adds the `Bearer ` prefix itself, so strip the user-supplied
+      // one to avoid a doubled `Authorization: Bearer Bearer <token>`.
+      const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
+      lines.push(`ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`);
+    }
   }
   if (config.anthropicModel) {
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
@@ -2314,7 +2398,7 @@ export function buildClaudeEnvLines(
   const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
-    lines.push(`${key}=${sanitizeEnvValue(value)}`);
+    lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
   return lines;
@@ -2446,10 +2530,43 @@ export function appendClaudeConfigAudit(
     metadata,
   };
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  fs.appendFileSync(
-    CLAUDE_CONFIG_AUDIT_FILE,
-    `${JSON.stringify(entry)}\n`,
-    'utf-8',
+  // 用 fd + O_APPEND 路径强制 0o600 创建：fs.appendFileSync 不接受 mode 参数，
+  // 首次落盘 mode = 0o666 & ~umask（实测 0o644），同主机其他本地账号能读
+  // 管理员审计轨迹（用户名 / OAuth 登录时点 / IM 凭据轮换时间窗 = 暴力破解
+  // 窗口枚举素材）。和 writeSecretFile 同形态强 0o600。
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND;
+  const fd = fs.openSync(CLAUDE_CONFIG_AUDIT_FILE, flags, 0o600);
+  try {
+    fs.writeSync(fd, `${JSON.stringify(entry)}\n`);
+  } finally {
+    try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+  // 自愈历史 0o644 文件：appendFileSync 在升级前已经创建过，单纯切到 fd 路径
+  // 只对新文件生效；显式 chmod 保证存量也收紧。
+  try {
+    fs.chmodSync(CLAUDE_CONFIG_AUDIT_FILE, 0o600);
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
+ * 记录 IM 通道密钥/配置轮换。复用 claude-provider.audit.log 文件以集中
+ * 审计；调用方需提供 channel ('feishu'|'telegram'|...) 和 changedFields
+ * （如 ['appSecret','encryptKey']）。同 appendClaudeConfigAudit 一样不抛错。
+ */
+export function appendImConfigAudit(
+  actor: string,
+  channel: string,
+  action: string,
+  changedFields: string[],
+  metadata?: Record<string, unknown>,
+): void {
+  appendClaudeConfigAudit(
+    actor,
+    `im_${channel}_${action}`,
+    changedFields,
+    metadata,
   );
 }
 
@@ -2550,9 +2667,7 @@ export function saveContainerEnvConfig(
   }
 
   fs.mkdirSync(CONTAINER_ENV_DIR, { recursive: true });
-  const tmp = `${containerEnvPath(folder)}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(sanitized, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, containerEnvPath(folder));
+  writeSecretFile(containerEnvPath(folder), JSON.stringify(sanitized, null, 2) + '\n');
 }
 
 export function deleteContainerEnvConfig(folder: string): void {
@@ -2588,7 +2703,7 @@ export function mergeClaudeEnvConfig(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
 ): ClaudeProviderConfig {
-  return {
+  const merged: ClaudeProviderConfig = {
     anthropicBaseUrl: override.anthropicBaseUrl || global.anthropicBaseUrl,
     anthropicAuthToken:
       override.anthropicAuthToken || global.anthropicAuthToken,
@@ -2600,6 +2715,16 @@ export function mergeClaudeEnvConfig(
     anthropicModel: override.anthropicModel || global.anthropicModel,
     updatedAt: global.updatedAt,
   };
+
+  // Third-party provider: strip OAuth credentials so the SDK does not try
+  // the OAuth auth path (which skips the standard Bearer header and causes
+  // 404 on non-Anthropic endpoints like Kimi).
+  if (merged.anthropicBaseUrl) {
+    merged.claudeOAuthCredentials = null;
+    merged.claudeCodeOauthToken = '';
+  }
+
+  return merged;
 }
 
 // ─── Registration config (plain JSON, no encryption) ─────────────
@@ -2695,7 +2820,7 @@ export function buildContainerEnvLines(
         continue;
       }
       // Strip control characters to prevent env injection
-      const sanitized = value.replace(/[\r\n\0]/g, '');
+      const sanitized = sanitizeCustomEnvValue(key, value);
       lines.push(`${key}=${sanitized}`);
     }
   }
@@ -2719,7 +2844,9 @@ export function writeCredentialsFile(
   // Claude CLI requires scopes to recognize the token as valid.
   // Fall back to a sensible default when the stored credentials lack scopes
   // (e.g. tokens imported before scopes were captured).
-  const scopes = creds.scopes?.length ? creds.scopes : DEFAULT_CREDENTIAL_SCOPES;
+  const scopes = creds.scopes?.length
+    ? creds.scopes
+    : DEFAULT_CREDENTIAL_SCOPES;
 
   const claudeAiOauth: {
     accessToken: string;
@@ -2743,11 +2870,20 @@ export function writeCredentialsFile(
 
   const filePath = path.join(sessionDir, '.credentials.json');
   const tmp = `${filePath}.tmp`;
+  // 0o600 — credentials 是 plaintext OAuth access/refresh token，
+  // 不能让同主机其他本地账号读取（旧版用 0o644 是泄漏）。
   fs.writeFileSync(tmp, JSON.stringify(credentialsData, null, 2) + '\n', {
     encoding: 'utf-8',
-    mode: 0o644,
+    mode: 0o600,
   });
   fs.renameSync(tmp, filePath);
+  // 防御性 chmod：rename 在 macOS APFS 上有时会保留旧 inode 的 mode；
+  // 显式再 chmod 一次确保最终落地权限严格。
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    /* ignore — best effort */
+  }
 }
 
 /**
@@ -2986,6 +3122,8 @@ export interface UserFeishuConfig {
   appSecret: string;
   enabled?: boolean;
   updatedAt: string | null;
+  ownerOpenId?: string; // auto-detected from first DM; used as sender_allowlist seed for new groups
+  autoIsolateContext?: boolean; // auto-create isolated conversation for each new IM chat
 }
 
 export interface UserTelegramConfig {
@@ -3006,6 +3144,7 @@ export interface UserDingTalkConfig {
   clientId: string;
   clientSecret: string;
   enabled?: boolean;
+  streamingMode?: 'card' | 'text';
   updatedAt: string | null;
 }
 
@@ -3013,12 +3152,32 @@ interface StoredDingTalkProviderConfigV1 {
   version: 1;
   clientId: string;
   enabled?: boolean;
+  streamingMode?: 'card' | 'text';
   updatedAt: string;
   secret: EncryptedSecrets;
 }
 
 interface DingTalkSecretPayload {
   clientSecret: string;
+}
+
+export interface UserDiscordConfig {
+  botToken: string;
+  enabled?: boolean;
+  streamingMode?: 'edit' | 'off';
+  updatedAt: string | null;
+}
+
+interface StoredDiscordProviderConfigV1 {
+  version: 1;
+  enabled?: boolean;
+  streamingMode?: 'edit' | 'off';
+  updatedAt: string;
+  secret: EncryptedSecrets;
+}
+
+interface DiscordSecretPayload {
+  botToken: string;
 }
 
 interface StoredQQProviderConfigV1 {
@@ -3055,6 +3214,8 @@ export function getUserFeishuConfig(userId: string): UserFeishuConfig | null {
       appSecret: secret.appSecret,
       enabled: stored.enabled,
       updatedAt: stored.updatedAt || null,
+      ownerOpenId: stored.ownerOpenId || undefined,
+      autoIsolateContext: stored.autoIsolateContext ?? false,
     };
   } catch (err) {
     logger.warn({ err, userId }, 'Failed to read user Feishu config');
@@ -3071,6 +3232,8 @@ export function saveUserFeishuConfig(
     appSecret: normalizeSecret(next.appSecret, 'appSecret'),
     enabled: next.enabled,
     updatedAt: new Date().toISOString(),
+    ownerOpenId: next.ownerOpenId,
+    autoIsolateContext: next.autoIsolateContext,
   };
 
   const payload: StoredFeishuProviderConfigV1 = {
@@ -3078,16 +3241,34 @@ export function saveUserFeishuConfig(
     appId: normalized.appId,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<FeishuSecretPayload>({ appSecret: normalized.appSecret }),
+    ownerOpenId: normalized.ownerOpenId,
+    autoIsolateContext: normalized.autoIsolateContext,
+    secret: encryptChannelSecret<FeishuSecretPayload>({
+      appSecret: normalized.appSecret,
+    }),
   };
 
   const dir = userImDir(userId);
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, 'feishu.json');
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
+}
+
+/**
+ * Update only the ownerOpenId in an existing Feishu config file, preserving the encrypted secret.
+ */
+export function saveFeishuOwnerOpenId(userId: string, openId: string): void {
+  const filePath = path.join(userImDir(userId), 'feishu.json');
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    parsed.ownerOpenId = openId;
+    writeSecretFile(filePath, JSON.stringify(parsed, null, 2) + '\n');
+    logger.info({ userId, openId }, 'Feishu owner open_id saved');
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to save Feishu owner open_id');
+  }
 }
 
 export function getUserTelegramConfig(
@@ -3133,15 +3314,15 @@ export function saveUserTelegramConfig(
     proxyUrl: normalizedProxyUrl || undefined,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<TelegramSecretPayload>({ botToken: normalized.botToken }),
+    secret: encryptChannelSecret<TelegramSecretPayload>({
+      botToken: normalized.botToken,
+    }),
   };
 
   const dir = userImDir(userId);
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, 'telegram.json');
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
 }
 
@@ -3185,15 +3366,15 @@ export function saveUserQQConfig(
     appId: normalized.appId,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<QQSecretPayload>({ appSecret: normalized.appSecret }),
+    secret: encryptChannelSecret<QQSecretPayload>({
+      appSecret: normalized.appSecret,
+    }),
   };
 
   const dir = userImDir(userId);
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, 'qq.json');
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
 }
 
@@ -3276,15 +3457,87 @@ export function saveUserWeChatConfig(
     bypassProxy: normalized.bypassProxy,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<WeChatSecretPayload>({ botToken: normalized.botToken }),
+    secret: encryptChannelSecret<WeChatSecretPayload>({
+      botToken: normalized.botToken,
+    }),
   };
 
   const dir = userImDir(userId);
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, 'wechat.json');
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
+  return normalized;
+}
+
+// ========== WhatsApp User IM Config ==========
+
+export interface UserWhatsAppConfig {
+  accountId: string;
+  phoneNumber: string;
+  enabled?: boolean;
+  /** Whether the user has completed Baileys QR pairing (set by future PR) */
+  paired?: boolean;
+  updatedAt: string | null;
+}
+
+interface StoredWhatsAppProviderConfigV1 {
+  version: 1;
+  accountId: string;
+  phoneNumber: string;
+  enabled?: boolean;
+  paired?: boolean;
+  updatedAt: string;
+}
+
+export function getUserWhatsAppConfig(
+  userId: string,
+): UserWhatsAppConfig | null {
+  const filePath = path.join(userImDir(userId), 'whatsapp.json');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (parsed.version !== 1) return null;
+
+    const stored = parsed as unknown as StoredWhatsAppProviderConfigV1;
+    return {
+      accountId: ((stored.accountId as string) ?? 'default').trim(),
+      phoneNumber: ((stored.phoneNumber as string) ?? '').trim(),
+      enabled: stored.enabled,
+      paired: stored.paired,
+      updatedAt: stored.updatedAt || null,
+    };
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to read user WhatsApp config');
+    return null;
+  }
+}
+
+export function saveUserWhatsAppConfig(
+  userId: string,
+  next: Omit<UserWhatsAppConfig, 'updatedAt'>,
+): UserWhatsAppConfig {
+  const normalized: UserWhatsAppConfig = {
+    accountId: (next.accountId ?? 'default').trim() || 'default',
+    phoneNumber: (next.phoneNumber ?? '').trim(),
+    enabled: next.enabled,
+    paired: next.paired,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const payload: StoredWhatsAppProviderConfigV1 = {
+    version: 1,
+    accountId: normalized.accountId,
+    phoneNumber: normalized.phoneNumber,
+    enabled: normalized.enabled,
+    paired: normalized.paired,
+    updatedAt: normalized.updatedAt || new Date().toISOString(),
+  };
+
+  const dir = userImDir(userId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'whatsapp.json');
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
 }
 
@@ -3306,6 +3559,7 @@ export function getUserDingTalkConfig(
       clientId: ((stored.clientId as string) ?? '').trim(),
       clientSecret: secret.clientSecret,
       enabled: stored.enabled,
+      streamingMode: stored.streamingMode === 'text' ? 'text' : 'card',
       updatedAt: stored.updatedAt || null,
     };
   } catch (err) {
@@ -3322,6 +3576,7 @@ export function saveUserDingTalkConfig(
     clientId: ((next.clientId as string) ?? '').trim(),
     clientSecret: normalizeSecret(next.clientSecret, 'clientSecret'),
     enabled: next.enabled,
+    streamingMode: next.streamingMode === 'text' ? 'text' : 'card',
     updatedAt: new Date().toISOString(),
   };
 
@@ -3329,16 +3584,71 @@ export function saveUserDingTalkConfig(
     version: 1,
     clientId: normalized.clientId,
     enabled: normalized.enabled,
+    streamingMode: normalized.streamingMode === 'text' ? 'text' : 'card',
     updatedAt: normalized.updatedAt || new Date().toISOString(),
-    secret: encryptChannelSecret<DingTalkSecretPayload>({ clientSecret: normalized.clientSecret }),
+    secret: encryptChannelSecret<DingTalkSecretPayload>({
+      clientSecret: normalized.clientSecret,
+    }),
   };
 
   const dir = userImDir(userId);
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, 'dingtalk.json');
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
+  return normalized;
+}
+
+// ========== Discord User IM Config ==========
+
+export function getUserDiscordConfig(
+  userId: string,
+): UserDiscordConfig | null {
+  const filePath = path.join(userImDir(userId), 'discord.json');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (parsed.version !== 1) return null;
+
+    const stored = parsed as unknown as StoredDiscordProviderConfigV1;
+    const secret = decryptChannelSecret<DiscordSecretPayload>(stored.secret);
+    return {
+      botToken: secret.botToken,
+      enabled: stored.enabled,
+      streamingMode: stored.streamingMode === 'edit' ? 'edit' : 'off',
+      updatedAt: stored.updatedAt || null,
+    };
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to read user Discord config');
+    return null;
+  }
+}
+
+export function saveUserDiscordConfig(
+  userId: string,
+  next: Omit<UserDiscordConfig, 'updatedAt'>,
+): UserDiscordConfig {
+  const normalized: UserDiscordConfig = {
+    botToken: normalizeSecret(next.botToken, 'botToken'),
+    enabled: next.enabled,
+    streamingMode: next.streamingMode === 'edit' ? 'edit' : 'off',
+    updatedAt: new Date().toISOString(),
+  };
+
+  const payload: StoredDiscordProviderConfigV1 = {
+    version: 1,
+    enabled: normalized.enabled,
+    streamingMode: normalized.streamingMode,
+    updatedAt: normalized.updatedAt || new Date().toISOString(),
+    secret: encryptChannelSecret<DiscordSecretPayload>({
+      botToken: normalized.botToken,
+    }),
+  };
+
+  const dir = userImDir(userId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'discord.json');
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
   return normalized;
 }
 
@@ -3359,16 +3669,40 @@ export interface SystemSettings {
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
   scriptTimeout: number;
-  // Skills auto-sync
-  skillAutoSyncEnabled: boolean;
-  skillAutoSyncIntervalMinutes: number;
   // Billing
   billingEnabled: boolean;
   billingMode: 'wallet_first';
   billingMinStartBalanceUsd: number;
   billingCurrency: string;
   billingCurrencyRate: number;
+  // External Claude directory (admin only)
+  externalClaudeDir: string;
+  // Claude Agent SDK 自动对话压缩触发点（tokens）。0 = 保留 SDK 默认（约 1M）
+  autoCompactWindow: number;
+  // 预定义 SubAgent（code-reviewer / web-researcher）使用的模型别名或完整 ID。
+  // 经 SUBAGENT_MODEL 注入容器；默认 inherit（继承主会话模型，不擅自改变），可在设置页改。
+  subagentModel: string;
+  // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
+  // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
+  disableMemoryLayerForAdminHost: boolean;
+  // Plugin catalog 自动扫描：true（默认）= 启动 5s 后扫一次 + 每小时一次；
+  // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
+  // 适用于不希望本机私有 plugin 自动入共享 catalog 的环境。
+  pluginAutoScan: boolean;
+  // 定时任务逾期容忍窗口（毫秒）。任何 next_run 落在过去且距今超过该窗口的任务
+  // 在 scheduler 轮询时直接跳过本次（next_run 推到下一次），避免停机/重启后多个
+  // 跨天积压任务集体在重启那一秒并发 fire 刷屏。
+  // 0 = 关闭（保留旧行为：无视逾期时长全部 backfill）。默认 300000 (5 分钟)。
+  taskBackfillGraceMs: number;
 }
+
+// Upper bound for the login lockout window. auth.ts reclaims login-attempt
+// records on a fixed 24h TTL (its authoritative window check assumes the
+// configured lockout never exceeds this); a larger value would let the cleanup
+// timer drop a record mid-lockout, resetting the per-ip counter and letting an
+// attacker resume brute-forcing by pausing ~24h. Every read path clamps to it,
+// not just saveSystemSettings, so the env/file fallbacks can't bypass the cap.
+const MAX_LOGIN_LOCKOUT_MINUTES = 1440;
 
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   containerTimeout: 1800000,
@@ -3380,19 +3714,34 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   loginLockoutMinutes: 15,
   maxConcurrentScripts: 10,
   scriptTimeout: 60000,
-  skillAutoSyncEnabled: false,
-  skillAutoSyncIntervalMinutes: 10,
   billingEnabled: false,
   billingMode: 'wallet_first',
   billingMinStartBalanceUsd: 0.01,
   billingCurrency: 'USD',
   billingCurrencyRate: 1,
+  externalClaudeDir: '',
+  autoCompactWindow: 0,
+  subagentModel: 'inherit',
+  disableMemoryLayerForAdminHost: false,
+  pluginAutoScan: true,
+  taskBackfillGraceMs: 300000,
 };
 
 function parseIntEnv(envVar: string | undefined, fallback: number): number {
   if (!envVar) return fallback;
   const parsed = parseInt(envVar, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
+ * autoCompactWindow 区间收紧：0 = 禁用（用 SDK 默认 ~1M）；>0 收紧到 [100000, 1000000]。
+ * SDK 侧 schema 为 assistant.mjs 的 `.min(1e5).max(1e6).catch(void 0)`——越界值会被静默剥离
+ * 回退默认。在读（file/env）与写（save）两端统一调用，避免存量/手填的越界值在下游静默失效。
+ */
+function clampAutoCompactWindow(v: unknown): number {
+  const n = typeof v === 'number' ? v : NaN;
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(1_000_000, Math.max(100_000, Math.floor(n)));
 }
 
 function parseFloatEnv(envVar: string | undefined, fallback: number): number {
@@ -3440,7 +3789,7 @@ function readSystemSettingsFromFile(): SystemSettings | null {
         : DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     loginLockoutMinutes:
       typeof raw.loginLockoutMinutes === 'number' && raw.loginLockoutMinutes > 0
-        ? raw.loginLockoutMinutes
+        ? Math.min(raw.loginLockoutMinutes, MAX_LOGIN_LOCKOUT_MINUTES)
         : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
     maxConcurrentScripts:
       typeof raw.maxConcurrentScripts === 'number' &&
@@ -3451,15 +3800,6 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.scriptTimeout === 'number' && raw.scriptTimeout > 0
         ? raw.scriptTimeout
         : DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
-    skillAutoSyncEnabled:
-      typeof raw.skillAutoSyncEnabled === 'boolean'
-        ? raw.skillAutoSyncEnabled
-        : DEFAULT_SYSTEM_SETTINGS.skillAutoSyncEnabled,
-    skillAutoSyncIntervalMinutes:
-      typeof raw.skillAutoSyncIntervalMinutes === 'number' &&
-      raw.skillAutoSyncIntervalMinutes >= 1
-        ? raw.skillAutoSyncIntervalMinutes
-        : DEFAULT_SYSTEM_SETTINGS.skillAutoSyncIntervalMinutes,
     billingEnabled:
       typeof raw.billingEnabled === 'boolean'
         ? raw.billingEnabled
@@ -3478,6 +3818,28 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.billingCurrencyRate === 'number' && raw.billingCurrencyRate > 0
         ? raw.billingCurrencyRate
         : DEFAULT_SYSTEM_SETTINGS.billingCurrencyRate,
+    externalClaudeDir:
+      typeof raw.externalClaudeDir === 'string'
+        ? raw.externalClaudeDir.trim()
+        : DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
+    autoCompactWindow: clampAutoCompactWindow(raw.autoCompactWindow),
+    subagentModel:
+      typeof raw.subagentModel === 'string' && raw.subagentModel.trim()
+        ? raw.subagentModel.trim()
+        : DEFAULT_SYSTEM_SETTINGS.subagentModel,
+    disableMemoryLayerForAdminHost:
+      typeof raw.disableMemoryLayerForAdminHost === 'boolean'
+        ? raw.disableMemoryLayerForAdminHost
+        : DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
+    pluginAutoScan:
+      typeof raw.pluginAutoScan === 'boolean'
+        ? raw.pluginAutoScan
+        : DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
+    taskBackfillGraceMs:
+      typeof raw.taskBackfillGraceMs === 'number' &&
+      raw.taskBackfillGraceMs >= 0
+        ? raw.taskBackfillGraceMs
+        : DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
   };
 }
 
@@ -3507,9 +3869,12 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.MAX_LOGIN_ATTEMPTS,
       DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     ),
-    loginLockoutMinutes: parseIntEnv(
-      process.env.LOGIN_LOCKOUT_MINUTES,
-      DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+    loginLockoutMinutes: Math.min(
+      parseIntEnv(
+        process.env.LOGIN_LOCKOUT_MINUTES,
+        DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+      ),
+      MAX_LOGIN_LOCKOUT_MINUTES,
     ),
     maxConcurrentScripts: parseIntEnv(
       process.env.MAX_CONCURRENT_SCRIPTS,
@@ -3518,13 +3883,6 @@ function buildEnvFallbackSettings(): SystemSettings {
     scriptTimeout: parseIntEnv(
       process.env.SCRIPT_TIMEOUT,
       DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
-    ),
-    skillAutoSyncEnabled:
-      process.env.SKILL_AUTO_SYNC_ENABLED === 'true' ||
-      DEFAULT_SYSTEM_SETTINGS.skillAutoSyncEnabled,
-    skillAutoSyncIntervalMinutes: parseIntEnv(
-      process.env.SKILL_AUTO_SYNC_INTERVAL_MINUTES,
-      DEFAULT_SYSTEM_SETTINGS.skillAutoSyncIntervalMinutes,
     ),
     billingEnabled:
       process.env.BILLING_ENABLED === 'true' ||
@@ -3539,6 +3897,24 @@ function buildEnvFallbackSettings(): SystemSettings {
     billingCurrencyRate: parseFloatEnv(
       process.env.BILLING_CURRENCY_RATE,
       DEFAULT_SYSTEM_SETTINGS.billingCurrencyRate,
+    ),
+    externalClaudeDir:
+      process.env.EXTERNAL_CLAUDE_DIR || DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
+    autoCompactWindow: clampAutoCompactWindow(
+      parseIntEnv(process.env.AUTO_COMPACT_WINDOW, DEFAULT_SYSTEM_SETTINGS.autoCompactWindow),
+    ),
+    subagentModel:
+      process.env.SUBAGENT_MODEL || DEFAULT_SYSTEM_SETTINGS.subagentModel,
+    disableMemoryLayerForAdminHost:
+      process.env.DISABLE_MEMORY_LAYER_FOR_ADMIN_HOST === 'true' ||
+      DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
+    pluginAutoScan:
+      process.env.PLUGIN_AUTO_SCAN === 'false'
+        ? false
+        : DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
+    taskBackfillGraceMs: parseIntEnv(
+      process.env.TASK_BACKFILL_GRACE_MS,
+      DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
     ),
   };
 }
@@ -3582,6 +3958,12 @@ export function getSystemSettings(): SystemSettings {
   return settings;
 }
 
+/** 获取生效的外部 Claude 目录（externalClaudeDir 空时 fallback 到 ~/.claude） */
+export function getEffectiveExternalDir(): string {
+  const settings = getSystemSettings();
+  return settings.externalClaudeDir || path.join(os.homedir(), '.claude');
+}
+
 export function saveSystemSettings(
   partial: Partial<SystemSettings>,
 ): SystemSettings {
@@ -3607,21 +3989,56 @@ export function saveSystemSettings(
   if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
   if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
   if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
-  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440; // max 24 hours
+  if (merged.loginLockoutMinutes > MAX_LOGIN_LOCKOUT_MINUTES)
+    merged.loginLockoutMinutes = MAX_LOGIN_LOCKOUT_MINUTES; // max 24 hours, see auth.ts reclaim TTL
   if (merged.maxConcurrentScripts < 1) merged.maxConcurrentScripts = 1;
   if (merged.maxConcurrentScripts > 50) merged.maxConcurrentScripts = 50;
   if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000; // min 5s
   if (merged.scriptTimeout > 600000) merged.scriptTimeout = 600000; // max 10 min
-  if (merged.skillAutoSyncIntervalMinutes < 1)
-    merged.skillAutoSyncIntervalMinutes = 1;
-  if (merged.skillAutoSyncIntervalMinutes > 1440)
-    merged.skillAutoSyncIntervalMinutes = 1440; // max 24h
   merged.billingMode = 'wallet_first';
   if (merged.billingMinStartBalanceUsd < 0)
     merged.billingMinStartBalanceUsd =
       DEFAULT_SYSTEM_SETTINGS.billingMinStartBalanceUsd;
   if (merged.billingMinStartBalanceUsd > 1000000)
     merged.billingMinStartBalanceUsd = 1000000;
+
+  // autoCompactWindow 在读/写两端统一用 clampAutoCompactWindow 收紧（见函数注释）。
+  merged.autoCompactWindow = clampAutoCompactWindow(merged.autoCompactWindow);
+
+  // subagentModel: 非空字符串（别名或完整 model ID），去空白并限长；空则回退默认。
+  if (typeof merged.subagentModel !== 'string' || !merged.subagentModel.trim()) {
+    merged.subagentModel = DEFAULT_SYSTEM_SETTINGS.subagentModel;
+  } else {
+    merged.subagentModel = merged.subagentModel.trim().slice(0, 64);
+  }
+
+  // taskBackfillGraceMs: 0 = 关闭（旧行为：无视逾期全 backfill）；
+  // >0 限制在 [1s, 24h]，避免误配置成几毫秒导致正常任务也被跳过。
+  if (
+    merged.taskBackfillGraceMs < 0 ||
+    !Number.isFinite(merged.taskBackfillGraceMs)
+  ) {
+    merged.taskBackfillGraceMs = 0;
+  } else if (merged.taskBackfillGraceMs > 0) {
+    if (merged.taskBackfillGraceMs < 1000) merged.taskBackfillGraceMs = 1000;
+    if (merged.taskBackfillGraceMs > 86400000)
+      merged.taskBackfillGraceMs = 86400000;
+  }
+
+  // Validate externalClaudeDir: must be empty or an absolute directory path
+  if (merged.externalClaudeDir) {
+    const trimmed = merged.externalClaudeDir.trim();
+    if (trimmed) {
+      try {
+        const resolved = fs.realpathSync(trimmed);
+        merged.externalClaudeDir = fs.statSync(resolved).isDirectory() ? resolved : '';
+      } catch {
+        merged.externalClaudeDir = '';
+      }
+    } else {
+      merged.externalClaudeDir = '';
+    }
+  }
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
   const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
@@ -3637,4 +4054,23 @@ export function saveSystemSettings(
   }
 
   return merged;
+}
+
+// ─── OAuth Usage Types ─────────────────────────────────────────────────────
+
+export interface OAuthUsageBucket {
+  utilization: number;
+  resets_at: string;
+}
+
+/**
+ * 解析 OAuth usage bucket 对象
+ * 运行时类型守卫，验证 API 响应结构
+ */
+export function parseOAuthUsageBucket(v: unknown): OAuthUsageBucket | null {
+  if (!v || typeof v !== 'object') return null;
+  const obj = v as Record<string, unknown>;
+  if (typeof obj.utilization !== 'number' || typeof obj.resets_at !== 'string')
+    return null;
+  return { utilization: obj.utilization, resets_at: obj.resets_at };
 }

@@ -34,6 +34,18 @@ export interface ContainerConfig {
 }
 
 export type ExecutionMode = 'container' | 'host';
+export type ConversationSource = 'manual' | 'feishu_thread';
+export type ConversationNavMode = 'horizontal' | 'vertical_threads';
+export type ImBindingMode = 'single_context' | 'thread_map';
+
+/** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
+export interface FeishuMessageMeta {
+  threadId?: string;
+  rootId?: string;
+  parentId?: string;
+  messageId?: string;
+  text?: string;
+}
 
 export interface RegisteredGroup {
   name: string;
@@ -50,9 +62,16 @@ export interface RegisteredGroup {
   target_main_jid?: string; // IM 消息路由到指定工作区的主对话（web:{folder}）
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
+  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
+  owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
+  sender_allowlist?: string[] | null; // null/undefined = 不限制，[] = 仅 owner 可触发（未 /claim 时无人可触发），[ids] = 白名单
   mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
   selected_mcps?: string[] | null; // custom 模式下选中的 MCP server IDs
+  conversation_source?: ConversationSource; // 工作区会话来源（默认 manual）
+  conversation_nav_mode?: ConversationNavMode; // 工作区会话导航模式（默认 horizontal）
+  binding_mode?: ImBindingMode; // IM 绑定模式（默认 single_context）
+  feishu_chat_mode?: string; // 飞书群模式：group/topic/p2p 等
+  feishu_group_message_type?: string; // 飞书群消息形式：chat/thread
 }
 
 export interface GroupMember {
@@ -78,6 +97,7 @@ export interface NewMessage {
   sdk_message_uuid?: string | null;
   source_kind?: MessageSourceKind | null;
   finalization_reason?: MessageFinalizationReason | null;
+  task_id?: string | null;
 }
 
 export type MessageSourceKind =
@@ -187,6 +207,14 @@ export interface User {
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
+  /**
+   * Per-user default for require_mention on auto-registered IM group chats.
+   * When true, newly auto-registered Feishu/Telegram/etc groups start with
+   * require_mention=1 (only @bot triggers a response). false preserves the
+   * legacy default of responding to every owner-sent message in the group.
+   * Existing groups are not retroactively changed.
+   */
+  default_require_mention: boolean;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
@@ -210,6 +238,7 @@ export interface UserPublic {
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
+  default_require_mention: boolean;
   created_at: string;
   last_login_at: string | null;
   last_active_at: string | null;
@@ -302,6 +331,24 @@ export interface SubAgent {
   last_im_jid: string | null;
   /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
   spawned_from_jid: string | null;
+  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
+  thread_id?: string | null;
+  root_message_id?: string | null;
+  title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
+  last_active_at?: string | null;
+}
+
+export interface ImContextBinding {
+  source_jid: string;
+  context_type: 'thread';
+  context_id: string;
+  workspace_jid: string;
+  agent_id: string;
+  root_message_id: string | null;
+  title: string | null;
+  last_active_at: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // WebSocket message types
@@ -343,6 +390,7 @@ export type WsMessageOut =
       name: string;
       prompt: string;
       resultSummary?: string;
+      titleGenerating?: boolean;
     }
   | {
       type: 'runner_state';
@@ -367,6 +415,21 @@ export type WsMessageOut =
   | { type: 'docker_build_log'; line: string }
   | { type: 'docker_build_complete'; success: boolean; error?: string }
   | {
+      type: 'whatsapp_status';
+      userId: string;
+      status:
+        | 'connecting'
+        | 'qr'
+        | 'connected'
+        | 'disconnected'
+        | 'logged_out';
+      qr?: string;
+      qrDataUrl?: string;
+      error?: string;
+      meJid?: string;
+      meName?: string;
+    }
+  | {
       type: 'billing_update';
       userId: string;
       usage: BillingAccessResult;
@@ -377,6 +440,7 @@ export type WsMessageOut =
       chatJid: string;
       snapshot: {
         partialText: string;
+        thinkingText?: string;
         activeTools: Array<{
           toolName: string;
           toolUseId: string;
@@ -388,10 +452,27 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: 'tool' | 'skill' | 'hook' | 'status';
+          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
         }>;
+        traceEvents?: Array<{
+          id: string;
+          timestamp: number;
+          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          scope?: StreamEvent['agentScope'];
+          title: string;
+          summary?: string;
+          detail?: string;
+          taskId?: string;
+          toolUseId?: string;
+          parentToolUseId?: string | null;
+          displayLevel?: StreamEvent['displayLevel'];
+        }>;
+        taskStates?: Record<string, unknown>;
+        contextAudit?: StreamEvent['contextAudit'];
         todos?: Array<{ id: string; content: string; status: string }>;
         systemStatus: string | null;
+        isThinking?: boolean;
+        activeHook?: { hookName: string; hookEvent: string } | null;
         turnId?: string;
       };
     };

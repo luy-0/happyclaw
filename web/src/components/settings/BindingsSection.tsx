@@ -7,13 +7,14 @@ import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { useImBindings } from './hooks/useImBindings';
 import { ImBindingRow } from './ImBindingRow';
 import { BindingTargetDialog } from './BindingTargetDialog';
+import { api } from '../../api/client';
 import type { AvailableImGroup } from '../../types';
 import type { BindingTarget } from './hooks/useImBindings';
 
-type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat';
+type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord';
 
 export function BindingsSection() {
-  const { bindings, loading, targets, targetsLoading, reload, rebind, error: hookError, clearError: clearHookError } = useImBindings();
+  const { bindings, loading, targets, targetsLoading, reload, rebind, resetAllowlist, error: hookError, clearError: clearHookError } = useImBindings();
   const [localError, setLocalError] = useState<string | null>(null);
   const errorMsg = localError || hookError;
   const [search, setSearch] = useState('');
@@ -24,6 +25,8 @@ export function BindingsSection() {
   // Dialog state
   const [rebindGroup, setRebindGroup] = useState<AvailableImGroup | null>(null);
   const [unbindGroup, setUnbindGroup] = useState<AvailableImGroup | null>(null);
+  const [resetAllowlistGroup, setResetAllowlistGroup] = useState<AvailableImGroup | null>(null);
+  const [deleteGroup, setDeleteGroup] = useState<AvailableImGroup | null>(null);
 
   const channels: { key: ChannelFilter; label: string }[] = useMemo(() => {
     const types = new Set(bindings.map((b) => b.channel_type));
@@ -32,6 +35,8 @@ export function BindingsSection() {
     if (types.has('telegram')) all.push({ key: 'telegram', label: 'Telegram' });
     if (types.has('qq')) all.push({ key: 'qq', label: 'QQ' });
     if (types.has('wechat')) all.push({ key: 'wechat', label: '微信' });
+    if (types.has('dingtalk')) all.push({ key: 'dingtalk', label: '钉钉' });
+    if (types.has('discord')) all.push({ key: 'discord', label: 'Discord' });
     return all;
   }, [bindings]);
 
@@ -59,6 +64,49 @@ export function BindingsSection() {
   const handleUnbind = useCallback((group: AvailableImGroup) => {
     setUnbindGroup(group);
   }, []);
+
+  const handleResetAllowlist = useCallback((group: AvailableImGroup) => {
+    setResetAllowlistGroup(group);
+  }, []);
+
+  const handleDelete = useCallback((group: AvailableImGroup) => {
+    setDeleteGroup(group);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteGroup) return;
+    const jid = deleteGroup.jid;
+    setDeleteGroup(null);
+    setActioningJid(jid);
+    setLocalError(null);
+    try {
+      await api.delete(`/api/groups/${encodeURIComponent(jid)}`);
+      reload();
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '删除失败');
+    } finally {
+      setActioningJid(null);
+    }
+  }, [deleteGroup, reload]);
+
+  const confirmResetAllowlist = useCallback(async () => {
+    if (!resetAllowlistGroup) return;
+    const jid = resetAllowlistGroup.jid;
+    setResetAllowlistGroup(null);
+    setActioningJid(jid);
+    setLocalError(null);
+    const err = await resetAllowlist(jid);
+    setActioningJid(null);
+    if (err) setLocalError(err);
+  }, [resetAllowlistGroup, resetAllowlist]);
+
+  const handleActivationModeChange = useCallback(async (jid: string, mode: string) => {
+    setActioningJid(jid);
+    setLocalError(null);
+    const err = await rebind(jid, { activation_mode: mode as 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled' });
+    setActioningJid(null);
+    if (err) setLocalError(err);
+  }, [rebind]);
 
   const confirmUnbind = useCallback(async () => {
     if (!unbindGroup) return;
@@ -192,7 +240,7 @@ export function BindingsSection() {
             <CardContent className="text-center">
             <MessageSquare className="w-10 h-10 mx-auto text-muted-foreground mb-3" />
             <p className="text-sm text-muted-foreground">
-              暂无 IM 渠道。在飞书、Telegram、QQ 或微信中向 Bot 发送消息后，渠道会自动出现在这里。
+              暂无 IM 渠道。在飞书、Telegram、QQ、微信、钉钉或 Discord 中向 Bot 发送消息后，渠道会自动出现在这里。
             </p>
             </CardContent>
           </Card>
@@ -209,6 +257,9 @@ export function BindingsSection() {
                 isActioning={actioningJid === group.jid}
                 onRebind={handleRebind}
                 onUnbind={handleUnbind}
+                onResetAllowlist={handleResetAllowlist}
+                onActivationModeChange={handleActivationModeChange}
+                onDelete={handleDelete}
               />
             ))}
           </div>
@@ -245,6 +296,34 @@ export function BindingsSection() {
         title="恢复默认路由"
         message={restoreConfirmGroup ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到主工作区）？` : ''}
         confirmText="恢复默认"
+      />
+
+      {/* Reset sender allowlist confirm dialog */}
+      <ConfirmDialog
+        open={!!resetAllowlistGroup}
+        onClose={() => setResetAllowlistGroup(null)}
+        onConfirm={confirmResetAllowlist}
+        title="重置发言者白名单"
+        message={
+          resetAllowlistGroup
+            ? `「${resetAllowlistGroup.name}」当前白名单为空，没人能触发 bot。重置后白名单将被清空，群内所有成员都能触发 bot。继续？`
+            : ''
+        }
+        confirmText="重置白名单"
+      />
+
+      {/* Delete IM group confirm dialog */}
+      <ConfirmDialog
+        open={!!deleteGroup}
+        onClose={() => setDeleteGroup(null)}
+        onConfirm={confirmDelete}
+        title="删除 IM 渠道"
+        message={
+          deleteGroup
+            ? `确认从 HappyClaw 中删除「${deleteGroup.name}」的注册记录？此操作仅清理本机绑定，不会影响该 IM 群本身。如果 bot 之后再次收到该群消息，会自动重新注册。`
+            : ''
+        }
+        confirmText="删除"
       />
     </div>
   );

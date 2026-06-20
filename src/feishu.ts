@@ -11,9 +11,11 @@ import {
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
+  sanitizeImFilename,
   MAX_FILE_SIZE,
   FileTooLargeError,
 } from './im-downloader.js';
+import { createDedupCache } from './im-utils.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
@@ -22,6 +24,14 @@ import {
   getStreamingSession,
 } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import { buildAgentReplyCard } from './feishu-cards/builder.js';
+import {
+  evaluateMentionGate,
+  isBotMentioned,
+  type MentionGateMention,
+} from './feishu-mention-gate.js';
+import { ProcessingLock, isStale } from './im-safety/index.js';
+import type { FeishuMessageMeta } from './types.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -42,14 +52,15 @@ export interface ConnectOptions {
   onNewChat?: (chatJid: string, chatName: string) => void;
   /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
   ignoreMessagesBefore?: number;
-  /** 斜杠指令回调（如 /clear），返回回复文本或 null */
-  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  /** 斜杠指令回调（如 /clear），返回回复文本或 null；mentions 仅飞书渠道传入，用于 /allow 等命令 */
+  onCommand?: (chatJid: string, command: string, senderImId?: string, mentions?: FeishuMentionLike[]) => Promise<string | null>;
   /** 根据 chatJid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (chatJid: string) => string | undefined;
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
   resolveEffectiveChatJid?: (
     chatJid: string,
-  ) => { effectiveJid: string; agentId: string | null } | null;
+    messageMeta?: FeishuMessageMeta,
+  ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   /** Bot 被添加到群聊时调用（自动注册群组） */
@@ -57,9 +68,15 @@ export interface ConnectOptions {
   /** Bot 被移出群聊或群被解散时调用（自动解绑 IM 绑定） */
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
-  shouldProcessGroupMessage?: (chatJid: string) => boolean;
+  shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** owner_mentioned 模式下检查发送者是否为 owner */
+  isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** 发言者白名单：命令处理之后、mention 门控之前调用；返回 false 则丢弃 */
+  isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** 飞书流式卡片按钮中断回调 */
   onCardInterrupt?: (chatJid: string) => void;
+  /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
+  onP2pSender?: (senderOpenId: string) => void;
 }
 
 export interface FeishuChatInfo {
@@ -67,7 +84,8 @@ export interface FeishuChatInfo {
   name?: string;
   user_count?: string;
   chat_type?: string;
-  chat_mode?: string; // 'p2p' | 'group'
+  chat_mode?: string; // 'p2p' | 'group' | 'topic'
+  group_message_type?: string; // 'chat' | 'thread'
 }
 
 export interface FeishuConnection {
@@ -100,8 +118,6 @@ export interface FeishuConnection {
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
 
-// Max characters per markdown element in Feishu cards
-const CARD_MD_LIMIT = 4000;
 // Feishu card allows at most 5 markdown tables; beyond this, skip card and use post+md directly
 const CARD_TABLE_LIMIT = 5;
 const FEISHU_WS_READY_STATE_OPEN = 1;
@@ -111,6 +127,12 @@ const WS_RECONNECT_MIN_INTERVAL_MS = 30_000;
 const BACKFILL_LOOKBACK_MS = 5 * 60 * 1000;
 const BACKFILL_PAGE_SIZE = 50;
 const BACKFILL_MAX_PAGES_PER_CHAT = 5;
+// 启动期 bot info 拉取的最大重试次数（指数退避 1s/2s/4s）
+const BOT_INFO_FETCH_MAX_ATTEMPTS = 4;
+// botOpenId 缺失时 lazy refetch 的最小间隔，避免对 OAPI 高频骚扰
+const BOT_INFO_REFETCH_MIN_INTERVAL_MS = 60_000;
+// "因 botOpenId 缺失而丢消息" 的 warn 节流间隔，避免日志刷屏
+const BOT_INFO_MISSING_WARN_INTERVAL_MS = 5 * 60 * 1000;
 
 interface FeishuMentionLike {
   key?: string;
@@ -121,6 +143,9 @@ interface FeishuMentionLike {
 interface IncomingMessagePayload {
   chatId: string;
   messageId: string;
+  rootId?: string;
+  parentId?: string;
+  threadId?: string;
   createTimeMs: number;
   messageType: string;
   content: string;
@@ -140,6 +165,49 @@ function toEpochMs(value: string | number | undefined): number {
   const numeric = typeof value === 'number' ? value : Number(value ?? 0);
   if (!Number.isFinite(numeric) || numeric <= 0) return 0;
   return numeric < 1e12 ? Math.trunc(numeric * 1000) : Math.trunc(numeric);
+}
+
+export interface FeishuRouteTarget {
+  raw: string;
+  chatId: string;
+  threadId?: string;
+  rootMessageId?: string;
+  replyInThread: boolean;
+}
+
+export function parseFeishuRouteTarget(raw: string): FeishuRouteTarget {
+  const [chatId, ...parts] = raw.split('#');
+  let threadId: string | undefined;
+  let rootMessageId: string | undefined;
+  for (const part of parts) {
+    if (part.startsWith('thread:')) {
+      threadId = part.slice('thread:'.length);
+    } else if (part.startsWith('root:')) {
+      rootMessageId = part.slice('root:'.length);
+    }
+  }
+  return {
+    raw,
+    chatId,
+    threadId,
+    rootMessageId,
+    replyInThread: !!rootMessageId,
+  };
+}
+
+function buildFeishuRouteTarget(
+  chatId: string,
+  threadId?: string,
+  rootMessageId?: string,
+): FeishuRouteTarget {
+  const parts = [chatId];
+  if (threadId) parts.push(`thread:${threadId}`);
+  if (rootMessageId) parts.push(`root:${rootMessageId}`);
+  return parseFeishuRouteTarget(parts.join('#'));
+}
+
+function feishuRouteToJid(target: FeishuRouteTarget): string {
+  return `feishu:${target.raw}`;
 }
 
 /**
@@ -294,8 +362,11 @@ function extractMessageContent(
       const fileKey = parsed.file_key;
       const filename = parsed.file_name || '';
       if (fileKey) {
+        // 使用清洗后的文件名构造占位符，下方 replace 也用同一份清洗结果，
+        // 任何上下文（成功/失败/解析失败）都不会让原始 filename 进入 prompt。
+        const safeFilename = sanitizeImFilename(filename || fileKey);
         return {
-          text: `[文件: ${filename || fileKey}]`,
+          text: `[文件: ${safeFilename}]`,
           fileInfos: [{ fileKey, filename }],
         };
       }
@@ -409,34 +480,6 @@ function extractMessageContent(
 }
 
 /**
- * Split long text at paragraph boundaries to fit within card element limits.
- */
-function splitAtParagraphs(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > maxLen) {
-    // Prefer splitting at double newline (paragraph break)
-    let idx = remaining.lastIndexOf('\n\n', maxLen);
-    if (idx < maxLen * 0.3) {
-      // Fallback to single newline
-      idx = remaining.lastIndexOf('\n', maxLen);
-    }
-    if (idx < maxLen * 0.3) {
-      // Hard split as last resort
-      idx = maxLen;
-    }
-    chunks.push(remaining.slice(0, idx).trim());
-    remaining = remaining.slice(idx).trim();
-  }
-  if (remaining) chunks.push(remaining);
-
-  return chunks;
-}
-
-/**
  * Map file extension to Feishu file type.
  */
 function getFileType(
@@ -476,86 +519,7 @@ function buildPostMdFallback(text: string): string {
 }
 
 function buildInteractiveCard(text: string): object {
-  const optimized = optimizeMarkdownStyle(text, 2);
-  const lines = text.split('\n');
-  let title = '';
-  let bodyStartIdx = 0;
-
-  // Extract title from first heading if present (use original text for title)
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    if (/^#{1,3}\s+/.test(lines[i])) {
-      title = lines[i].replace(/^#+\s*/, '').trim();
-      bodyStartIdx = i + 1;
-    }
-    break;
-  }
-
-  // Apply optimizeMarkdownStyle to body (title was already extracted from original)
-  const optimizedLines = optimized.split('\n');
-  // Skip lines corresponding to the title in optimized text
-  let optimizedBody: string;
-  if (bodyStartIdx > 0) {
-    // Find the first non-empty line in optimized text and skip it (it's the demoted title)
-    let skipIdx = 0;
-    for (let i = 0; i < optimizedLines.length; i++) {
-      if (!optimizedLines[i].trim()) continue;
-      skipIdx = i + 1;
-      break;
-    }
-    optimizedBody = optimizedLines.slice(skipIdx).join('\n').trim();
-  } else {
-    optimizedBody = optimized.trim();
-  }
-
-  // Generate title if no heading found — use first line preview
-  if (!title) {
-    const firstLine = (lines.find((l) => l.trim()) || '')
-      .replace(/[*_`#\[\]]/g, '')
-      .trim();
-    title =
-      firstLine.length > 40
-        ? firstLine.slice(0, 37) + '...'
-        : firstLine || 'Reply';
-  }
-
-  // Build card elements
-  const elements: Array<Record<string, unknown>> = [];
-  const contentToRender = optimizedBody || optimized.trim();
-
-  if (contentToRender.length > CARD_MD_LIMIT) {
-    // Long content: split into multiple markdown elements
-    const chunks = splitAtParagraphs(contentToRender, CARD_MD_LIMIT);
-    for (const chunk of chunks) {
-      elements.push({ tag: 'markdown', content: chunk });
-    }
-  } else if (contentToRender) {
-    // Split by horizontal rules for visual sections
-    const sections = contentToRender.split(/\n-{3,}\n/);
-    for (let i = 0; i < sections.length; i++) {
-      if (i > 0) elements.push({ tag: 'hr' });
-      const s = sections[i].trim();
-      if (s) elements.push({ tag: 'markdown', content: s });
-    }
-  }
-
-  // Ensure at least one element
-  if (elements.length === 0) {
-    elements.push({ tag: 'markdown', content: optimized.trim() });
-  }
-
-  return {
-    schema: '2.0',
-    config: {
-      wide_screen_mode: true,
-      summary: { content: title },
-    },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template: 'indigo',
-    },
-    body: { elements },
-  };
+  return buildAgentReplyCard({ status: 'done', text });
 }
 
 // ─── Factory Function ──────────────────────────────────────────
@@ -567,12 +531,14 @@ function buildInteractiveCard(text: string): object {
 export function createFeishuConnection(
   config: FeishuConnectionConfig,
 ): FeishuConnection {
-  // LRU deduplication cache
-  const MSG_DEDUP_MAX = 1000;
-  const MSG_DEDUP_TTL = 30 * 60 * 1000; // 30min
+  // LRU deduplication cache（共享 helper，避免 6 个 IM channel 各自写一份）
+  const dedup = createDedupCache({
+    ttlMs: 30 * 60 * 1000,
+    max: 1000,
+  });
 
   // Per-instance state
-  const msgCache = new Map<string, number>();
+  const processingLock = new ProcessingLock();
   const senderNameCache = new Map<string, string>();
   const lastMessageIdByChat = new Map<string, string>();
   const ackReactionByChat = new Map<string, string>();
@@ -593,6 +559,13 @@ export function createFeishuConnection(
   let disconnectedChecks = 0;
   let disconnectedSince: number | null = null;
   let healthTimer: NodeJS.Timeout | null = null;
+  // botOpenId 自愈状态：lastBotInfoFetchAt 防止 lazy refetch 高频骚扰 OAPI；
+  // botInfoRefetchInFlight 防止并发拉取
+  let lastBotInfoFetchAt = 0;
+  let botInfoRefetchInFlight: Promise<void> | null = null;
+  // mention gate fail-closed 的 warn 节流：避免 botOpenId 长时间缺失时日志洪水
+  let lastBotInfoMissingWarnAt = 0;
+  let botInfoMissingDroppedSinceLastWarn = 0;
 
   function rememberChatProgress(chatId: string, createTimeMs: number, chatType?: string): void {
     knownChatIds.add(chatId);
@@ -644,30 +617,87 @@ export function createFeishuConnection(
     stopHealthMonitor();
     healthTimer = setInterval(() => {
       void checkConnectionHealth();
+      // 兜底：botOpenId 缺失时让健康检查顺手 lazy refetch；
+      // 启动期 retry 失败 / 飞书短暂抖动后能在几分钟内自动恢复 mention 守卫。
+      if (!botOpenId) {
+        void ensureBotOpenIdFresh('health-check');
+      }
     }, WS_HEALTH_CHECK_INTERVAL_MS);
     healthTimer.unref?.();
   }
 
-  function isDuplicate(msgId: string): boolean {
-    const now = Date.now();
-    // Map preserves insertion order; stop at first non-expired entry
-    for (const [id, ts] of msgCache.entries()) {
-      if (now - ts > MSG_DEDUP_TTL) {
-        msgCache.delete(id);
-      } else {
-        break;
-      }
+  /**
+   * 拉取 bot open_id —— 启动期与自愈共用入口。
+   * 失败时返回空串，由调用方决定是否重试。
+   */
+  async function fetchBotOpenIdOnce(): Promise<string> {
+    if (!client) return '';
+    try {
+      const botInfoRes = await client.request({
+        method: 'GET',
+        url: '/open-apis/bot/v3/info/',
+      });
+      const info = botInfoRes as {
+        bot?: { open_id?: string };
+        data?: { bot?: { open_id?: string } };
+      };
+      return info?.bot?.open_id || info?.data?.bot?.open_id || '';
+    } catch (err) {
+      logger.debug({ err }, 'fetchBotOpenIdOnce failed');
+      return '';
     }
-    if (msgCache.size >= MSG_DEDUP_MAX) {
-      const firstKey = msgCache.keys().next().value;
-      if (firstKey) msgCache.delete(firstKey);
-    }
-    return msgCache.has(msgId);
   }
 
-  function markSeen(msgId: string): void {
-    msgCache.delete(msgId);
-    msgCache.set(msgId, Date.now());
+  /**
+   * 启动期带指数退避的 bot open_id 拉取。最多 4 次（间隔 0/1s/2s/4s）。
+   * 即使全部失败也不阻塞 connect()，由 ensureBotOpenIdFresh() 后续兜底。
+   */
+  async function fetchBotOpenIdWithRetry(): Promise<void> {
+    for (let attempt = 0; attempt < BOT_INFO_FETCH_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
+      }
+      const id = await fetchBotOpenIdOnce();
+      lastBotInfoFetchAt = Date.now();
+      if (id) {
+        botOpenId = id;
+        logger.info(
+          { botOpenId, attempt: attempt + 1 },
+          'Fetched bot open_id for mention detection',
+        );
+        return;
+      }
+    }
+    logger.warn(
+      { attempts: BOT_INFO_FETCH_MAX_ATTEMPTS },
+      'Could not fetch bot open_id after retries; mention gating will fail-closed until recovered',
+    );
+  }
+
+  /**
+   * 后台 lazy refetch：消息进入 mention 门控前若发现 botOpenId 仍空，触发一次。
+   * 用 lastBotInfoFetchAt 节流，避免每条消息都打 OAPI；并发安全（in-flight Promise 复用）。
+   */
+  function ensureBotOpenIdFresh(reason: string): Promise<void> {
+    if (botOpenId) return Promise.resolve();
+    if (botInfoRefetchInFlight) return botInfoRefetchInFlight;
+    const now = Date.now();
+    if (now - lastBotInfoFetchAt < BOT_INFO_REFETCH_MIN_INTERVAL_MS) {
+      return Promise.resolve();
+    }
+    botInfoRefetchInFlight = (async () => {
+      const id = await fetchBotOpenIdOnce();
+      lastBotInfoFetchAt = Date.now();
+      if (id) {
+        botOpenId = id;
+        logger.info({ botOpenId, reason }, 'Recovered bot open_id (lazy refetch)');
+      } else {
+        logger.debug({ reason }, 'Lazy refetch of bot open_id still failed');
+      }
+    })().finally(() => {
+      botInfoRefetchInFlight = null;
+    });
+    return botInfoRefetchInFlight;
   }
 
   async function downloadFeishuImage(
@@ -818,20 +848,56 @@ export function createFeishuConnection(
     }
   }
 
+  function clearAckForTarget(rawTarget: string): void {
+    const target = parseFeishuRouteTarget(rawTarget);
+    const ackStored = ackReactionByChat.get(target.raw);
+    if (!ackStored) return;
+    const [ackMsgId, ackReactionId] = ackStored.split(':');
+    removeReaction(ackMsgId, ackReactionId).catch(() => {});
+    ackReactionByChat.delete(target.raw);
+  }
+
+  /**
+   * Low-level send: route to reply (thread-aware) or create, based on target.
+   * Uses rootMessageId for thread routing, falls back to lastMessageIdByChat for reply context.
+   */
+  async function sendToFeishu(
+    chatId: string,
+    msgType: string,
+    content: string,
+  ): Promise<void> {
+    if (!client) return;
+    const target = parseFeishuRouteTarget(chatId);
+    const receiveIdType = target.chatId.startsWith('oc_')
+      ? 'chat_id'
+      : 'open_id';
+    const replyMsgId =
+      target.rootMessageId || lastMessageIdByChat.get(target.chatId);
+    if (replyMsgId) {
+      await client.im.message.reply({
+        path: { message_id: replyMsgId },
+        data: {
+          content,
+          msg_type: msgType,
+          ...(target.replyInThread ? { reply_in_thread: true } : {}),
+        },
+      });
+    } else {
+      await client.im.v1.message.create({
+        params: { receive_id_type: receiveIdType },
+        data: {
+          receive_id: target.chatId,
+          msg_type: msgType,
+          content,
+        },
+      });
+    }
+  }
+
   async function sendTextToChat(chatId: string, text: string): Promise<void> {
     if (!client) return;
     try {
-      const receive_id_type = chatId.startsWith('oc_')
-        ? 'chat_id'
-        : 'open_id';
-      await client.im.v1.message.create({
-        params: { receive_id_type },
-        data: {
-          receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text }),
-        },
-      });
+      await sendToFeishu(chatId, 'text', JSON.stringify({ text }));
     } catch (err) {
       logger.error({ chatId, err }, 'Failed to send Feishu text reply');
     }
@@ -849,10 +915,16 @@ export function createFeishuConnection(
       resolveEffectiveChatJid,
       onAgentMessage,
       shouldProcessGroupMessage,
+      isGroupOwnerMessage,
+      isSenderAllowedInGroup,
+      onP2pSender,
     } = connectOptions || {};
     const {
       chatId,
       messageId,
+      rootId,
+      parentId,
+      threadId,
       createTimeMs,
       messageType,
       content: rawContent,
@@ -863,15 +935,31 @@ export function createFeishuConnection(
     } = payload;
     if (!chatId || !messageId) return;
 
-    if (isDuplicate(messageId)) {
+    if (isStale(createTimeMs)) {
+      logger.debug(
+        { messageId, createTimeMs, age: Date.now() - createTimeMs },
+        'Stale Feishu message (>30min), dropping',
+      );
+      return;
+    }
+    if (dedup.isDuplicate(messageId)) {
       logger.debug({ messageId }, 'Duplicate message, skipping');
       return;
     }
-    markSeen(messageId);
+    if (!processingLock.acquire(messageId)) {
+      logger.debug(
+        { messageId },
+        'Feishu message already in-flight, skipping duplicate dispatch',
+      );
+      return;
+    }
+    dedup.markSeen(messageId);
     logger.info(
       { messageId, messageType, chatId, source },
       'Feishu message received',
     );
+
+    try {
 
     if (
       ignoreMessagesBefore &&
@@ -908,14 +996,162 @@ export function createFeishuConnection(
     }
 
     const chatJid = `feishu:${chatId}`;
+    const rootMessageId = rootId || messageId;
+    const messageRouteTarget = buildFeishuRouteTarget(
+      chatId,
+      threadId,
+      threadId ? rootMessageId : rootId,
+    );
     const resolvedSenderName = senderName || getSenderName(senderOpenId);
     const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
 
     // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
     onNewChat?.(chatJid, resolvedChatName);
 
+    // P2P 消息：通知调用方用于自动检测 owner open_id
+    if (chatType === 'p2p' && senderOpenId && onP2pSender) {
+      onP2pSender(senderOpenId);
+    }
+
+    // NOTE: image/file download moved BELOW the group gates (allowlist +
+    // mention gate). Declaring attachmentsJson here keeps it in scope for the
+    // store/broadcast block; the actual download runs only after authorization.
     let attachmentsJson: string | undefined;
 
+    lastMessageIdByChat.set(chatId, messageId);
+
+    const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
+    const timestamp = new Date(resolvedCreateTimeMs).toISOString();
+    rememberChatProgress(chatId, resolvedCreateTimeMs, chatType);
+
+    // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
+    // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
+    // 需要先 strip 掉开头的 @mention 前缀再匹配
+    const textForSlash = text?.trim().replace(/^@\S+\s+/, '') ?? '';
+    const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
+    if (slashMatch && onCommand) {
+      const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
+      logger.info(
+        { chatJid, cmd: slashMatch[1], cmdBody },
+        'Feishu slash command detected',
+      );
+      try {
+        const reply = await onCommand(chatJid, cmdBody, senderOpenId, mentions);
+        logger.info(
+          {
+            chatJid,
+            cmd: slashMatch[1],
+            hasReply: !!reply,
+            replyLen: reply?.length,
+          },
+          'Feishu slash command processed',
+        );
+        if (reply) {
+          await sendTextToChat(messageRouteTarget.raw, reply);
+          return; // 已知命令，拦截
+        }
+        // reply 为 null 表示未知命令，继续作为普通消息处理
+      } catch (err) {
+        logger.error(
+          { chatJid, cmd: slashMatch[1], err },
+          'Feishu slash command failed',
+        );
+        try {
+          await sendTextToChat(
+            messageRouteTarget.raw,
+            '⚠️ 命令执行失败，请稍后重试',
+          );
+        } catch (sendErr) {
+          logger.error(
+            { chatJid, sendErr },
+            'Failed to send slash command error feedback',
+          );
+        }
+        return;
+      }
+    }
+
+    // ── 群聊发言者白名单过滤（命令已处理后，非白名单发言者丢弃或软拒绝） ──
+    if (chatType === 'group' && isSenderAllowedInGroup && !isSenderAllowedInGroup(chatJid, senderOpenId)) {
+      // 被 @bot 时回 SILENT 表情表达「看到但故意不回复」，让发言者知道 bot 并非无响应而是被白名单挡掉；
+      // 未 @bot 时静默丢弃，避免把群聊闲聊污染成一堆表情。
+      // botOpenId 缺失时 isBotMentioned() 返回 false → 不加 SILENT 反应。
+      // 反应只是 courtesy（消息已被 allowlist 决定丢弃），不能确认 @ 时宁可不加。
+      // 与下方 mention gate 的 fail-closed 方向相反：那里是业务正确性边界，必须确认。
+      if (isBotMentioned(botOpenId, mentions as MentionGateMention[] | undefined)) {
+        addReaction(messageId, 'SILENT').catch(() => {});
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Soft-rejected group message with SILENT reaction: sender not in allowlist',
+        );
+      } else {
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Dropped group message: sender not in allowlist',
+        );
+      }
+      return;
+    }
+
+    // ── 群聊 Mention 过滤：require_mention / owner_mentioned 模式下过滤 ──
+    // 决策由 evaluateMentionGate（src/feishu-mention-gate.ts）以纯函数形式给出，
+    // 历史上这里曾因 botOpenId 缺失而 fail-open 静默失效；新版 fail-closed，
+    // 并通过 ensureBotOpenIdFresh() 触发后台 lazy refetch 自愈。
+    {
+      const decision = evaluateMentionGate({
+        chatType,
+        botOpenId,
+        mentions: mentions as MentionGateMention[] | undefined,
+        chatJid,
+        senderOpenId,
+        shouldProcessGroupMessage,
+        isGroupOwnerMessage,
+      });
+      if (!decision.allow) {
+        if (decision.reason === 'bot_open_id_missing') {
+          // 触发后台 lazy refetch（节流由函数内部保证），不阻塞当前消息
+          void ensureBotOpenIdFresh('mention-gate-fallback');
+          // warn 日志按 5 分钟节流，避免 botOpenId 长时间缺失时刷屏
+          const now = Date.now();
+          botInfoMissingDroppedSinceLastWarn++;
+          if (
+            now - lastBotInfoMissingWarnAt >=
+            BOT_INFO_MISSING_WARN_INTERVAL_MS
+          ) {
+            logger.warn(
+              {
+                chatJid,
+                messageId,
+                droppedSinceLastWarn: botInfoMissingDroppedSinceLastWarn,
+              },
+              'Dropping group messages: bot open_id unknown (fail-closed). Triggered lazy refetch.',
+            );
+            lastBotInfoMissingWarnAt = now;
+            botInfoMissingDroppedSinceLastWarn = 0;
+          } else {
+            logger.debug(
+              { chatJid, messageId },
+              'Dropped group message: bot open_id missing (warn throttled)',
+            );
+          }
+        } else if (decision.reason === 'not_mentioned') {
+          logger.debug(
+            { chatJid, messageId },
+            'Dropped group message: mention required but bot not mentioned',
+          );
+        } else {
+          logger.debug(
+            { chatJid, messageId, senderOpenId },
+            'Dropped group message: owner_mentioned mode, sender is not owner',
+          );
+        }
+        return;
+      }
+    }
+
+    // ── 附件下载（已通过白名单 + mention 门控后才执行）──
+    // 安全：未授权发送者 / 未 @bot 的群消息已在上面 return，绝不会触发图片/
+    // 文件下载落盘或对飞书 API 的拉取（防止未授权资源消耗 / SSRF 式拉取）。
     if (extracted.imageKeys && extracted.imageKeys.length > 0) {
       // 图片消息：下载后双轨处理
       // 1. Vision 通道：base64 附件供模型看图
@@ -964,12 +1200,29 @@ export function createFeishuConnection(
         }
       }
 
+      // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
+      // 否则长图/超大图片下载失败时会落入 agent 的空消息分支，回复"消息是空的"。
+      const failedCount = extracted.imageKeys.length - attachments.length;
+      const markers: string[] = [];
       if (attachments.length > 0) {
         attachmentsJson = JSON.stringify(attachments);
-        // 在 content 中添加图片标记 + 磁盘路径，与文件消息保持一致
-        // agent 可通过路径直接操作文件，无需从 DB 解码 base64
-        const pathHints = savedPaths.map((p) => `[图片: ${p}]`).join('\n');
-        const imgMarker = pathHints || '[图片]';
+        if (savedPaths.length > 0) {
+          markers.push(...savedPaths.map((p) => `[图片: ${p}]`));
+        } else {
+          markers.push('[图片]');
+        }
+      }
+      if (failedCount > 0) {
+        markers.push(
+          `[图片下载失败: ${failedCount} 张，可能超过飞书接口限制或网络异常]`,
+        );
+        logger.warn(
+          { chatJid, messageId, failedCount, totalKeys: extracted.imageKeys.length },
+          'Feishu image download failed for some or all images',
+        );
+      }
+      const imgMarker = markers.join('\n');
+      if (imgMarker) {
         text = text ? `${imgMarker}\n${text}` : imgMarker;
       }
     } else if (extracted.fileInfos && extracted.fileInfos.length > 0) {
@@ -990,108 +1243,66 @@ export function createFeishuConnection(
           'Cannot resolve group folder for file download',
         );
         for (const fi of extracted.fileInfos) {
-          const placeholder = `[文件: ${fi.filename || fi.fileKey}]`;
+          const safeFilename = sanitizeImFilename(fi.filename || fi.fileKey);
+          const placeholder = `[文件: ${safeFilename}]`;
           text = text.replace(
             placeholder,
-            `[文件下载失败: ${fi.filename || fi.fileKey}]`,
+            `[文件下载失败: ${safeFilename}]`,
           );
         }
       } else {
         for (const fi of extracted.fileInfos) {
+          const safeFilename = sanitizeImFilename(fi.filename || fi.fileKey);
           const relPath = await downloadFeishuFileToDisk(
             messageId,
             fi.fileKey,
             fi.filename,
             groupFolder,
           );
-          const placeholder = `[文件: ${fi.filename || fi.fileKey}]`;
+          const placeholder = `[文件: ${safeFilename}]`;
           text = text.replace(
             placeholder,
             relPath
               ? `[文件: ${relPath}]`
-              : `[文件下载失败: ${fi.filename || fi.fileKey}]`,
+              : `[文件下载失败: ${safeFilename}]`,
           );
         }
       }
     }
 
-    lastMessageIdByChat.set(chatId, messageId);
-
-    const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
-    const timestamp = new Date(resolvedCreateTimeMs).toISOString();
-    rememberChatProgress(chatId, resolvedCreateTimeMs, chatType);
-
-    // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
-    // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
-    // 需要先 strip 掉开头的 @mention 前缀再匹配
-    const textForSlash = text?.trim().replace(/^@\S+\s+/, '') ?? '';
-    const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
-    if (slashMatch && onCommand) {
-      const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
-      logger.info(
-        { chatJid, cmd: slashMatch[1], cmdBody },
-        'Feishu slash command detected',
-      );
-      try {
-        const reply = await onCommand(chatJid, cmdBody);
-        logger.info(
-          {
-            chatJid,
-            cmd: slashMatch[1],
-            hasReply: !!reply,
-            replyLen: reply?.length,
-          },
-          'Feishu slash command processed',
-        );
-        if (reply) {
-          await sendTextToChat(chatId, reply);
-          return; // 已知命令，拦截
-        }
-        // reply 为 null 表示未知命令，继续作为普通消息处理
-      } catch (err) {
-        logger.error(
-          { chatJid, cmd: slashMatch[1], err },
-          'Feishu slash command failed',
-        );
-        try {
-          await sendTextToChat(chatId, '⚠️ 命令执行失败，请稍后重试');
-        } catch (sendErr) {
-          logger.error(
-            { chatJid, sendErr },
-            'Failed to send slash command error feedback',
-          );
-        }
-        return;
-      }
-    }
-
-    // ── 群聊 Mention 过滤：require_mention 模式下，bot 未被 @ 则丢弃 ──
-    if (chatType === 'group' && shouldProcessGroupMessage) {
-      const isBotMentioned = botOpenId
-        ? (mentions?.some((m) => m.id?.open_id === botOpenId) ?? false)
-        : true; // 无 bot open_id 时默认放行（安全降级）
-      if (!isBotMentioned && !shouldProcessGroupMessage(chatJid)) {
-        logger.debug(
-          { chatJid, messageId },
-          'Dropped group message: mention required but bot not mentioned',
-        );
-        return;
-      }
-    }
+    const agentRouting = resolveEffectiveChatJid?.(chatJid, {
+      threadId,
+      rootId: rootMessageId,
+      parentId,
+      messageId,
+      text,
+    });
+    const routeSourceJid =
+      agentRouting?.sourceJid ??
+      (messageRouteTarget.threadId || messageRouteTarget.rootMessageId
+        ? feishuRouteToJid(messageRouteTarget)
+        : chatJid);
 
     // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
     if (source === 'ws') {
+      const ackTarget = parseFeishuRouteTarget(
+        routeSourceJid.startsWith('feishu:')
+          ? routeSourceJid.slice('feishu:'.length)
+          : routeSourceJid,
+      );
       addReaction(messageId, 'OnIt')
         .then((reactionId) => {
           if (reactionId) {
-            ackReactionByChat.set(chatId, `${messageId}:${reactionId}`);
+            ackReactionByChat.set(
+              ackTarget.raw,
+              `${messageId}:${reactionId}`,
+            );
           }
         })
         .catch(() => {});
     }
 
     // Store message and broadcast to WebSocket clients
-    const agentRouting = resolveEffectiveChatJid?.(chatJid);
     const targetJid = agentRouting?.effectiveJid ?? chatJid;
 
     const targetAgentId = agentRouting?.agentId;
@@ -1105,14 +1316,14 @@ export function createFeishuConnection(
       text,
       timestamp,
       false,
-      { attachments: attachmentsJson, sourceJid: chatJid },
+      { attachments: attachmentsJson, sourceJid: routeSourceJid },
     );
     broadcastNewMessage(
       targetJid,
       {
         id: messageId,
         chat_jid: targetJid,
-        source_jid: chatJid,
+        source_jid: routeSourceJid,
         sender: senderOpenId,
         sender_name: resolvedSenderName,
         content: text,
@@ -1154,6 +1365,21 @@ export function createFeishuConnection(
         'Feishu message stored',
       );
     }
+    } catch (err) {
+      // 走到这里时该消息已被 dedup.markSeen 永久去重，且飞书 WS 不保证重投——
+      // 静默吞掉会让用户以为 bot 卡死。回一条简短提示引导用户重发（重发是新
+      // messageId，不受去重影响），并把异常完整记录下来。
+      logger.error(
+        { err, messageId, chatId, source },
+        'Feishu message intake failed after dedup markSeen',
+      );
+      // 仅实时消息提示重发；backfill 回填的旧消息失败不打扰用户。
+      if (source === 'ws') {
+        await sendTextToChat(chatId, '⚠️ 消息处理失败，请重发一次');
+      }
+    } finally {
+      processingLock.release(messageId);
+    }
   }
 
   async function backfillChatMessages(
@@ -1194,8 +1420,12 @@ export function createFeishuConnection(
             chat_type?: string;
             mentions?: FeishuMentionLike[];
             deleted?: boolean;
+            root_id?: string;
+            parent_id?: string;
+            thread_id?: string;
             sender?: {
               id?: string;
+              sender_type?: string;
               sender_id?: {
                 open_id?: string;
               };
@@ -1211,7 +1441,7 @@ export function createFeishuConnection(
         .filter((item) => {
           if (item.deleted === true || !item.message_id) return false;
           // 过滤 Bot 自身发送的消息，避免 backfill 将回复当作新消息处理
-          const senderType = (item as any).sender?.sender_type;
+          const senderType = item.sender?.sender_type;
           if (senderType === 'app') return false;
           return true;
         })
@@ -1221,6 +1451,9 @@ export function createFeishuConnection(
           return {
             chatId,
             messageId: item.message_id as string,
+            rootId: item.root_id || undefined,
+            parentId: item.parent_id || undefined,
+            threadId: item.thread_id || undefined,
             createTimeMs: toEpochMs(item.create_time),
             messageType: item.msg_type || item.message_type || '',
             content: item.body?.content || item.content || '',
@@ -1377,31 +1610,12 @@ export function createFeishuConnection(
         appType: lark.AppType.SelfBuild,
       });
 
-      // Fetch bot open_id for mention detection (best-effort, non-blocking)
-      try {
-        const botInfoRes = await client.request({
-          method: 'GET',
-          url: '/open-apis/bot/v3/info/',
-        });
-        const info = botInfoRes as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
-        botOpenId = info?.bot?.open_id || info?.data?.bot?.open_id || '';
-        if (botOpenId) {
-          logger.info(
-            { botOpenId },
-            'Fetched bot open_id for mention detection',
-          );
-        } else {
-          logger.warn(
-            'Could not fetch bot open_id, mention gating will be bypassed',
-          );
-        }
-      } catch (err) {
-        logger.warn(
-          { err },
-          'Failed to fetch bot info, mention gating will be bypassed',
-        );
-        botOpenId = '';
-      }
+      // Fetch bot open_id for mention detection — 带 retry 的 best-effort 拉取。
+      // 启动期失败后，健康检查 + 进入 mention 门控前的 lazy refetch 会兜底自愈，
+      // 期间 mention 守卫维持 fail-closed（拒绝群消息），不会回退到默认放行。
+      botOpenId = '';
+      lastBotInfoFetchAt = 0;
+      await fetchBotOpenIdWithRetry();
 
       // Create event dispatcher
       eventDispatcher = new lark.EventDispatcher({}).register({
@@ -1412,6 +1626,9 @@ export function createFeishuConnection(
               {
                 chatId: message.chat_id,
                 messageId: message.message_id,
+                rootId: message.root_id,
+                parentId: message.parent_id,
+                threadId: message.thread_id,
                 createTimeMs: toEpochMs(message.create_time),
                 messageType: message.message_type,
                 content: message.content,
@@ -1537,6 +1754,7 @@ export function createFeishuConnection(
       }
       client = null;
       lastWsStateConnected = false;
+      processingLock.dispose();
     },
 
     async sendMessage(
@@ -1552,38 +1770,14 @@ export function createFeishuConnection(
         return;
       }
 
-      const clearAckReaction = () => {
-        const ackStored = ackReactionByChat.get(chatId);
-        if (ackStored) {
-          const [ackMsgId, ackReactionId] = ackStored.split(':');
-          removeReaction(ackMsgId, ackReactionId).catch(() => {});
-          ackReactionByChat.delete(chatId);
-        }
-      };
-
       try {
         // Detect pre-built Feishu interactive card JSON — send directly without wrapping
         if (text.startsWith('{"type":"interactive"')) {
           try {
             const parsed = JSON.parse(text);
             if (parsed.type === 'interactive' && parsed.card) {
-              const lastMsgId = lastMessageIdByChat.get(chatId);
-              if (lastMsgId) {
-                await client.im.message.reply({
-                  path: { message_id: lastMsgId },
-                  data: { content: text, msg_type: 'interactive' },
-                });
-              } else {
-                await client.im.v1.message.create({
-                  params: { receive_id_type: 'chat_id' },
-                  data: {
-                    receive_id: chatId,
-                    msg_type: 'interactive',
-                    content: text,
-                  },
-                });
-              }
-              clearAckReaction();
+              await sendToFeishu(chatId, 'interactive', text);
+              clearAckForTarget(chatId);
               return;
             }
           } catch {
@@ -1599,74 +1793,21 @@ export function createFeishuConnection(
         if (usePostMd) {
           // Too many tables for card format, go directly to post+md
           const postContent = buildPostMdFallback(text);
-          const lastMsgId = lastMessageIdByChat.get(chatId);
-          if (lastMsgId) {
-            await client.im.message.reply({
-              path: { message_id: lastMsgId },
-              data: { content: postContent, msg_type: 'post' },
-            });
-          } else {
-            await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: {
-                receive_id: chatId,
-                msg_type: 'post',
-                content: postContent,
-              },
-            });
-          }
+          await sendToFeishu(chatId, 'post', postContent);
         } else {
           const card = buildInteractiveCard(text);
           const content = JSON.stringify(card);
-
-          const lastMsgId = lastMessageIdByChat.get(chatId);
-          if (lastMsgId) {
-            try {
-              await client.im.message.reply({
-                path: { message_id: lastMsgId },
-                data: { content, msg_type: 'interactive' },
-              });
-            } catch (err) {
-              logger.warn(
-                { err, chatId },
-                'Feishu interactive reply failed, fallback to post+md',
-              );
-              await client.im.message.reply({
-                path: { message_id: lastMsgId },
-                data: {
-                  content: buildPostMdFallback(text),
-                  msg_type: 'post',
-                },
-              });
-            }
-          } else {
-            try {
-              await client.im.v1.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: {
-                  receive_id: chatId,
-                  msg_type: 'interactive',
-                  content,
-                },
-              });
-            } catch (err) {
-              logger.warn(
-                { err, chatId },
-                'Feishu interactive create failed, fallback to post+md',
-              );
-              await client.im.v1.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: {
-                  receive_id: chatId,
-                  msg_type: 'post',
-                  content: buildPostMdFallback(text),
-                },
-              });
-            }
+          try {
+            await sendToFeishu(chatId, 'interactive', content);
+          } catch (err) {
+            logger.warn(
+              { err, chatId },
+              'Feishu interactive send failed, fallback to post+md',
+            );
+            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
           }
         }
         logger.debug({ chatId }, 'Sent Feishu card message');
-        clearAckReaction();
 
         for (const localImagePath of localImagePaths || []) {
           try {
@@ -1688,14 +1829,11 @@ export function createFeishuConnection(
               );
               continue;
             }
-            await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: {
-                receive_id: chatId,
-                msg_type: 'image',
-                content: JSON.stringify({ image_key: imageKey }),
-              },
-            });
+            await sendToFeishu(
+              chatId,
+              'image',
+              JSON.stringify({ image_key: imageKey }),
+            );
           } catch (imageErr) {
             logger.warn(
               { chatId, localImagePath, err: imageErr },
@@ -1703,9 +1841,10 @@ export function createFeishuConnection(
             );
           }
         }
+        clearAckForTarget(chatId);
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu card message');
-        clearAckReaction();
+        clearAckForTarget(chatId);
       }
     },
 
@@ -1749,40 +1888,13 @@ export function createFeishuConnection(
         }
 
         // Step 2: Send image message
-        // receive_id_type: group chat ids start with "oc_", DM open_ids start with "ou_"
-        const receive_id_type = chatId.startsWith('oc_')
-          ? 'chat_id'
-          : 'open_id';
-        const lastMsgId = lastMessageIdByChat.get(chatId);
-        const content = JSON.stringify({ image_key: imageKey });
-
-        if (lastMsgId) {
-          await client.im.message.reply({
-            path: { message_id: lastMsgId },
-            data: { content, msg_type: 'image' },
-          });
-        } else {
-          await client.im.v1.message.create({
-            params: { receive_id_type },
-            data: {
-              receive_id: chatId,
-              msg_type: 'image',
-              content,
-            },
-          });
-        }
+        await sendToFeishu(chatId, 'image', JSON.stringify({ image_key: imageKey }));
 
         // Step 3: If caption provided, send it as a follow-up text message
         if (caption) {
-          await client.im.v1.message.create({
-            params: { receive_id_type },
-            data: {
-              receive_id: chatId,
-              msg_type: 'text',
-              content: JSON.stringify({ text: caption }),
-            },
-          });
+          await sendToFeishu(chatId, 'text', JSON.stringify({ text: caption }));
         }
+        clearAckForTarget(chatId);
 
         logger.info(
           { chatId, imageKey, mimeType, size: imageBuffer.length },
@@ -1839,18 +1951,13 @@ export function createFeishuConnection(
           throw new Error('文件上传失败：未返回 file_key');
         }
 
+        // Determine msg_type: Feishu requires upload file_type and send msg_type to match.
+        // mp4 → media (video message), opus → audio (audio message), others → file.
+        const msgType = fileType === 'mp4' ? 'media' : fileType === 'opus' ? 'audio' : 'file';
+
         // Send file message
-        const receive_id_type = chatId.startsWith('oc_')
-          ? 'chat_id'
-          : 'open_id';
-        await client.im.v1.message.create({
-          params: { receive_id_type },
-          data: {
-            receive_id: chatId,
-            msg_type: 'file',
-            content: JSON.stringify({ file_key: fileKey }),
-          },
-        });
+        await sendToFeishu(chatId, msgType, JSON.stringify({ file_key: fileKey }));
+        clearAckForTarget(chatId);
 
         logger.info(
           { chatId, fileName, fileSize: buffer.length },
@@ -1867,31 +1974,29 @@ export function createFeishuConnection(
 
     async sendReaction(chatId: string, isTyping: boolean): Promise<void> {
       if (!client) return;
-      const lastMsgId = lastMessageIdByChat.get(chatId);
+      const target = parseFeishuRouteTarget(chatId);
+      const reactionKey = target.raw;
+      const lastMsgId =
+        target.rootMessageId || lastMessageIdByChat.get(target.chatId);
       if (!lastMsgId) return;
 
       if (isTyping) {
         const reactionId = await addReaction(lastMsgId, 'OnIt');
         if (reactionId) {
-          typingReactionByChat.set(chatId, `${lastMsgId}:${reactionId}`);
+          typingReactionByChat.set(reactionKey, `${lastMsgId}:${reactionId}`);
         }
       } else {
-        const stored = typingReactionByChat.get(chatId);
+        const stored = typingReactionByChat.get(reactionKey);
         if (stored) {
           const [msgId, reactionId] = stored.split(':');
           await removeReaction(msgId, reactionId);
-          typingReactionByChat.delete(chatId);
+          typingReactionByChat.delete(reactionKey);
         }
       }
     },
 
     clearAckReaction(chatId: string): void {
-      const ackStored = ackReactionByChat.get(chatId);
-      if (ackStored) {
-        const [ackMsgId, ackReactionId] = ackStored.split(':');
-        removeReaction(ackMsgId, ackReactionId).catch(() => {});
-        ackReactionByChat.delete(chatId);
-      }
+      clearAckForTarget(chatId);
     },
 
     isConnected(): boolean {
@@ -1901,8 +2006,9 @@ export function createFeishuConnection(
     async getChatInfo(chatId: string): Promise<FeishuChatInfo | null> {
       if (!client) return null;
       try {
+        const target = parseFeishuRouteTarget(chatId);
         const res = await client.im.v1.chat.get({
-          path: { chat_id: chatId },
+          path: { chat_id: target.chatId },
         });
         if (!res.data) return null;
         return {
@@ -1911,6 +2017,7 @@ export function createFeishuConnection(
           user_count: res.data.user_count,
           chat_type: res.data.chat_type,
           chat_mode: res.data.chat_mode,
+          group_message_type: (res.data as { group_message_type?: string }).group_message_type,
         };
       } catch (err) {
         logger.warn({ err, chatId }, 'Failed to get Feishu chat info');
@@ -1959,7 +2066,8 @@ export function createFeishuConnection(
     },
 
     getLastMessageId(chatId: string): string | undefined {
-      return lastMessageIdByChat.get(chatId);
+      const target = parseFeishuRouteTarget(chatId);
+      return target.rootMessageId || lastMessageIdByChat.get(target.chatId);
     },
   };
 

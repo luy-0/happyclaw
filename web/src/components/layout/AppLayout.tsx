@@ -5,15 +5,18 @@ import { BottomTabBar } from './BottomTabBar';
 import { ConnectionBanner } from '../common/ConnectionBanner';
 import { wsManager } from '../../api/ws';
 import { useTheme } from '../../hooks/useTheme';
+import { useRouteRestore } from '../../hooks/useRouteRestore';
 import { useBillingStore } from '../../stores/billing';
 import { useGroupsStore } from '../../stores/groups';
 import { useChatStore } from '../../stores/chat';
+import { useAuthStore } from '../../stores/auth';
 
 export function AppLayout() {
   const location = useLocation();
   const isChatRoute = location.pathname.startsWith('/chat');
   const hideMobileTabBar = /^\/chat\/.+/.test(location.pathname);
   useTheme(); // 应用并同步持久化的主题偏好
+  useRouteRestore(); // PWA 重启时恢复上次访问的路由（默认关闭，设置中启用）
 
   // Sidebar: expanded only on chat route, collapsed on other routes
   const [userCollapsed, setUserCollapsed] = useState(false);
@@ -73,6 +76,14 @@ export function AppLayout() {
     return () => { unsub(); };
   }, []);
 
+  // 更新 document.title，显示未读回复数
+  const totalUnread = useChatStore((s) => Object.values(s.unreadReplies).reduce((sum, n) => sum + n, 0));
+  const appearance = useAuthStore((s) => s.appearance);
+  useEffect(() => {
+    const appName = appearance?.appName || 'HappyClaw';
+    document.title = totalUnread > 0 ? `(${totalUnread}) ${appName}` : appName;
+  }, [totalUnread, appearance?.appName]);
+
   // 全局监听 agent_status，确保不在 ChatView 页面时也能更新 sub-agent 状态
   useEffect(() => {
     const unsub = wsManager.on('agent_status', (data: any) => {
@@ -80,6 +91,7 @@ export function AppLayout() {
         useChatStore.getState().handleAgentStatus(
           data.chatJid, data.agentId, data.status,
           data.name, data.prompt, data.resultSummary, data.kind,
+          data.titleGenerating,
         );
       }
     });

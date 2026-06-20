@@ -38,6 +38,8 @@ interface GroupState {
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
+  /** Provider profile ID selected for the current active runner (null = default/override). */
+  selectedProviderId: string | null;
   /** True when a _drain sentinel has been written for the current active runner. */
   drainSentinelWritten: boolean;
   /** True when messages have been IPC-injected into the running agent via sendMessage().
@@ -46,6 +48,15 @@ interface GroupState {
    *  re-read those messages.  The close handler uses this flag to force pendingMessages
    *  so drainGroup triggers a fresh run. */
   hasIpcInjectedMessages: boolean;
+  /**
+   * HappyClaw user id that started the current run (idle→active), or null when
+   * unknown (IM / task / agent / drain runs, or no initiator supplied). The
+   * stop/interrupt routes use it for a resource-level "owner OR initiator"
+   * check, so a shared member can stop/interrupt only the run they started, not
+   * the owner's. Set by the enqueue that starts a fresh run; cleared on idle.
+   * Subsequent IPC-injected messages during an active run do NOT change it.
+   */
+  currentRunInitiator: string | null;
 }
 
 type ActiveGroupState = GroupState & { groupFolder: string };
@@ -57,6 +68,13 @@ export class GroupQueue {
   private activeHostProcessCount = 0;
   private waitingGroups = new Set<string>();
   private contextOverflowGroups = new Set<string>(); // 跟踪发生上下文溢出的 group
+  // 记录最近一次 stopGroup 的时间戳（毫秒）。runForGroup finally 块会用它来
+  // 决定是否跳过自动 drainGroup —— stopGroup 中清空 pendingMessages 之后，
+  // hasIpcInjectedMessages 重新置 pendingMessages=true，会让用户的 'stop' 之后
+  // 容器立即又被拉起来。同时让主消息循环在 OOM 计数前看一眼这个标志，避免
+  // 把 user-stopped (SIGKILL → 137) 误判为真实 OOM 触发会话重置。
+  private recentlyStoppedFolders = new Map<string, number>();
+  private static RECENTLY_STOPPED_WINDOW_MS = 30_000;
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
@@ -94,12 +112,25 @@ export class GroupQueue {
         retryCount: 0,
         retryTimer: null,
         restarting: false,
+        selectedProviderId: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
+        currentRunInitiator: null,
       };
       this.groups.set(groupJid, state);
     }
     return state;
+  }
+
+  /** 当前重试轮次（0 = 首次尝试）。供 processMessages 侧识别静默重试轮。 */
+  getRetryCount(groupJid: string): number {
+    return this.groups.get(groupJid)?.retryCount ?? 0;
+  }
+
+  /** 本轮失败后队列是否还会再次重试（决定错误提示发本轮还是等最终失败）。 */
+  willRetryAfterFailure(groupJid: string): boolean {
+    if (this.contextOverflowGroups.has(groupJid)) return false;
+    return (this.groups.get(groupJid)?.retryCount ?? 0) < MAX_RETRIES;
   }
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
@@ -156,12 +187,51 @@ export class GroupQueue {
     );
   }
 
+  /**
+   * 公开 shutdown 状态供 scheduler 等子系统避免在关停过程中再启动新工作。
+   * 调度器主循环 tick 期间若已 shutdown，应直接 skip 这次 tick，避免在
+   * grace 窗口内 spawn 新脚本子进程导致孤儿。
+   */
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
   private clearRetryTimer(state: GroupState): void {
     if (state.retryTimer !== null) {
       clearTimeout(state.retryTimer);
       state.retryTimer = null;
     }
     state.retryCount = 0;
+  }
+
+  /**
+   * 仅取消正在排队的 retry 定时器，不重置 retryCount。
+   * interruptQuery 用这个：用户中断当前查询不应抹掉之前的 backoff 进度，
+   * 否则 N 次失败后正在退避的 runner 一被 interrupt 就回到 retry=0，
+   * 死循环重试同一个失败请求。
+   */
+  private cancelRetryTimer(state: GroupState): void {
+    if (state.retryTimer !== null) {
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+    }
+  }
+
+  /**
+   * Whether stopGroup was issued for this folder in the recent window.
+   * Used by:
+   *   1. runForGroup finally — skip pendingMessages re-arm + drainGroup
+   *   2. main loop OOM handler — don't count user-stopped 137 as OOM
+   *   3. anything else that needs to suppress auto-restart shortly after a stop
+   */
+  isRecentlyStopped(folder: string): boolean {
+    const ts = this.recentlyStoppedFolders.get(folder);
+    if (!ts) return false;
+    if (Date.now() - ts > GroupQueue.RECENTLY_STOPPED_WINDOW_MS) {
+      this.recentlyStoppedFolders.delete(folder);
+      return false;
+    }
+    return true;
   }
 
   private isHostMode(groupJid: string): boolean {
@@ -247,6 +317,39 @@ export class GroupQueue {
     return state?.active === true;
   }
 
+  /**
+   * The HappyClaw user id that started the currently-active *message* run owning
+   * this jid's serialization key, or null if unknown / no active run. Used by
+   * the stop/interrupt routes for a resource-level "owner OR initiator" ACL: a
+   * shared member may stop/interrupt only a message run they started themselves.
+   *
+   * Task runs (`activeRunnerIsTask` — scheduled tasks, agent conversations,
+   * terminal warmup) are deliberately EXCLUDED and return null → owner-only.
+   * currentRunInitiator is stamped at message-enqueue time and is NOT touched by
+   * runTask, so a base-jid task (e.g. terminal-warmup, index.ts) sharing the
+   * GroupState can go active while a member's still-pending message left an
+   * initiator on it; gating on `!activeRunnerIsTask` prevents that member from
+   * being mis-read as the task run's initiator (which would let them stop the
+   * owner's task). Not clearing the field in runTask is intentional — it lets
+   * the member's own pending message run still expose them once it starts.
+   *
+   * Unlike resolveActiveState this does NOT require groupFolder to be set, so
+   * the initiator is readable from the instant the run goes active (idle→active)
+   * — even during the cold-start window before registerProcess. It matches on
+   * `active` (+ not-a-task) + serialization key only.
+   */
+  getActiveRunInitiator(groupJid: string): string | null {
+    const own = this.groups.get(groupJid);
+    if (own?.active) {
+      return own.activeRunnerIsTask ? null : (own.currentRunInitiator ?? null);
+    }
+    const activeRunner = this.findActiveRunnerFor(groupJid);
+    if (!activeRunner) return null;
+    const runner = this.groups.get(activeRunner);
+    if (!runner || runner.activeRunnerIsTask) return null;
+    return runner.currentRunInitiator ?? null;
+  }
+
   /** Count active task runners whose JID starts with the given base JID + '#task:' */
   countActiveTaskRunners(baseJid: string): number {
     const prefix = baseJid + '#task:';
@@ -257,6 +360,40 @@ export class GroupQueue {
       }
     }
     return count;
+  }
+
+  /**
+   * List every virtual-JID runner that belongs to the same folder family as
+   * `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
+   * `{...}#task:{id}`), excluding the base JID itself — whether it is actively
+   * running OR merely QUEUED (capacity-blocked: in pendingTasks / waitingGroups,
+   * not yet active). Used by workspace-level operations (delete / clear-history)
+   * that stop every descendant before wiping the folder's filesystem.
+   *
+   * Including queued descendants is essential: a capacity-blocked sub-agent left
+   * out of the stop set would be picked up by drainWaiting after a slot frees and
+   * launch against a folder/session dir that was already deleted (container/
+   * process leak + ENOENT). stopGroup() on a queued descendant clears its
+   * pendingTasks and removes it from waitingGroups, so it never launches.
+   *
+   * Matching is done via serializationKey (folder-based), so descendants
+   * launched from any sibling JID sharing the same folder are all returned.
+   */
+  listDescendantJids(baseJid: string): string[] {
+    const baseKey = this.getSerializationKey(baseJid);
+    const prefix = baseKey + '#';
+    const result: string[] = [];
+    for (const [jid, state] of this.groups.entries()) {
+      if (!this.getSerializationKey(jid).startsWith(prefix)) continue;
+      if (
+        state.active ||
+        state.pendingTasks.length > 0 ||
+        this.waitingGroups.has(jid)
+      ) {
+        result.push(jid);
+      }
+    }
+    return result;
   }
 
   /**
@@ -313,7 +450,60 @@ export class GroupQueue {
     return stuck;
   }
 
-  enqueueMessageCheck(groupJid: string): void {
+  /**
+   * Get the PID of the active runner process for a group.
+   * Returns undefined if no active process or running in container mode.
+   */
+  getRunnerPid(groupJid: string): number | undefined {
+    const state = this.groups.get(groupJid);
+    return state?.process?.pid;
+  }
+
+  /**
+   * Resolve the active docker container name for a group, honoring the same
+   * sibling-JID / serialization-key rules as `sendMessage()`. Returns null
+   * when there is no active runner *or* the active runner is a host process.
+   *
+   * Used by the plugin-expander-core to decide whether an inline `!` bash
+   * template can run inside the user's container.
+   */
+  getActiveContainerName(groupJid: string): string | null {
+    const state = this.resolveActiveState(groupJid);
+    return state?.containerName ?? null;
+  }
+
+  /**
+   * Returns true iff `sendMessage(groupJid, ...)` would return 'sent' right
+   * now — i.e. there is an active runner and it is compatible with piping a
+   * user message in. Specifically:
+   *   - `resolveActiveState(groupJid)` returns non-null (active state, own
+   *     or via serialization sibling), AND
+   *   - the active runner is NOT a scheduled-task runner unless the caller
+   *     IS a `#agent:` conversation virtual JID (those are user-message
+   *     handlers started via `enqueueTask`).
+   *
+   * This predicate exists ONLY to gate web.ts eager plugin-command expansion
+   * against the same compatibility rules `sendMessage` uses internally.
+   * Returning `true` when `sendMessage` would actually return `no_active`
+   * causes a double-fire: eager expand runs inline `!` here, sendMessage
+   * rejects, cold-start re-reads the original DB row, expands a SECOND time,
+   * and inline `!` runs again under the wrong runner context (#21 round-13
+   * P1-1). The name is deliberately specific to discourage accidental reuse
+   * for "is a runner up at all?" semantics — that's `resolveActiveState() !==
+   * null`, which doesn't match `sendMessage`'s acceptance set.
+   */
+  hasActiveMainRunnerForMessage(groupJid: string): boolean {
+    const state = this.resolveActiveState(groupJid);
+    if (!state) return false;
+    // Task-runner exclusion mirrors sendMessage(). Conversation agents
+    // (`#agent:` virtual JIDs) DO accept IPC messages — exempt them.
+    if (state.activeRunnerIsTask && !groupJid.includes('#agent:')) {
+      return false;
+    }
+    return true;
+  }
+
+  enqueueMessageCheck(groupJid: string, initiatorUserId?: string): void {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
@@ -333,6 +523,15 @@ export class GroupQueue {
         'Group runner active, message queued',
       );
       return;
+    }
+
+    // Past the active / shared-active check → this jid will start its OWN fresh
+    // run (now, or once capacity frees). Record who initiated it so the
+    // stop/interrupt routes can do an owner-or-initiator check. Only overwrite
+    // when an initiator is explicitly supplied, so internal drain re-enqueues
+    // (no initiator) don't wipe a pending run's initiator.
+    if (initiatorUserId !== undefined) {
+      state.currentRunInitiator = initiatorUserId;
     }
 
     if (!this.hasCapacityFor(groupJid)) {
@@ -402,19 +601,23 @@ export class GroupQueue {
   registerProcess(
     groupJid: string,
     proc: ChildProcess,
-    containerName: string | null,
-    groupFolder?: string,
-    displayName?: string,
-    agentId?: string,
-    taskRunId?: string,
+    opts: {
+      containerName: string | null;
+      groupFolder?: string;
+      displayName?: string;
+      agentId?: string;
+      taskRunId?: string;
+      selectedProviderId?: string | null;
+    },
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
-    state.containerName = containerName;
-    state.displayName = displayName || null;
-    if (groupFolder) state.groupFolder = groupFolder;
-    state.agentId = agentId || null;
-    state.taskRunId = taskRunId || null;
+    state.containerName = opts.containerName;
+    state.displayName = opts.displayName || null;
+    if (opts.groupFolder) state.groupFolder = opts.groupFolder;
+    state.agentId = opts.agentId || null;
+    state.taskRunId = opts.taskRunId || null;
+    state.selectedProviderId = opts.selectedProviderId ?? null;
   }
 
   /**
@@ -457,6 +660,8 @@ export class GroupQueue {
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
     onInjected?: () => void,
+    sourceJid?: string,
+    taskId?: string,
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
@@ -492,15 +697,26 @@ export class GroupQueue {
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
       const filepath = path.join(inputDir, filename);
       const tempPath = `${filepath}.tmp`;
+      // Stamp taskId when this injection carries a scheduled-task prompt so the
+      // agent-runner can attribute the resulting send_message output to the task
+      // (drives notify_channels broadcast on the host). Omitted for regular
+      // user messages, matching the cold-start path's messageTaskId handling.
       fs.writeFileSync(
         tempPath,
-        JSON.stringify({ type: 'message', text, images }),
+        JSON.stringify({ type: 'message', text, images, sourceJid, taskId }),
       );
       fs.renameSync(tempPath, filepath);
       state.queryInFlight = true;
       onInjected?.();
       return 'sent';
-    } catch {
+    } catch (err) {
+      // 不静默：磁盘满 / 权限错 / inode 耗尽这些根因不应该被伪装成
+      // 'no_active'。下游会重新 enqueueMessageCheck 走 fallback 路径，
+      // 但运维需要看到根因日志。
+      logger.warn(
+        { groupJid, inputDir, err },
+        'GroupQueue.sendMessage: failed to write IPC input file, falling back to no_active',
+      );
       return 'no_active';
     }
   }
@@ -537,7 +753,7 @@ export class GroupQueue {
       : agentId
         ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
-    for (const name of ['_drain', '_close']) {
+    for (const name of ['_drain', '_close', '_interrupt']) {
       try {
         fs.unlinkSync(path.join(inputDir, name));
       } catch {
@@ -563,6 +779,12 @@ export class GroupQueue {
     context: string,
   ): void {
     if (!state.groupFolder) return;
+    // 与 runForGroup finally 的逻辑保持一致：刚被 stopGroup 标记的 folder 不
+    // 应该在这里重新点亮 pendingMessages，否则 stopGroup 之后的 drainGroup 路径
+    // 会拉起一个新 runner。
+    if (this.isRecentlyStopped(state.groupFolder)) {
+      return;
+    }
     try {
       if (!this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) return;
 
@@ -620,6 +842,27 @@ export class GroupQueue {
   }
 
   /**
+   * Signal a specific group's active container to gracefully exit.
+   * Used by provider switch: after the container exits, processGroupMessages
+   * will automatically restart it (picking up the new provider via override).
+   * Uses _drain (not _close) so the current query finishes before exit.
+   */
+  requestGracefulRestart(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    if (!state?.active || !state.groupFolder) return false;
+    const written = this.writeDrainSentinel(state as ActiveGroupState);
+    if (written) {
+      // Ensure close handler triggers a new run even if no messages are pending
+      state.pendingMessages = true;
+      logger.info(
+        { groupJid, groupFolder: state.groupFolder },
+        'Sent drain signal for provider switch',
+      );
+    }
+    return written;
+  }
+
+  /**
    * Close all active containers/processes so they restart with fresh credentials.
    * Called after OAuth token refresh to ensure running agents pick up new tokens.
    */
@@ -663,7 +906,9 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state) return false;
 
-    this.clearRetryTimer(state);
+    // 只取消等待中的 retry 定时器（如果有），不重置 retryCount —— 不让用户
+    // 中断把已积累的 backoff 进度归零。
+    this.cancelRetryTimer(state);
 
     const inputDir = this.resolveIpcInputDir(state);
     try {
@@ -700,6 +945,11 @@ export class GroupQueue {
     requestedState.pendingMessages = false;
     requestedState.pendingTasks = [];
     this.clearRetryTimer(requestedState);
+    // 标记 stop 时间：runForGroup finally + index.ts OOM 计数 + 主消息循环
+    // 都用这个时间窗判断 user-stopped vs 真 OOM / IPC-injected drain。
+    if (requestedState.groupFolder) {
+      this.recentlyStoppedFolders.set(requestedState.groupFolder, Date.now());
+    }
 
     const activeRunner = this.findActiveRunnerFor(groupJid);
     const targetJid = activeRunner || groupJid;
@@ -708,6 +958,9 @@ export class GroupQueue {
       state.pendingMessages = false;
       state.pendingTasks = [];
       this.clearRetryTimer(state);
+    }
+    if (state.groupFolder) {
+      this.recentlyStoppedFolders.set(state.groupFolder, Date.now());
     }
     this.waitingGroups.delete(groupJid);
     this.waitingGroups.delete(targetJid);
@@ -891,6 +1144,16 @@ export class GroupQueue {
     reason: 'messages' | 'drain',
   ): Promise<void> {
     const state = this.getGroup(groupJid);
+    // Defensive re-entrancy guard: never start a second runner on a GroupState
+    // that is already active. Pending work is picked up by the active runner's
+    // finally → drainGroup, so returning here loses nothing.
+    if (state.active) {
+      logger.warn(
+        { groupJid, reason },
+        'runForGroup called on already-active group, ignoring re-entry',
+      );
+      return;
+    }
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = false;
@@ -938,6 +1201,10 @@ export class GroupQueue {
       this.scheduleRetry(groupJid, state);
     } finally {
       // Clean up stale sentinel files before clearing groupFolder/agentId
+      const exitFolder = state.groupFolder;
+      const isStopRequested = exitFolder
+        ? this.isRecentlyStopped(exitFolder)
+        : false;
       if (state.groupFolder) {
         try {
           this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
@@ -951,11 +1218,21 @@ export class GroupQueue {
       // already replied to them, processGroupMessages will find 0 new messages
       // (cursor was committed) and return immediately — harmless.  If the
       // agent crashed, this ensures the messages are re-read from DB.
-      if (state.hasIpcInjectedMessages) {
+      //
+      // BUT: when the user just clicked Stop, this re-armed pendingMessages
+      // was racing stopGroup's clear → the agent restarted itself instantly.
+      // Honor stopGroup's intent by skipping this re-arm if a stop was issued
+      // for this folder in the last RECENTLY_STOPPED_WINDOW_MS.
+      if (state.hasIpcInjectedMessages && !isStopRequested) {
         state.pendingMessages = true;
         logger.debug(
           { groupJid },
           'IPC-injected messages detected, marking pending for safety re-check',
+        );
+      } else if (state.hasIpcInjectedMessages && isStopRequested) {
+        logger.info(
+          { groupJid, folder: exitFolder },
+          'Stop requested recently, skipping pendingMessages re-arm',
         );
       }
       state.active = false;
@@ -969,6 +1246,7 @@ export class GroupQueue {
       state.groupFolder = null;
       state.agentId = null;
       state.taskRunId = null;
+      state.currentRunInitiator = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -985,16 +1263,37 @@ export class GroupQueue {
       } catch (err) {
         logger.error({ groupJid, err }, 'onContainerExit callback failed');
       }
-      try {
-        this.drainGroup(groupJid);
-      } catch (err) {
-        logger.error({ groupJid, err }, 'drainGroup failed');
+      // Skip auto-drain when a stop was just requested — drainGroup would
+      // start a fresh runForGroup if any pending* slipped through.
+      if (!isStopRequested) {
+        try {
+          this.drainGroup(groupJid);
+        } catch (err) {
+          logger.error({ groupJid, err }, 'drainGroup failed');
+        }
+      } else {
+        logger.info(
+          { groupJid, folder: exitFolder },
+          'Stop requested recently, skipping drainGroup',
+        );
       }
     }
   }
 
   private async runTask(groupJid: string, task: QueuedTask): Promise<void> {
     const state = this.getGroup(groupJid);
+    // Defensive re-entrancy guard (see runForGroup): a task must never start on
+    // an already-active GroupState, or it would overwrite the live process
+    // handle and double-count the concurrency slot.
+    if (state.active) {
+      logger.warn(
+        { groupJid, taskId: task.id },
+        'runTask called on already-active group, re-queuing task',
+      );
+      state.pendingTasks.unshift(task);
+      this.waitingGroups.add(groupJid);
+      return;
+    }
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = true;
@@ -1163,8 +1462,36 @@ export class GroupQueue {
 
     this.waitingGroups.delete(groupJid);
 
+    // GC one-shot virtual JIDs (#task:/#agent:) once fully idle. Each task run
+    // uses a unique taskRunId → a unique JID, so without this the groups Map
+    // grows without bound. Only virtual JIDs are collected; real chat JIDs are
+    // bounded by the number of registered groups and keep useful state. We only
+    // reach here when there are no pending tasks and no runnable messages.
+    if (this.isVirtualJid(groupJid)) {
+      const s = this.groups.get(groupJid);
+      if (
+        s &&
+        !s.active &&
+        !s.queryInFlight &&
+        !s.pendingMessages &&
+        s.pendingTasks.length === 0 &&
+        !s.retryTimer &&
+        !s.restarting &&
+        !this.waitingGroups.has(groupJid)
+      ) {
+        this.groups.delete(groupJid);
+        this.contextOverflowGroups.delete(groupJid);
+        // fall through to drainWaiting so other waiting groups still get a slot
+      }
+    }
+
     // Nothing pending for this group; check if other groups are waiting for a slot
     this.drainWaiting();
+  }
+
+  /** Virtual JIDs are one-shot per run (`{jid}#task:{id}` / `{jid}#agent:{id}`). */
+  private isVirtualJid(jid: string): boolean {
+    return jid.includes('#task:') || jid.includes('#agent:');
   }
 
   private drainWaiting(): void {
@@ -1175,7 +1502,14 @@ export class GroupQueue {
 
     for (const jid of candidates) {
       const activeRunner = this.findActiveRunnerFor(jid);
-      if (activeRunner && activeRunner !== jid) continue;
+      // Any active runner sharing this serialization key — including jid's OWN
+      // runner — means no new runner may start. enqueueMessageCheck adds a jid
+      // to waitingGroups even while its own runner is active (state.active), so
+      // without checking self-active we would start a SECOND concurrent runner
+      // on the same GroupState (duplicate replies, orphaned containers, broken
+      // counters). Pending work is drained by the active runner's
+      // finally → drainGroup, so skipping here is safe (no starvation).
+      if (activeRunner) continue;
       if (!this.hasCapacityFor(jid)) continue;
 
       this.waitingGroups.delete(jid);
@@ -1227,6 +1561,8 @@ export class GroupQueue {
       pendingTasks: number;
       containerName: string | null;
       displayName: string | null;
+      groupFolder: string | null;
+      selectedProviderId: string | null;
     }>;
   } {
     const groups: Array<{
@@ -1236,6 +1572,8 @@ export class GroupQueue {
       pendingTasks: number;
       containerName: string | null;
       displayName: string | null;
+      groupFolder: string | null;
+      selectedProviderId: string | null;
     }> = [];
 
     for (const [jid, state] of this.groups) {
@@ -1246,6 +1584,8 @@ export class GroupQueue {
         pendingTasks: state.pendingTasks.length,
         containerName: state.containerName,
         displayName: state.displayName,
+        groupFolder: state.groupFolder,
+        selectedProviderId: state.selectedProviderId,
       });
     }
 
@@ -1275,6 +1615,25 @@ export class GroupQueue {
       },
       'GroupQueue shutting down, waiting for containers',
     );
+
+    // 主动写 _close sentinel：runForGroup 的 query() loop 一直在等 IPC 输入，
+    // 没有 sentinel 就需要等到 grace 用完再被 SIGTERM/docker stop 强制结束。
+    // 写入后 agent 看到 sentinel 自然 break loop、走 finally 清理、conversation
+    // archive 完成。和 closeAllActiveForCredentialRefresh 的策略一致。
+    for (const [, state] of this.groups) {
+      if (!state.active || !state.groupFolder) continue;
+      const inputDir = state.taskRunId
+        ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'tasks-run', state.taskRunId, 'input')
+        : state.agentId
+          ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'agents', state.agentId, 'input')
+          : path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+      try {
+        fs.mkdirSync(inputDir, { recursive: true });
+        fs.writeFileSync(path.join(inputDir, '_close'), '');
+      } catch {
+        // best effort — fall back to SIGTERM/docker stop later
+      }
+    }
 
     // Wait for activeCount to reach zero or timeout
     const startTime = Date.now();

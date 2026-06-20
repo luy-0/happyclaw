@@ -120,7 +120,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
             memberCount={showCollabBadge ? g.member_count : undefined}
             isActive={currentGroup === g.jid} isHome={false}
             isRunning={runnerStates[g.jid] === 'running'}
-            editable={g.editable} deletable={g.deletable}
+            canModify={g.can_modify}
             onSelect={handleGroupSelect}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={openClear}
@@ -238,7 +238,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                         <ChatGroupItem
                           jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
                           lastMessage={mainGroup.lastMessage}                          isActive={currentGroup === mainGroup.jid} isHome
-                          isRunning={runnerStates[mainGroup.jid] === 'running'} editable
+                          isRunning={runnerStates[mainGroup.jid] === 'running'} canModify={mainGroup.can_modify}
                           onSelect={handleGroupSelect}
                           onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                           onClearHistory={openClear}
@@ -258,7 +258,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                             lastMessage={g.lastMessage}                            isShared={g.is_shared} memberRole={g.member_role} memberCount={g.member_count}
                             isActive={currentGroup === g.jid} isHome={false} isPinned
                             isRunning={runnerStates[g.jid] === 'running'}
-                            editable={g.editable} deletable={g.deletable}
+                            canModify={g.can_modify}
                             onSelect={handleGroupSelect}
                             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                             onClearHistory={openClear}
@@ -305,7 +305,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
         <BugReportDialog open={showBugReport} onClose={() => setShowBugReport(false)} />
         <CreateContainerDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} />
         <RenameDialog open={renameState.open} jid={renameState.jid} currentName={renameState.name} onClose={() => setRenameState({ open: false, jid: '', name: '' })} />
-        <ConfirmDialog open={clearState.open} onClose={closeClear} onConfirm={handleClearConfirm} title="重建工作区" message={`确认重建「${clearState.name}」？不可撤销。`} confirmText="确认重建" confirmVariant="danger" loading={clearLoading} />
+        <ConfirmDialog open={clearState.open} onClose={closeClear} onConfirm={handleClearConfirm} title="重建工作区" message={`确认重建「${clearState.name}」？会清除全部聊天记录、上下文、所有子对话及其消息，并删除工作目录文件。持久化目录 (data/extra/) 与定时任务本身保留。不可撤销。`} confirmText="确认重建" confirmVariant="danger" loading={clearLoading} />
         <ConfirmDialog open={deleteState.open} onClose={() => setDeleteState({ open: false, jid: '', name: '' })} onConfirm={handleDeleteConfirm} title="删除工作区" message={`确认删除「${deleteState.name}」？不可撤销。`} confirmText="删除" confirmVariant="danger" loading={deleteLoading} />
     </TooltipProvider>
   );

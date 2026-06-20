@@ -5,8 +5,10 @@ import { useAuthStore } from '../../stores/auth';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
 import { EmojiAvatar } from '../common/EmojiAvatar';
+import { ErrorBoundary } from '../common';
 import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square, Code2, Zap, BookOpen, Wrench } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
+import { resolveSystemMessage } from '../../lib/system-message-registry';
 
 interface MessageListProps {
   messages: Message[];
@@ -34,6 +36,14 @@ type FlatItem =
   | { type: 'error'; content: string }
   | { type: 'message'; content: Message };
 
+// Intl.DateTimeFormat construction is expensive; reuse one instance across all
+// rows so flatMessages doesn't re-pay the cost per message on every re-group.
+const DATE_LABEL_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+});
+
 const quickPrompts = [
   { icon: Code2, title: '分析代码', desc: '帮我阅读和分析一段代码的逻辑' },
   { icon: Zap, title: '自动化脚本', desc: '编写一个自动化处理任务的脚本' },
@@ -44,6 +54,7 @@ const quickPrompts = [
 export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, onSend }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
+  const thinkingDurationCache = useChatStore(s => s.thinkingDurationCache ?? {});
   const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
   // Spawn agents: selector returns stable reference (the agents array itself),
   // then useMemo filters for spawn kind. Direct .filter() in selector causes
@@ -64,15 +75,39 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
   const prevMessageCount = useRef(messages.length);
+  // Window during which the scroll handler ignores updates and the streaming
+  // RAF skips its catch-up scroll, so a user-initiated smooth scroll can run
+  // uninterrupted (≈500ms browser default + 100ms slack).
+  const smoothScrollUntilRef = useRef(0);
+  const smoothCatchUpTimerRef = useRef<number | null>(null);
+  const SMOOTH_SCROLL_LOCK_MS = 600;
+
+  const scheduleSmoothCatchUp = useCallback(() => {
+    if (smoothCatchUpTimerRef.current !== null) {
+      window.clearTimeout(smoothCatchUpTimerRef.current);
+    }
+    const delay = Math.max(0, smoothScrollUntilRef.current - Date.now()) + 16;
+    smoothCatchUpTimerRef.current = window.setTimeout(() => {
+      smoothCatchUpTimerRef.current = null;
+      if (!scrollStateRef.current.autoScroll) return;
+      const parent = parentRef.current;
+      if (!parent) return;
+      parent.scrollTo({ top: parent.scrollHeight });
+    }, delay);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (smoothCatchUpTimerRef.current !== null) {
+        window.clearTimeout(smoothCatchUpTimerRef.current);
+      }
+    };
+  }, []);
 
   // Compute flatMessages (with date headers) before virtualizer
   const flatMessages = useMemo<FlatItem[]>(() => {
     const grouped = messages.reduce((acc, msg) => {
-      const date = new Date(msg.timestamp).toLocaleDateString('zh-CN', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric',
-      });
+      const date = DATE_LABEL_FORMATTER.format(new Date(msg.timestamp));
       if (!acc[date]) acc[date] = [];
       acc[date].push(msg);
       return acc;
@@ -83,16 +118,11 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       items.push({ type: 'date', content: date });
       msgs.forEach((msg) => {
         if (msg.sender === '__system__') {
-          if (msg.content === 'context_reset') {
-            items.push({ type: 'divider', content: '上下文已清除' });
-          } else if (msg.content === 'query_interrupted') {
-            items.push({ type: 'divider', content: '已中断' });
-          } else if (msg.content.startsWith('agent_error:')) {
-            items.push({ type: 'error', content: msg.content.slice('agent_error:'.length) });
-          } else if (msg.content.startsWith('agent_max_retries:')) {
-            items.push({ type: 'error', content: msg.content.slice('agent_max_retries:'.length) });
-          } else if (msg.content.startsWith('system_info:')) {
-            items.push({ type: 'divider', content: msg.content.slice('system_info:'.length) });
+          if (msg.content.startsWith('context_overflow:')) {
+            items.push({ type: 'message', content: msg });
+          } else {
+            const resolved = resolveSystemMessage(msg.content);
+            items.push({ type: resolved.style, content: resolved.text });
           }
         } else if (!msg.is_from_me && /^\/(sw|spawn)\s+/i.test(msg.content)) {
           // /sw or /spawn commands render as compact spawn-task cards
@@ -147,17 +177,26 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     overscan: window.innerWidth < 1024 ? 12 : 8,
   });
 
-  // 检测向上滚动触发 loadMore + 保存滚动位置
+  // Detect at-bottom (autoScroll) and at-top (loadMore) via the scroll event.
+  // Critically, this fires only on actual scroll events — not when scrollHeight
+  // grows during streaming with scrollTop unchanged. So content growth never
+  // spuriously flips autoScroll off (the failure mode of the IntersectionObserver
+  // approach in PR #455). The ref is updated synchronously to avoid races with
+  // the streaming RAF catch-up.
   useEffect(() => {
     const parent = parentRef.current;
     if (!parent) return;
 
     const handleScroll = () => {
+      // While a programmatic smooth scroll is animating, ignore intermediate
+      // scroll events — they would briefly set autoScroll=false mid-animation
+      // and flicker the floating "scroll to bottom" button.
+      if (Date.now() < smoothScrollUntilRef.current) return;
+
       const { scrollTop, scrollHeight, clientHeight } = parent;
-      const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+      const isAtBottom = scrollHeight - scrollTop - clientHeight < 10;
       const isAtTop = scrollTop < 50;
 
-      // Only trigger setState when value actually changes
       if (scrollStateRef.current.autoScroll !== isAtBottom) {
         scrollStateRef.current.autoScroll = isAtBottom;
         setAutoScroll(isAtBottom);
@@ -180,21 +219,30 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   useEffect(() => {
     if (autoScroll && messages.length > prevMessageCount.current) {
       requestAnimationFrame(() => {
-        parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight, behavior: 'smooth' });
+        const parent = parentRef.current;
+        if (!parent) return;
+        smoothScrollUntilRef.current = Date.now() + SMOOTH_SCROLL_LOCK_MS;
+        parent.scrollTo({ top: parent.scrollHeight, behavior: 'smooth' });
+        scheduleSmoothCatchUp();
       });
     }
     prevMessageCount.current = messages.length;
-  }, [messages.length, autoScroll]);
+  }, [messages.length, autoScroll, scheduleSmoothCatchUp]);
 
   // 外部触发滚到底部（发送消息后）
   useEffect(() => {
     if (scrollTrigger && scrollTrigger > 0) {
+      scrollStateRef.current.autoScroll = true;
       setAutoScroll(true);
       requestAnimationFrame(() => {
-        parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight, behavior: 'smooth' });
+        const parent = parentRef.current;
+        if (!parent) return;
+        smoothScrollUntilRef.current = Date.now() + SMOOTH_SCROLL_LOCK_MS;
+        parent.scrollTo({ top: parent.scrollHeight, behavior: 'smooth' });
+        scheduleSmoothCatchUp();
       });
     }
-  }, [scrollTrigger]);
+  }, [scrollTrigger, scheduleSmoothCatchUp]);
 
   // Fallback: 消息在挂载后加载（首次页面加载时 store 为空）
   // initialOffset 只在挂载时生效，消息后加载需要手动定位
@@ -244,28 +292,71 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flatMessages.length]);
 
-  // Auto-scroll when streaming content is active — poll-based to avoid
-  // re-rendering on every text_delta (the streaming object changes very frequently).
+  // Auto-scroll when streaming content is active. Subscribes directly to the
+  // chat store (no React re-render) and schedules a single rAF-coalesced
+  // scrollTo per animation frame, regardless of how many text_delta /
+  // thinking_delta updates land. This replaces the 100ms setInterval poll
+  // (PR #455 era) which competed with smooth scrolls and caused 3-4 visible
+  // jumps when the user scrolled to the bottom mid-stream.
   const hasStreaming = useChatStore(s =>
     agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? '']
   );
   useEffect(() => {
-    if (!autoScroll || !hasStreaming) return;
-    const id = setInterval(() => {
-      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
-    }, 100);
-    return () => clearInterval(id);
-  }, [hasStreaming, autoScroll]);
+    if (!hasStreaming) return;
+
+    let raf = 0;
+    const schedule = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        // Yield to any in-progress smooth scroll so we don't snap-interrupt it.
+        if (Date.now() < smoothScrollUntilRef.current) {
+          scheduleSmoothCatchUp();
+          return;
+        }
+        if (!scrollStateRef.current.autoScroll) return;
+        const parent = parentRef.current;
+        if (!parent) return;
+        parent.scrollTo({ top: parent.scrollHeight });
+      });
+    };
+
+    const readStreaming = (state: ReturnType<typeof useChatStore.getState>) =>
+      agentId ? state.agentStreaming[agentId] : state.streaming[groupJid ?? ''];
+
+    let prevText = readStreaming(useChatStore.getState())?.partialText ?? '';
+    let prevThinking = readStreaming(useChatStore.getState())?.thinkingText ?? '';
+
+    const unsubscribe = useChatStore.subscribe((state) => {
+      const cur = readStreaming(state);
+      const curText = cur?.partialText ?? '';
+      const curThinking = cur?.thinkingText ?? '';
+      if (curText !== prevText || curThinking !== prevThinking) {
+        prevText = curText;
+        prevThinking = curThinking;
+        schedule();
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [hasStreaming, agentId, groupJid, scheduleSmoothCatchUp]);
 
   const scrollToTop = useCallback(() => {
     parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
 
   const scrollToBottom = useCallback(() => {
+    scrollStateRef.current.autoScroll = true;
+    setAutoScroll(true);
+    smoothScrollUntilRef.current = Date.now() + SMOOTH_SCROLL_LOCK_MS;
     const parent = parentRef.current;
     if (!parent) return;
     parent.scrollTo({ top: parent.scrollHeight, behavior: 'smooth' });
-  }, []);
+    scheduleSmoothCatchUp();
+  }, [scheduleSmoothCatchUp]);
 
   const showScrollButtons = messages.length > 0;
 
@@ -409,7 +500,9 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                 ref={virtualizer.measureElement}
                 data-index={virtualItem.index}
               >
-                <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} isShared={isShared} />
+                <ErrorBoundary>
+                  <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} thinkingDurationMs={thinkingDurationCache[message.id]} isShared={isShared} />
+                </ErrorBoundary>
               </div>
             );
           })}

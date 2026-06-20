@@ -3,11 +3,10 @@
 
 FROM node:22-slim
 
-# Copy uv from official image (multi-arch, no extra download)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uvx /usr/local/bin/uvx
-
 # Install system packages (organized by category)
+# NOTE: Keep this layer BEFORE `COPY --from=ghcr.io/astral-sh/uv:latest` so that
+# uv:latest digest churn (frequent releases) does not invalidate this ~440MB layer.
+# See issue #403.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # --- Browser & fonts ---
     chromium \
@@ -85,6 +84,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Symlink fd-find → fd (Debian names it fdfind)
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
+# Copy uv from official image (multi-arch, no extra download).
+# Placed AFTER the apt-get layer: uv:latest releases frequently, so its digest
+# changes invalidate this layer on most rebuilds. Keeping the heavy apt-get
+# layer above ensures it stays cached across uv version bumps. See issue #403.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uvx /usr/local/bin/uvx
+
 # Locale environment
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
@@ -109,42 +115,28 @@ ARG CACHEBUST=1
 RUN npm install -g agent-browser
 RUN npm install
 
-# Install Tailscale (userspace networking for SSH to Mac)
-# Non-fatal: network issues may cause transient failures
-RUN curl -fsSL https://tailscale.com/install.sh | sh 2>&1 | tail -5 \
-    || echo "WARNING: Failed to install Tailscale, skipping"
-
-# Install GitHub CLI (gh)
-# Non-fatal: network issues may cause transient failures
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/* \
-    && gh --version \
-    || echo "WARNING: Failed to install GitHub CLI, skipping"
-
-# Install feishu-cli (pre-compiled binary from GitHub Releases)
-# Non-fatal: GitHub API rate limits may cause transient failures
+# Install feishu-cli (binary + builtin skills), 始终跟踪 latest release。
+# 通过 302 redirect 从 github.com/releases/latest 的 Location header 提取 tag
+# （和 install.sh 作者自己用的技巧一致），不经 api.github.com 规避 rate limit。
+# CACHEBUST 已在此前触发，每次构建都会重新解析 latest。
 ARG TARGETARCH
-RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}"; \
-    VERSION=$(curl -fsSL https://api.github.com/repos/riba2534/feishu-cli/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null); \
-    if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then \
-      curl -fsSL "https://github.com/riba2534/feishu-cli/releases/download/${VERSION}/feishu-cli_${VERSION}_linux-${ARCH}.tar.gz" \
-        | tar -xz --strip-components=1 -C /usr/local/bin && \
-      feishu-cli --version; \
-    else \
-      echo "WARNING: Failed to fetch feishu-cli version (GitHub API rate limit?), skipping installation"; \
-    fi
-
-# Install feishu-cli skills (builtin, lowest priority in discovery)
-# Non-fatal: GitHub API rate limits may cause transient failures
-RUN mkdir -p /opt/builtin-skills; \
-    curl -fsSL https://api.github.com/repos/riba2534/feishu-cli/tarball/main 2>/dev/null \
-      | tar -xz --strip-components=2 -C /opt/builtin-skills --wildcards '*/skills/*' 2>/dev/null \
-    && ls /opt/builtin-skills/ \
-    || echo "WARNING: Failed to fetch feishu-cli skills, skipping"
+RUN set -e && \
+    ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    VERSION=$(curl -sI "https://github.com/riba2534/feishu-cli/releases/latest" \
+      | grep -i '^location:' | head -1 \
+      | sed 's|.*/tag/\([^[:space:]]*\).*|\1|' | tr -d '\r\n') && \
+    if [ -z "$VERSION" ]; then echo "ERROR: 无法从 github.com 302 redirect 解析 feishu-cli 最新版本"; exit 1; fi && \
+    echo "Installing feishu-cli $VERSION for $ARCH" && \
+    curl -fsSL "https://github.com/riba2534/feishu-cli/releases/download/${VERSION}/feishu-cli_${VERSION}_linux-${ARCH}.tar.gz" \
+      | tar -xz --strip-components=1 -C /usr/local/bin && \
+    feishu-cli --version && \
+    mkdir -p /opt/builtin-skills && \
+    SKILLS_TMP=$(mktemp -d) && \
+    curl -fsSL "https://github.com/riba2534/feishu-cli/archive/refs/tags/${VERSION}.tar.gz" \
+      | tar -xz -C "$SKILLS_TMP" && \
+    cp -r "$SKILLS_TMP"/*/skills/. /opt/builtin-skills/ && \
+    rm -rf "$SKILLS_TMP" && \
+    ls /opt/builtin-skills/
 
 # Copy source code
 COPY agent-runner/ ./
@@ -162,10 +154,17 @@ RUN chmod +x /app/entrypoint.sh
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace
 
-# Install oh-my-zsh for node user (ys theme)
-RUN su - node -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended' \
+# Install oh-my-zsh for node user (ys theme).
+# Best-effort: the installer pulls install.sh from raw.githubusercontent.com AND
+# git-clones the ohmyzsh repo from github.com — both are flaky behind some
+# networks (notably CN), where the clone doesn't fail fast but HANGS. A plain
+# `|| echo` can't rescue a hang, so wrap in `timeout` to cap the attempt. It's a
+# cosmetic shell theme, NOT required by the agent runtime, so timeout/failure
+# must fall back to the default shell rather than abort the whole image build.
+RUN timeout -k 5 90 su - node -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended' \
     && sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' /home/node/.zshrc \
-    && chsh -s /bin/zsh node
+    && chsh -s /bin/zsh node \
+    || echo "⚠️ oh-my-zsh setup skipped (network slow/unavailable); container keeps default shell"
 
 # Entrypoint runs as root to fix volume permissions, then drops to node user.
 # Do NOT add USER node here — entrypoint handles the privilege drop.

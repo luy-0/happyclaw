@@ -6,7 +6,7 @@
 
 HappyClaw 是一个自托管的多用户 AI Agent 系统：
 
-- **输入**：飞书 / Telegram / QQ / 钉钉 / Web 界面消息（每个用户可独立配置 IM 通道）
+- **输入**：飞书 / Telegram / QQ / 钉钉 / WhatsApp（基于 Baileys）/ Web 界面消息（每个用户可独立配置 IM 通道）
 - **执行**：Docker 容器或宿主机进程中运行 Claude Agent（基于 Claude Agent SDK），每个用户拥有独立主容器
 - **输出**：飞书富文本卡片 / Telegram HTML / QQ 纯文本 / Web 实时流式推送
 - **记忆**：Agent 自主维护 `CLAUDE.md` 和工作区文件，实现跨会话持久记忆
@@ -22,7 +22,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/routes/auth.ts` | 认证：登录 / 登出 / 注册、`GET /api/auth/me`（含 `setupStatus`）、设置向导、RBAC、邀请码 |
 | `src/routes/groups.ts` | 群组 CRUD、消息分页、会话重置（重建工作区）、群组级容器环境变量 |
 | `src/routes/files.ts` | 文件上传（50MB 限制）/ 下载 / 删除、目录管理、路径遍历防护 |
-| `src/routes/config.ts` | Claude / 飞书配置（AES-256-GCM 加密存储）、连通性测试、批量应用到所有容器、per-user IM 通道配置（`/api/config/user-im/feishu`、`/api/config/user-im/telegram`、`/api/config/user-im/qq`、`/api/config/user-im/dingtalk`） |
+| `src/routes/config.ts` | Claude / 飞书配置（AES-256-GCM 加密存储）、连通性测试、批量应用到所有容器、per-user IM 通道配置（`/api/config/user-im/feishu`、`/api/config/user-im/telegram`、`/api/config/user-im/qq`、`/api/config/user-im/dingtalk`、`/api/config/user-im/whatsapp`） |
 | `src/routes/monitor.ts` | 系统状态：容器列表、队列状态、健康检查（`GET /api/health` 无需认证） |
 | `src/routes/memory.ts` | 记忆文件读写（`groups/global/` + `groups/{folder}/`）、全文检索 |
 | `src/routes/tasks.ts` | 定时任务 CRUD + 执行日志查询 |
@@ -31,13 +31,17 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/routes/browse.ts` | 目录浏览 API（`GET/POST /api/browse/directories`，受挂载白名单约束） |
 | `src/routes/agents.ts` | Sub-Agent CRUD（`GET/POST/DELETE /api/groups/:jid/agents`） |
 | `src/routes/mcp-servers.ts` | MCP Servers 管理（CRUD + `POST /api/mcp-servers/sync-host`，per-user） |
+| `src/routes/plugins.ts` | Claude Code Plugins 管理（catalog + per-user enable + versioned runtime）：admin 通过 `POST /api/plugins/catalog/scan` 触发宿主机扫描共享导入 catalog；用户从 catalog enable（`PATCH /api/plugins/enabled/:fullId`，自动 materialize runtime）；`DELETE /api/plugins/marketplaces/:name` 仅清除调用者自己的 enabled refs，不删 catalog |
+| `src/plugin-utils.ts` | Plugin 加载工具：`loadUserPlugins(userId, {runtime})` → `SdkPluginConfig[]`；per-user enable refs 在 `data/plugins/users/{userId}/plugins.json`，runtime materialize 到 `data/plugins/runtime/{userId}/snapshots/{snapshotId}/{marketplace}/{plugin}/` |
+| `src/plugin-dependency-check.ts` | Plugin 依赖 best-effort 预检：扫描 plugin 目录下 `commands/*.md` frontmatter 的 `allowed-tools: Bash()` + `hooks/hooks.json` 的 command 第一 token；`config/plugin-deps-override.json` 人工覆盖表优先级最高 |
 | `src/feishu.ts` | 飞书连接工厂（`createFeishuConnection`）：WebSocket 长连接、消息去重（LRU 1000 条 / 30min TTL）、富文本卡片、Reaction；`file` 消息下载到工作区；`post` 图文消息仅提取文字 |
 | `src/telegram.ts` | Telegram 连接工厂（`createTelegramConnection`）：Bot API Long Polling、Markdown → HTML 转换、长消息分片（3800 字符）；`message:photo` 下载为 base64 供 Vision；`message:document` 下载文件到工作区 |
 | `src/qq.ts` | QQ 连接工厂（`createQQConnection`）：Bot API v2 WebSocket 长连接、OAuth Token 管理、C2C 私聊 + 群聊 @Bot、消息去重（LRU 1000 条 / 30min TTL）、Markdown → 纯文本、长消息分片（5000 字符）、图片下载为 base64 供 Vision |
 | `src/dingtalk.ts` | 钉钉连接工厂（`createDingTalkConnection`）：Stream 协议长连接、消息去重（LRU 1000 条 / 30min TTL）；支持 `text`、`picture`（通过 downloadCode 下载）和 `image`（通过 contentUrl 下载）；图片超过 5MB 不发 base64，仅保存到 `downloads/dingtalk/` |
+| `src/whatsapp.ts` | WhatsApp 连接工厂（`createWhatsAppConnection`）：基于 `@whiskeysockets/baileys` 的 WhatsApp Web 协议；`useMultiFileAuthState` 持久化登录态；QR 经 `qrcode` 渲染 PNG data URL 推前端；自动 3s 重连（logged_out 不重连避免 QR 风暴）；`messages.upsert` 转发文本 + 媒体（image/video/audio/document）下载到 `downloads/whatsapp/{date}/`；小图片附 base64 attachment 供 Vision；`group-participants.update` 触发 onBotAddedToGroup / onBotRemovedFromGroup；群组 `require_mention` 通过 `mentionedJid` 与 `sock.user.id` 比对。详见 §8.13 |
 | `src/dingtalk-streaming-card.ts` | 钉钉 AI Card 流式响应控制器（打字机效果） |
 | `src/im-downloader.ts` | IM 文件下载工具：`saveDownloadedFile()` 将 Buffer 写入 `downloads/{channel}/{YYYY-MM-DD}/`，支持 `feishu`/`telegram`/`qq`/`dingtalk` 通道，处理路径安全、文件名冲突和 50MB 限制 |
-| `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 飞书/Telegram/QQ/钉钉连接管理、热重连、批量断开 |
+| `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 飞书/Telegram/QQ/钉钉/Discord/WhatsApp 连接管理、热重连、批量断开 |
 | `src/container-runner.ts` | 容器生命周期：Docker run + 宿主机进程模式、卷挂载构建（isAdminHome 区分权限）、环境变量注入 |
 | `src/agent-output-parser.ts` | Agent 输出解析：OUTPUT_MARKER 流式输出解析、stdout/stderr 处理、进程生命周期回调（从 container-runner.ts 提取的共享逻辑） |
 | `src/group-queue.ts` | 并发控制：最大 20 容器 + 最大 5 宿主机进程、会话级队列、任务优先于消息、指数退避重试 |
@@ -60,7 +64,6 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/terminal-manager.ts` | Docker 容器终端管理（node-pty + pipe fallback，WebSocket 双向通信） |
 | `src/message-attachments.ts` | 图片附件规范化（MIME 检测、Data URL 解析） |
 | `src/image-detector.ts` | 图片 MIME 检测（magic bytes），由 `shared/image-detector.ts` 同步 |
-| `src/daily-summary.ts` | 每日对话汇总（凌晨 2-3 点，per-user，写入 HEARTBEAT.md） |
 | `src/script-runner.ts` | 脚本任务执行器（`exec()` + 并发限制 + 超时 + 1MB 输出缓冲） |
 | `src/reset-admin.ts` | 管理员密码重置脚本入口 |
 | `src/config.ts` | 常量：路径、超时、并发限制、会话密钥（优先级：环境变量 > 文件 > 生成，0600 权限） |
@@ -209,8 +212,15 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 | IPC 通道 `data/ipc/{folder}/` | `/workspace/ipc` | 读写 | 读写（仅自己） |
 | 项目级 Skills `container/skills/` | `/workspace/project-skills` | 只读 | 只读 |
 | 用户级 Skills `~/.claude/skills/` | `/workspace/user-skills` | 只读 | admin 创建的会话可读 |
+| feishu-cli OAuth 状态 `data/config/user-cli/{userId}/feishu-cli/` | `/home/node/.feishu-cli` | 读写 | 读写（仅自己） |
 | 环境变量 `data/env/{folder}/env` | `/workspace/env-dir/env` | 只读 | 只读 |
+| 持久 extra 目录 `data/extra/{folder}/` | `/workspace/extra` | 读写 | 读写（仅自己） |
 | 额外挂载（白名单内） | `/workspace/extra/{name}` | 按白名单 | 按白名单（`nonMainReadOnly` 时强制只读） |
+| 持久化 npm 全局包 `data/extra/{folder}/.npm-global/` | `/workspace/extra/.npm-global` | 读写 | 读写（仅自己） |
+
+> **npm 全局包持久化**：容器内 npm prefix 由 entrypoint.sh 指向 `/workspace/extra/.npm-global/`，PATH 也包含该目录的 `bin/`。Agent 在容器内执行 `npm install -g <pkg>`（如 `lark-cli`、`@fanfanv5/feishu-cli`、各类 npx 风格的 MCP server 包）会自动持久化到 host 端 `data/extra/{folder}/.npm-global/`，下次新容器启动直接可用，不会因 `docker run --rm` 销毁而丢失。Per-user 隔离（每个 home folder 有独立 extra 目录）。注意：跨 CPU 架构迁移时（如 ARM64 ↔ x86_64）带 native module 的包会失效，纯 JS 包不影响。
+>
+> 注意：本机制依赖 `container/entrypoint.sh`，更新后需通过 `./container/build.sh` 重建镜像才能生效。
 
 ### 3.5 配置优先级
 
@@ -323,7 +333,7 @@ SQLite WAL 模式，Schema 经历 v1→v24 演进（`db.ts` 中的 `SCHEMA_VERSI
 | `scheduled_tasks` | `id` | 定时任务（调度类型、上下文模式、状态、`execution_type`、`script_command`、`created_by`） |
 | `task_run_logs` | `id` (auto) | 任务执行日志（耗时、状态、结果） |
 | `registered_groups` | `jid` | 注册的会话（folder 映射、容器配置、执行模式、`customCwd`、`is_home`、`init_source_path`、`init_git_url`、`selected_skills`、`require_mention`） |
-| `sessions` | `(group_folder, agent_id)` | 会话 ID 映射（Claude session 持久化，支持 Sub-Agent 独立会话） |
+| `sessions` | `(group_folder, agent_id)` | 会话 ID 映射（Claude session 持久化，支持 Sub-Agent 独立会话；`provider_id` 字段用于 ProviderPool sticky 选择，避免跨 OAuth 账号 thinking block 签名失效） |
 | `router_state` | `key` | KV 存储（`last_timestamp`、`last_agent_timestamp`） |
 | `users` | `id` | 用户账户（密码哈希、角色、权限、状态、`ai_name`、`ai_avatar_emoji`、`ai_avatar_color`、`avatar_emoji`、`avatar_color`、`ai_avatar_url`、`deleted_at`） |
 | `user_sessions` | `id` | 登录会话（token、过期时间、最后活跃） |
@@ -366,12 +376,18 @@ data/
   config/user-im/{userId}/telegram.json    # 用户级 Telegram IM 配置（AES-256-GCM 加密）
   config/user-im/{userId}/qq.json          # 用户级 QQ IM 配置（AES-256-GCM 加密）
   config/user-im/{userId}/dingtalk.json   # 用户级钉钉 IM 配置（AES-256-GCM 加密）
+  config/user-cli/{userId}/feishu-cli/     # 用户级 feishu-cli OAuth 状态（token.json + config.yaml，bind-mount 到容器 /home/node/.feishu-cli）
   config/registration.json                 # 注册设置（开关、邀请码要求）
   config/session-secret.key                # 会话签名密钥（0600 权限）
   config/system-settings.json              # 系统运行参数（容器超时、并发限制等）
+  extra/{folder}/                            # 容器持久 extra 目录（bind-mount 到 /workspace/extra/）
   streaming-buffer/                         # 流式文本磁盘缓冲（崩溃恢复用，自动清理）
   skills/{userId}/                         # 用户级 Skills 数据
   mcp-servers/{userId}/servers.json        # 用户 MCP Servers 配置
+  plugins/catalog/index.json                                            # 共享 catalog 索引（admin 扫描后所有用户可见）
+  plugins/catalog/marketplaces/{mp}/plugins/{plugin}/versions/{contentHash}/   # admin 共享 catalog 的 immutable snapshot（内容 hash 寻址）
+  plugins/users/{userId}/plugins.json                                   # per-user enable refs（only-v2 schemaVersion=1）
+  plugins/runtime/{userId}/snapshots/{snapshotId}/{mp}/{plugin}/        # per-user materialized runtime（versioned；Docker 只读挂载到 /workspace/plugins/）
 
 config/default-groups.json                 # 预注册群组配置
 config/mount-allowlist.json                # 容器挂载白名单
@@ -390,81 +406,27 @@ scripts/                      # 构建辅助脚本
 
 ## 7. Web API
 
-### 认证
-- `GET /api/auth/status` — 系统初始化状态（`initialized`、是否有用户）
-- `POST /api/auth/setup` — 创建首个管理员（仅用户表为空时可用）
-- `POST /api/auth/login` · `POST /api/auth/logout` · `GET /api/auth/me`（含 `setupStatus`）
-- `POST /api/auth/register` · `PUT /api/auth/profile` · `PUT /api/auth/change-password`
+> **完整 API 端点列表见 [`docs/API.md`](docs/API.md)**。新增或修改 Web 路由前请先阅读该文档。
+> 拆分原因：原 §7 整段约 3.5 KB / ~900 tokens 是只在新增/修改 API 时才需要的参考清单，
+> 强制每请求加载到 cache_read 不划算。详细清单按需 Read，下表保留路由文件入口作为快速锚点。
 
-### 群组
-- `GET /api/groups` · `POST /api/groups`（创建 Web 会话）
-- `PATCH /api/groups/:jid`（重命名） · `DELETE /api/groups/:jid`
-- `POST /api/groups/:jid/reset-session`（重建工作区）
-- `GET /api/groups/:jid/messages`（分页 + 轮询，支持多 JID 查询）
-- `GET|PUT /api/groups/:jid/env`（群组级容器环境变量）
+| 模块 | 入口文件 |
+|------|---------|
+| 认证 | `src/routes/auth.ts` |
+| 群组 | `src/routes/groups.ts` |
+| 文件 | `src/routes/files.ts` |
+| 记忆 | `src/routes/memory.ts` |
+| 配置（Claude / IM / 系统设置） | `src/routes/config.ts` |
+| 任务 | `src/routes/tasks.ts` |
+| 管理（用户 / 邀请码 / 审计） | `src/routes/admin.ts` |
+| Sub-Agent | `src/routes/agents.ts` |
+| 目录浏览 | `src/routes/browse.ts` |
+| MCP Servers | `src/routes/mcp-servers.ts` |
+| Claude Code Plugins | `src/routes/plugins.ts` |
+| 用量统计 | `src/routes/usage.ts` |
+| 监控 / 健康检查 | `src/routes/monitor.ts`（`GET /api/health` 无需认证） |
 
-### 文件
-- `GET /api/groups/:jid/files` · `POST /api/groups/:jid/files`（上传，50MB 限制）
-- `GET /api/groups/:jid/files/download/:path` · `DELETE /api/groups/:jid/files/:path`
-- `POST /api/groups/:jid/directories`
-
-### 记忆
-- `GET /api/memory/sources` · `GET /api/memory/search`（全文检索）
-- `GET|PUT /api/memory/file`
-
-### 配置
-- `GET|PUT /api/config/claude` · `PUT /api/config/claude/secrets`
-- `GET|PUT /api/config/claude/custom-env`
-- `POST /api/config/claude/test`（连通性测试） · `POST /api/config/claude/apply`（应用到所有容器）
-- `GET|PUT /api/config/feishu`（**deprecated**，使用 `/api/config/user-im/feishu` 代替）
-- `GET|PUT /api/config/telegram` · `POST /api/config/telegram/test`（**deprecated**，使用 `/api/config/user-im/telegram` 代替）
-- `GET|PUT /api/config/appearance` · `GET /api/config/appearance/public`（外观配置，public 端点无需认证）
-- `GET|PUT /api/config/system` — 系统运行参数（容器超时、并发限制等），需要 `manage_system_config` 权限
-- `GET /api/config/user-im/status`（所有渠道连接状态，含 QQ）
-- `GET|PUT /api/config/user-im/feishu`（用户级飞书 IM 配置，GET 返回 `connected` 字段）
-- `GET|PUT /api/config/user-im/telegram`（用户级 Telegram IM 配置，GET 返回 `connected`、`effectiveProxyUrl`、`proxySource`，PUT 支持 `proxyUrl`/`clearProxyUrl`）
-- `POST /api/config/user-im/telegram/test`（Telegram Bot Token 连通性测试，使用 per-user proxyUrl）
-- `GET|PUT /api/config/user-im/qq`（用户级 QQ IM 配置，GET 返回 `connected` 字段）
-- `POST /api/config/user-im/qq/test`（QQ 凭据连通性测试）
-- `POST /api/config/user-im/qq/pairing-code`（生成 QQ 配对码）
-- `GET /api/config/user-im/qq/paired-chats`（已配对的 QQ 聊天列表）
-- `DELETE /api/config/user-im/qq/paired-chats/:jid`（移除 QQ 配对）
-- `GET|PUT /api/config/user-im/dingtalk`（用户级钉钉 IM 配置，GET 返回 `connected` 字段）
-
-### 任务
-- `GET /api/tasks` · `POST /api/tasks` · `PATCH /api/tasks/:id` · `DELETE /api/tasks/:id`
-- `GET /api/tasks/:id/logs`
-
-### 管理
-- `GET /api/admin/users` · `POST /api/admin/users` · `PATCH /api/admin/users/:id`
-- `DELETE /api/admin/users/:id` · `POST /api/admin/users/:id/restore`
-- `POST /api/admin/invites` · `GET /api/admin/invites` · `DELETE /api/admin/invites/:code`
-- `GET /api/admin/audit-log`
-- `GET|PUT /api/admin/settings/registration`
-
-### Sub-Agent
-- `GET /api/groups/:jid/agents` · `POST /api/groups/:jid/agents`（创建 Sub-Agent）
-- `DELETE /api/groups/:jid/agents/:agentId`
-
-### 目录浏览
-- `GET /api/browse/directories`（列出可选目录，受挂载白名单约束）
-- `POST /api/browse/directories`（创建自定义工作目录）
-
-### MCP Servers
-- `GET /api/mcp-servers` · `POST /api/mcp-servers`（CRUD，per-user）
-- `PATCH /api/mcp-servers/:id` · `DELETE /api/mcp-servers/:id`
-- `POST /api/mcp-servers/sync-host`（从宿主机同步 MCP Server 配置）
-
-### 用量统计
-- `GET /api/usage/stats?days=7&userId=&model=`（从 `usage_daily_summary` 查询，支持用户/模型筛选）
-- `GET /api/usage/models`（去重模型列表）
-- `GET /api/usage/users`（有用量数据的用户列表，admin 可见全部）
-
-### 监控
-- `GET /api/status` · `GET /api/health`（无需认证）
-
-### WebSocket
-- `/ws`（详见 §3.6 WebSocket 协议）
+WebSocket：`/ws`（协议详见 §3.6）。
 
 ## 8. 关键行为
 
@@ -534,7 +496,7 @@ scripts/                      # 构建辅助脚本
 
 ### 8.10 IM 通道热管理
 
-通过 `PUT /api/config/user-im/feishu`、`PUT /api/config/user-im/telegram`、`PUT /api/config/user-im/qq` 或 `PUT /api/config/user-im/dingtalk` 更新 IM 配置后：
+通过 `PUT /api/config/user-im/feishu`、`PUT /api/config/user-im/telegram`、`PUT /api/config/user-im/qq`、`PUT /api/config/user-im/dingtalk` 或 `PUT /api/config/user-im/whatsapp` 更新 IM 配置后：
 - 保存配置到 `data/config/user-im/{userId}/` 目录（AES-256-GCM 加密）
 - 断开该用户的旧连接
 - 如果新配置有效（`enabled=true` 且凭据非空），立即建立新连接
@@ -567,6 +529,45 @@ scripts/                      # 构建辅助脚本
 
 **前置条件**：飞书应用需要 `im:message.group_msg` 敏感权限（实时接收群里所有消息）。`im:message:readonly` 仅控制 REST API 读取历史消息，不影响 WebSocket 实时推送。没有 `im:message.group_msg` 权限时，平台层只推送 @消息，`require_mention=false` 无法生效。
 
+### 8.13 WhatsApp 通道（基于 Baileys）
+
+为响应海外用户使用 WhatsApp 的需求，集成 `@whiskeysockets/baileys`（社区维护的 WhatsApp Web 协议逆向库，Meta 官方未授权）。
+
+**登录与连接**：
+- `useMultiFileAuthState` 把 noise 密钥 / Signal pre-keys 等持久化到 `data/config/user-im/{userId}/whatsapp-auth/{accountId}/`，重启后无需重新扫码
+- `connection.update` 事件把 `qr`/`open`/`close` 三种状态转换成 `WhatsAppConnectionState` `{ status, qr, qrDataUrl, error, meJid, meName }`，QR 串通过 `qrcode` render 为 PNG data URL
+- 状态走 `onConnectionUpdate` 回调 → `broadcastWhatsAppStatus(userId, state)` → `whatsapp_status` WS 事件推到前端 `WhatsAppChannelCard`
+- 自动重连：非 `loggedOut` 断线延迟 3s 重连；`loggedOut` 不重连（避免 QR 风暴），由用户在前端手动重新启用
+- `getUserWhatsAppState(userId)` 缓存最近一次 state，前端刷新页面后通过 `GET /api/config/user-im/whatsapp` 拿回当前 QR
+
+**消息接收**（`messages.upsert` event）：
+- 跳过 `type !== 'notify'`（history sync 不重跑）、`fromMe`、`status@broadcast` / `@newsletter`
+- `ignoreMessagesBefore` 过滤断线重连后的堆积消息
+- `extractMessageText` 支持 `conversation` / `extendedTextMessage` / `ephemeralMessage` 嵌套 / `viewOnceMessage` 嵌套，以及 `image/video/document` 的 caption 字段
+- 媒体消息（image/video/audio/document）走 `tryHandleMediaMessage`：`downloadMediaMessage(msg, 'buffer', ...)` 取二进制 → `saveDownloadedFile(folder, 'whatsapp', name, buf)` 保存到 `data/groups/{folder}/downloads/whatsapp/{YYYY-MM-DD}/`，content 文本格式 `[图片: downloads/whatsapp/.../wa_image_xxx.jpg]\n可选 caption`
+- 小图片（≤5MB）同时输出 base64 `attachments` 字段供 Vision API 消费
+- 群组（`@g.us`）vs DM（`@s.whatsapp.net`）jid 识别，`participant` 作为群组消息 senderId
+- `sock.groupMetadata(jid)` 异步获取真实群名（首次遇到时，缓存到 `groupNameCache` 防止重复请求）
+
+**群聊门控**（与 feishu / discord 一致）：
+- `isSenderAllowedInGroup(chatJid, senderImId)` 发言者白名单，false 则丢弃
+- `shouldProcessGroupMessage(chatJid, senderImId)` 配合 `isMentioningBot(content, sock.user.id)`：bot 未被 @ 且该 hook 返回 false 则丢弃（require_mention 模式）
+- `isGroupOwnerMessage(chatJid, senderImId)`：bot 被 @ 但发送者非 owner 时丢弃（owner_mentioned 模式）
+- mention 检测：从 `extendedTextMessage.contextInfo.mentionedJid` / `imageMessage.contextInfo.mentionedJid` 等取 jid 列表，与 `jidNormalizedUser(sock.user.id)` 比对（去除 device 后缀）
+
+**消息发送**：
+- `sendMessage` 走 `markdownToPlainText` + `splitTextChunks(4096)`（与 dingtalk/wechat/qq 一致），分片消息追加 `(i/N)` 标记
+- 局部图片附件：`sendMessage` 第三参 `localImagePaths` 循环 `readFile` → `guessMimeType` 推断 → `sock.sendMessage({ image, mimetype })`
+- `sendImage`：`sock.sendMessage({ image: Buffer, mimetype, caption, fileName })`
+- `sendFile`：`fs.readFile` filePath → `sock.sendMessage({ document: Buffer, mimetype: guessMimeType(name), fileName })`
+- `sendTyping`：`sock.sendPresenceUpdate('composing'|'paused', jid)`
+
+**群组事件**（`group-participants.update`）：
+- `action='add'` 且 participants 包含 bot self jid → `onBotAddedToGroup(chatJid, chatName)`，bot 名取自 `sock.groupMetadata().subject`
+- `action='remove'` 且 participants 包含 bot self jid → `onBotRemovedFromGroup(chatJid)`
+
+**风险提示**：Baileys 是社区逆向工程的 WhatsApp Web 协议库，Meta 在 2025-2026 收紧识别（握手时序、加密时序），封号率显著上升。同 OpenClaw / Wechaty puppet 等同类逆向方案共享相同风险。商用场景应使用 Meta 官方 Cloud API（需要 Facebook Business 验证、按模板消息计费）。
+
 ## 9. 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -584,7 +585,10 @@ scripts/                      # 构建辅助脚本
 | `MAX_CONCURRENT_HOST_PROCESSES` | `5` | 宿主机模式并发上限（可通过设置页覆盖） |
 | `MAX_LOGIN_ATTEMPTS` | `5` | 登录失败锁定阈值（可通过设置页覆盖） |
 | `LOGIN_LOCKOUT_MINUTES` | `15` | 锁定持续时间（分钟）（可通过设置页覆盖） |
+| `AUTO_COMPACT_WINDOW` | `0`（禁用，使用 SDK 默认 ~1M） | Claude Agent SDK 自动对话压缩触发点（tokens），0 = 关闭，>0 范围 [10000, 2000000]（可通过设置页覆盖） |
+| `TASK_BACKFILL_GRACE_MS` | `300000`（5min） | 定时任务逾期容忍窗口（毫秒）。停机重启后 `next_run` 距今超过该窗口的任务直接跳过本次（推到下一次触发），避免跨天积压任务集体 fire 刷屏。0 = 关闭旧行为（可通过设置页覆盖） |
 | `TRUST_PROXY` | `false` | 信任反向代理的 `X-Forwarded-For` 头（启用后从代理头获取客户端 IP） |
+| `CORS_ALLOWED_ORIGINS` | 空（仅放行 localhost） | 公网域名访问**必须**配置：WebSocket upgrade 有 Origin 纵深防御（防 CSWSH），非 localhost 的 Origin 不在白名单会被 **403** 拒绝 → 前端 WS 连不上、无流式卡片。设为逗号分隔的域名（如 `https://claw.example.com`）或 `*`（放行所有，关闭该防御）。可写入项目根 `.env`（启动时由 `src/load-env.ts` 自动加载） |
 | `TZ` | 系统时区 | 定时任务时区 |
 
 ## 10. 开发约束
@@ -597,9 +601,25 @@ scripts/                      # 构建辅助脚本
 - **Issue / PR 规范**见下方 §10.1
 - 系统路径不可通过文件 API 操作：`logs/`、`CLAUDE.md`、`.claude/`、`conversations/`
 - StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，修改后运行 `make sync-types` 同步（`make build` 自动触发，`make typecheck` 校验一致性）
-- Claude SDK 和 CLI 始终使用最新版本（agent-runner `package.json` 中 `"*"`，通过 `make update-sdk` 更新）
+- Claude SDK / CLI 和容器内置的第三方工具始终使用最新版本：
+  - `@anthropic-ai/claude-agent-sdk` 在 `agent-runner/package.json` 用 `"*"` + 无 lock file + `CACHEBUST` 触发每次 `npm install` 重跑
+  - `feishu-cli` 在 `container/Dockerfile` 通过 `github.com/riba2534/feishu-cli/releases/latest` 的 **302 redirect Location header** 提取 tag 动态下载（不走 `api.github.com` 规避 rate limit），binary 和 skills 共享同一 `$VERSION` 确保一致
+  - 通过 `make update-sdk` 手动触发一次更新
 - 容器内以 `node` 非 root 用户运行，需注意文件权限
 - **关闭服务时禁止 `lsof -ti:PORT | xargs kill`**，该命令会杀掉所有连接到该端口的进程（包括 OrbStack/Docker 网络代理），导致 Docker daemon 崩溃。正确做法：`lsof -ti:PORT -sTCP:LISTEN | xargs kill`（仅杀监听进程）
+- **Claude Code Plugin 接入**：
+  - Plugin 通过 SDK `options.plugins`（`SdkPluginConfig[]`）注入，SDK 内部转成 `--plugin-dir <path>` 传给 spawn 的 claude CLI。**不要**走 settings.json 的 `enabledPlugins` 或 `CLAUDE_CODE_PLUGIN_SEED_DIR`（v2 方案已废弃）
+  - `ContainerInput.plugins` 由 `container-runner.ts` 的两处 spawn 处就地派生新 input（`{ ...input, plugins: loadUserPlugins(ownerId, {runtime}) }`），**禁止原地 mutate** —— 队列/日志/重试路径共享同一 input 引用
+  - Plugin 目录路径必须是已展开的绝对路径。Docker 模式：`/workspace/plugins/snapshots/{snapshotId}/{mp}/{plugin}`（runtime/{userId} 整个目录只读挂到 /workspace/plugins/，所以容器内一定带 snapshots/ 前缀）；Host 模式：`path.join(DATA_DIR, 'plugins', 'runtime', userId, 'snapshots', snapshotId, mp, plugin)`。**不允许**含 `~` 字面量（SDK/CLI 不保证展开）
+  - 依赖检测是 **best-effort 警告**，不作为启用门槛。修正扫描遗漏请改 `config/plugin-deps-override.json` 覆盖表
+  - 删除 marketplace（`DELETE /api/plugins/marketplaces/:name`）只清除**调用者自己**的 enabled refs，**不删** catalog（catalog 是 admin 共享导入的全局只读集合）
+  - 运行中 agent 进程**不热加载** plugin 变化——启用/禁用后 UI 必须提示"下次新会话生效"。第一版仅支持 plugin 内的 commands/agents/hooks/skills/scripts；插件持久数据（`~/.claude/plugins/data/`）与凭据不自动迁移
+  - **Catalog snapshot immutable**：catalog 按内容 hash 寻址（`versions/{contentHash}/`），同一 plugin 的不同版本独立留存；rollback 自动跟随用户 enable refs 命中的实际 hash，不需要"反向复制"。Materialize 通过 `copyTreeIsolated`（`fs.copyFileSync(..., COPYFILE_FICLONE)`）：macOS APFS / Linux btrfs/xfs 上初始接近零拷贝，写入时 COW 分裂分配新块；其他文件系统退化为字节拷贝。无论何种文件系统，runtime 与 catalog **始终独立 inode**——host 模式 bypass-permissions agent 写穿透不会污染 catalog。每个 materialize 出的 plugin 带 `@happyclaw-runtime-markers/{mp}/{plugin}.json` 兄弟节点 marker（放在 snapshot 根下、plugin root 之外），下次 materialize 据此识别并通过 rename + backup rollback 迁移老 hard-link runtime（rename 之间仍有极短 ENOENT 窗口，但远短于 rmSync）
+  - **Runtime versioned snapshot**：`runtime/{userId}/snapshots/{snapshotId}/...` 是用户视角的版本化只读视图。启用新版本只切用户配置（`users/{userId}/plugins.json`），旧会话继续读旧 snapshot 直到 GC，避免运行中读到半写入目录
+  - **`PATCH /enabled` 走 mcp 范式**：read-modify-write 单 schema，无 v1→v2 接管路径（v1 cache 布局已删除，存量用户首次访问 enabled 列表为空属预期）
+  - **container-runner 双路径预构建**：host / docker spawn 之前都先 `materializeUserRuntime(ownerId)`；`prepareHostPlugins` helper 与 `buildVolumeMounts` 内联 materialize **必须对称**，否则两条路径会出现 runtime 不一致
+  - **自动 scan 默认开启**：admin 在宿主机安装 / 更新的 plugin marketplace 会在主进程启动 5s 后 + 每小时自动入 catalog（`POST /api/plugins/catalog/scan` 也手动触发同一逻辑），对所有 member 可见可启用。可通过系统设置 `SystemSettings.pluginAutoScan = false` 关闭定时扫描（admin 仍可手动点 `POST /api/plugins/catalog/scan`），适用于不希望本机私有 plugin 自动入共享 catalog 的环境。注意：定时器仅在主进程启动时按当前值注册一次，运行时切换需重启服务才能生效
+  - **v3 时代 endpoint 已废**：`POST /api/plugins/sync-host` 与 `GET /api/plugins/available-on-host` 已在 PR1 删除，新代码不要再引用
 
 ### 10.1 Issue / PR 规范
 
@@ -638,6 +658,13 @@ scripts/                      # 构建辅助脚本
 
 **Issue 正文**（Feature）：自由格式，说清需求背景和预期行为即可。
 
+**PR 分支干净性**：目标是 PR 只含本次要提的 commit，不夹带其它本地 commit。
+
+提 PR 前先 `git fetch upstream`，再用 `git log upstream/main..HEAD` 自查——输出应只含本次要提的 commit。
+
+- 若本地 `main` 与 `upstream/main` 对齐，从本地 `main` 切分支没问题；
+- 若本地 `main` 有未合并到上游的 commit（之前提的 PR 未 merge / 被关闭等），从它切会把这些 commit 一并带进新 PR。这种情况要么直接从 `upstream/main` 切（`git fetch upstream && git checkout -b fix/xxx upstream/main`），要么修正：`git checkout -B <branch> upstream/main && git cherry-pick <你的 commit>` 后 `git push --force-with-lease fork <branch>`（force push 自己的功能分支需用户确认，但属于必要清理）。
+
 **PR 标题**：与 commit message 一致，`类型: 简要描述`（如 `修复: 定时任务运行时用户消息被吞掉的问题 (#151)`）。关联 Issue 时在末尾加 `(#issue号)`。
 
 **PR 正文**：
@@ -664,7 +691,22 @@ make dev           # 启动前后端（首次自动安装依赖和构建镜像�
 make dev-backend   # 仅启动后端
 make dev-web       # 仅启动前端
 make build         # 编译全部（后端 + 前端 + agent-runner）
-make start         # 一键启动生产环境
+make start         # 一键启动生产环境（前台阻塞运行，日志输出到终端）
+make status        # 查看服务运行状态（进程、端口、日志、Docker 容器）
+make logs           # 实时查看日志（仅在用户自行后台化时有效）
+make stop           # 停止占用 3000 端口的服务（前台运行时请直接 Ctrl+C）
+```
+
+**开发模式选择：**
+
+| 场景 | 命令 | 说明 |
+|------|------|------|
+| 改完代码重启 | Ctrl+C 停止后再 `make start` | 前台阻塞运行 |
+| 改完前端热更新 | `make dev-web`（另开终端） | Vite 热更新 |
+| 改完后端快速验证 | `make dev-backend`（另开终端） | tsx watch |
+| 生产环境运行 | `make start` | 前台阻塞运行；如需后台化请自行 `make start > /tmp/happyclaw.log 2>&1 &` |
+
+```bash
 make typecheck     # TypeScript 全量类型检查（后端 + 前端 + agent-runner）
 make test          # 约束测试（vitest，重构前/后必跑，详见 §11）
 make format        # 格式化代码（prettier）

@@ -14,6 +14,54 @@ import type { ContainerOutput } from './container-runner.js';
 export const OUTPUT_START_MARKER = '---HAPPYCLAW_OUTPUT_START---';
 export const OUTPUT_END_MARKER = '---HAPPYCLAW_OUTPUT_END---';
 
+/**
+ * Parse a framed payload slice, accepting it only if it yields a JSON *object*
+ * (a real ContainerOutput). Returns null on any parse error or a non-object.
+ */
+function tryParseContainerOutput(jsonStr: string): ContainerOutput | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(jsonStr.trim());
+  } catch {
+    return null;
+  }
+  return typeof v === 'object' && v !== null ? (v as ContainerOutput) : null;
+}
+
+function isJsonWhitespace(ch: string): boolean {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
+/**
+ * Find the end of the JSON object that starts at buf[start] (which must be '{').
+ * Returns the index just AFTER the matching closing '}', or -1 if the object is
+ * not yet complete in buf. String-aware: braces (and the literal START/END
+ * marker strings the payload may quote) inside JSON string values do not affect
+ * the brace depth, so this is never fooled by an embedded marker — even when a
+ * second frame trails in the same buffer. O(buf length), single pass.
+ */
+function findJsonObjectEnd(buf: string, start: number): number {
+  let depth = 0;
+  let inStr = false;
+  let escaped = false;
+  for (let i = start; i < buf.length; i++) {
+    const ch = buf[i];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
 // ─── Stdout Stream Parser ────────────────────────────────────────────
 
 export interface StdoutParserState {
@@ -25,6 +73,8 @@ export interface StdoutParserState {
   hasSuccessOutput: boolean;
   /** True when agent emitted a { status: 'closed' } marker (exit due to _close sentinel). */
   hasClosedOutput: boolean;
+  /** True when SDK returned an API/provider failure as a successful final text. */
+  hasProviderFailureOutput: boolean;
   /** True when agent emitted a stream event with statusText='interrupted'. */
   hasInterruptedOutput: boolean;
 }
@@ -46,6 +96,7 @@ export function createStdoutParserState(): StdoutParserState {
     outputChain: Promise.resolve(),
     hasSuccessOutput: false,
     hasClosedOutput: false,
+    hasProviderFailureOutput: false,
     hasInterruptedOutput: false,
   };
 }
@@ -94,52 +145,130 @@ export function attachStdoutHandler(
       while (
         (startIdx = state.parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1
       ) {
-        const endIdx = state.parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-        if (endIdx === -1) break; // Incomplete pair, wait for more data
+        const contentStart = startIdx + OUTPUT_START_MARKER.length;
+        // Locate the framed JSON object by brace matching rather than by
+        // scanning for END markers. The agent's reply text can contain literal
+        // START/END marker strings inside the JSON payload; deriving the
+        // object's true end from the JSON structure is both correct (never
+        // fooled by an embedded marker — even when a second frame trails in the
+        // same buffer) and O(payload): no repeated slice+parse per candidate
+        // terminator, which would stall the shared main-process event loop. The
+        // ContainerOutput payload is always a JSON object.
+        let objStart = contentStart;
+        while (
+          objStart < state.parseBuffer.length &&
+          isJsonWhitespace(state.parseBuffer[objStart])
+        ) {
+          objStart++;
+        }
+        if (objStart >= state.parseBuffer.length) break; // only whitespace yet
 
-        const jsonStr = state.parseBuffer
-          .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-          .trim();
+        // Resync past a broken/unparseable frame so the buffer never stalls
+        // until the size cap (the pre-refactor parser always advanced past a
+        // malformed frame). `knownEnd`, when given, is this frame's already
+        // located END index — used by the parse-failure path, whose object may
+        // legitimately contain literal END marker strings, so we must NOT
+        // re-scan for END from contentStart. Without it (non-object payload),
+        // skip past whichever boundary arrives first: this frame's END (frame
+        // fully delimited but malformed) or a later START. Returns false only
+        // when neither boundary exists yet, so the caller waits for more data.
+        const resyncPastBrokenFrame = (
+          reason: string,
+          knownEnd?: number,
+        ): boolean => {
+          let resyncTo = -1;
+          if (knownEnd !== undefined) {
+            resyncTo = knownEnd + OUTPUT_END_MARKER.length;
+          } else {
+            const nextStart = state.parseBuffer.indexOf(
+              OUTPUT_START_MARKER,
+              contentStart,
+            );
+            const endIdx = state.parseBuffer.indexOf(
+              OUTPUT_END_MARKER,
+              contentStart,
+            );
+            if (endIdx !== -1 && (nextStart === -1 || endIdx < nextStart)) {
+              resyncTo = endIdx + OUTPUT_END_MARKER.length;
+            } else if (nextStart !== -1) {
+              resyncTo = nextStart;
+            }
+          }
+          if (resyncTo === -1) return false;
+          logger.warn({ group: opts.groupName }, reason);
+          state.parseBuffer = state.parseBuffer.slice(resyncTo);
+          return true;
+        };
+
+        if (state.parseBuffer[objStart] !== '{') {
+          // Payload isn't a JSON object — framing is broken.
+          if (
+            resyncPastBrokenFrame(
+              'Framed payload is not a JSON object, resyncing past broken frame',
+            )
+          ) {
+            continue;
+          }
+          break;
+        }
+
+        const objEnd = findJsonObjectEnd(state.parseBuffer, objStart);
+        if (objEnd === -1) break; // object still streaming in — wait
+        const endIdx = state.parseBuffer.indexOf(OUTPUT_END_MARKER, objEnd);
+        if (endIdx === -1) break; // object complete, END marker not here yet
+
+        const parsed = tryParseContainerOutput(
+          state.parseBuffer.slice(objStart, objEnd),
+        );
+        if (!parsed) {
+          // Balanced braces but not a valid ContainerOutput object (should not
+          // happen for well-formed output). The frame is fully delimited (END
+          // already located at endIdx), so drop it and continue rather than
+          // stalling until the buffer cap — no later START is required.
+          resyncPastBrokenFrame(
+            'Framed JSON object failed to parse, skipping frame',
+            endIdx,
+          );
+          continue;
+        }
+
         state.parseBuffer = state.parseBuffer.slice(
           endIdx + OUTPUT_END_MARKER.length,
         );
 
-        try {
-          const parsed: ContainerOutput = JSON.parse(jsonStr);
-          if (parsed.newSessionId) {
-            state.newSessionId = parsed.newSessionId;
-          }
-          if (parsed.status === 'success') {
-            state.hasSuccessOutput = true;
-          }
-          if (parsed.status === 'closed') {
-            state.hasClosedOutput = true;
-          }
-          if (
-            parsed.status === 'stream' &&
-            parsed.streamEvent?.statusText === 'interrupted'
-          ) {
-            state.hasInterruptedOutput = true;
-          }
-          // Activity detected — reset the hard timeout
-          opts.resetTimeout();
-          // Call onOutput for all markers (including null results)
-          // so idle timers start even for "silent" query completions.
-          const onOutputFn = opts.onOutput;
-          state.outputChain = state.outputChain
-            .then(() => onOutputFn(parsed))
-            .catch((err) => {
-              logger.error(
-                { group: opts.groupName, err },
-                'onOutput callback error',
-              );
-            });
-        } catch (err) {
-          logger.warn(
-            { group: opts.groupName, error: err },
-            'Failed to parse streamed output chunk',
-          );
+        if (parsed.newSessionId) {
+          state.newSessionId = parsed.newSessionId;
         }
+        if (parsed.status === 'success') {
+          state.hasSuccessOutput = true;
+          if (isProviderFailureResult(parsed.result)) {
+            state.hasProviderFailureOutput = true;
+            parsed.providerFailure = true;
+          }
+        }
+        if (parsed.status === 'closed') {
+          state.hasClosedOutput = true;
+        }
+        if (
+          parsed.status === 'stream' &&
+          parsed.streamEvent?.statusText === 'interrupted'
+        ) {
+          state.hasInterruptedOutput = true;
+        }
+        // Activity detected — reset the hard timeout
+        opts.resetTimeout();
+        // Call onOutput for all markers (including null results) so idle timers
+        // start even for "silent" query completions.
+        const onOutputFn = opts.onOutput;
+        const parsedForCallback = parsed;
+        state.outputChain = state.outputChain
+          .then(() => onOutputFn(parsedForCallback))
+          .catch((err) => {
+            logger.error(
+              { group: opts.groupName, err },
+              'onOutput callback error',
+            );
+          });
       }
     }
   });
@@ -499,7 +628,7 @@ export function handleSuccessClose(
 
   // Streaming mode: wait for output chain to settle
   if (ctx.onOutput) {
-    const { hasClosedOutput } = ctx.stdoutState;
+    const { hasClosedOutput, hasProviderFailureOutput } = ctx.stdoutState;
     waitForOutputChain(
       outputChain,
       ctx.groupName,
@@ -518,6 +647,7 @@ export function handleSuccessClose(
           status: finalStatus,
           result: null,
           newSessionId,
+          providerFailure: hasProviderFailureOutput,
         });
       },
     );
@@ -597,9 +727,60 @@ const API_ERROR_PATTERNS = [
   /\binvalid[_ ]?api\b/i,
   /\bbilling\s+(error|issue|limit)\b/i,
   /\bcredit(s)?\s+(exhausted|insufficient)\b/i,
+  /\bout of extra usage\b/i,
+  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
+  /\bresets?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]*\)/i,
   /connection\s*(refused|reset|timed?\s*out)/i,
   /ECONNREFUSED|ECONNRESET|ETIMEDOUT/,
 ];
+
+/**
+ * Detection for "the provider returned a quota/limit notice as the agent's
+ * final text" (rather than a normal reply).
+ *
+ * CRITICAL: this runs against the agent's *normal reply body* (parsed.result),
+ * not stderr. A match triggers killing the container, clearing the Claude
+ * session and marking the provider unhealthy — all user-visible side effects.
+ * So the match must be near-zero false-positive: generic substrings like
+ * "rate limit" or "quota exceeded" appear constantly in legitimate technical
+ * conversations ("to avoid hitting the API rate limit…", "disk quota
+ * exceeded") and must NEVER be treated as a provider failure here.
+ *
+ * We therefore require a *structured* Claude account-limit signal:
+ *  - a Claude-specific limit phrase ("out of extra usage", "you've hit your
+ *    limit", "usage limit reached", "upgrade to increase your usage limit"),
+ *    AND
+ *  - the message reads as a short system-style notice, not a long answer that
+ *    merely quotes the phrase. Real Claude limit notices are a single terse
+ *    line; agent replies discussing rate limits are much longer.
+ *
+ * The strongest, length-independent signal is the reset timestamp Claude
+ * appends to genuine limit notices ("· resets 2:10am (Asia/Shanghai)"); when a
+ * Claude limit phrase co-occurs with that timestamp we accept regardless of
+ * length, since no normal reply produces both together.
+ */
+
+/** Claude-specific account/usage-limit phrases (not generic provider errors). */
+const CLAUDE_LIMIT_PHRASE_PATTERNS = [
+  /\bout of extra usage\b/i,
+  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
+  // "usage limit reached" — anchored on "usage" so a generic "rate limit
+  // reached" / "request limit reached" in a normal reply does not match.
+  /\busage\s+limit\s+reached\b/i,
+  /\bupgrade\s+to\s+(?:increase|raise)\s+your\s+usage\s+limit\b/i,
+  /\byour\s+(?:usage\s+)?limit\s+will\s+reset\b/i,
+];
+
+/** The reset-timestamp suffix Claude appends to genuine limit notices. */
+const CLAUDE_LIMIT_RESET_PATTERN =
+  /\bresets?\b[^.\n]*?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]*\)/i;
+
+/**
+ * Upper bound (chars) for treating a Claude limit phrase as a *standalone*
+ * system notice. Genuine notices are a single short line; this guards against
+ * a long agent reply that merely mentions the phrase mid-answer.
+ */
+const CLAUDE_LIMIT_NOTICE_MAX_LEN = 200;
 
 /**
  * Classify whether stderr output indicates an API-level error
@@ -611,4 +792,28 @@ const API_ERROR_PATTERNS = [
 export function isApiError(stderr: string): boolean {
   if (!stderr) return false;
   return API_ERROR_PATTERNS.some((pattern) => pattern.test(stderr));
+}
+
+/**
+ * Whether the agent's final text is actually a Claude account-limit notice the
+ * SDK surfaced as a "successful" result. See CLAUDE_LIMIT_* above for why this
+ * deliberately avoids generic rate-limit/quota substrings.
+ */
+export function isProviderFailureResult(result: string | null): boolean {
+  if (!result) return false;
+  const trimmed = result.trim();
+  if (!trimmed) return false;
+
+  const hasLimitPhrase = CLAUDE_LIMIT_PHRASE_PATTERNS.some((p) =>
+    p.test(trimmed),
+  );
+  if (!hasLimitPhrase) return false;
+
+  // Accept when a Claude reset timestamp accompanies the phrase (length-
+  // independent: no normal reply emits both), or when the whole result is a
+  // short standalone notice rather than a long answer quoting the phrase.
+  return (
+    CLAUDE_LIMIT_RESET_PATTERN.test(trimmed) ||
+    trimmed.length <= CLAUDE_LIMIT_NOTICE_MAX_LEN
+  );
 }

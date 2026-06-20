@@ -39,6 +39,7 @@ interface TasksState {
   loading: boolean;
   error: string | null;
   runningTaskIds: Set<string>;
+  groupNames: Record<string, string>;
   loadTasks: () => Promise<void>;
   createTask: (
     prompt: string,
@@ -48,6 +49,8 @@ interface TasksState {
     executionMode?: 'host' | 'container',
     scriptCommand?: string,
     notifyChannels?: string[] | null,
+    chatJid?: string,
+    contextMode?: 'group' | 'isolated',
   ) => Promise<void>;
   updateTaskStatus: (id: string, status: 'active' | 'paused') => Promise<void>;
   updateTask: (id: string, fields: Record<string, unknown>) => Promise<void>;
@@ -71,14 +74,16 @@ export const useTasksStore = create<TasksState>((set, get) => ({
   loading: false,
   error: null,
   runningTaskIds: new Set<string>(),
+  groupNames: {},
 
   loadTasks: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ tasks: ScheduledTask[]; runningTaskIds?: string[] }>('/api/tasks');
+      const data = await api.get<{ tasks: ScheduledTask[]; runningTaskIds?: string[]; groupNames?: Record<string, string> }>('/api/tasks');
       set({
         tasks: data.tasks,
         runningTaskIds: new Set(data.runningTaskIds || []),
+        groupNames: data.groupNames || {},
         loading: false,
         error: null,
       });
@@ -95,6 +100,8 @@ export const useTasksStore = create<TasksState>((set, get) => ({
     executionMode?: 'host' | 'container',
     scriptCommand?: string,
     notifyChannels?: string[] | null,
+    chatJid?: string,
+    contextMode?: 'group' | 'isolated',
   ) => {
     try {
       const normalizedScheduleValue =
@@ -118,6 +125,12 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       }
       if (notifyChannels !== undefined) {
         body.notify_channels = notifyChannels;
+      }
+      if (chatJid) {
+        body.chat_jid = chatJid;
+      }
+      if (contextMode) {
+        body.context_mode = contextMode;
       }
       await api.post('/api/tasks', body);
       set({ error: null });
@@ -144,6 +157,9 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       await get().loadTasks();
     } catch (err) {
       set({ error: extractErrorMessage(err) });
+      // Re-throw so callers (TaskDetail.handleSave) can distinguish failure from
+      // success — otherwise a failed save still shows "保存成功".
+      throw err;
     }
   },
 

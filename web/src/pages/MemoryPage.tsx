@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Loader2, RefreshCw, Save } from 'lucide-react';
+import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Loader2, RefreshCw, Save, Monitor } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
+import { useAuthStore } from '../stores/auth';
 import { useGroupsStore } from '../stores/groups';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -10,7 +11,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 
-type MemoryType = 'global' | 'heartbeat' | 'session' | 'date' | 'conversation';
+type MemoryType = 'global' | 'session' | 'date' | 'conversation';
 
 interface MemorySource {
   path: string;
@@ -38,7 +39,7 @@ interface MemorySearchHit {
   snippet: string;
 }
 
-const MEMORY_TYPES: MemoryType[] = ['global', 'heartbeat', 'session', 'date', 'conversation'];
+const MEMORY_TYPES: MemoryType[] = ['global', 'session', 'date', 'conversation'];
 const FOLDER_SUB_GROUPED: Set<MemoryType> = new Set(['session', 'date', 'conversation']);
 
 function getErrorMessage(err: unknown, fallback: string): string {
@@ -53,7 +54,6 @@ function getErrorMessage(err: unknown, fallback: string): string {
 function typeLabel(type: MemoryType): string {
   switch (type) {
     case 'global': return '全局记忆';
-    case 'heartbeat': return '每日心跳';
     case 'session': return '会话记忆';
     case 'date': return '日期记忆';
     case 'conversation': return '对话归档';
@@ -139,6 +139,15 @@ export function MemoryPage() {
   const [keyword, setKeyword] = useState('');
   const [searchHits, setSearchHits] = useState<Record<string, MemorySearchHit>>({});
 
+  // 宿主机 ~/.claude 资源（admin only）
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const [extResources, setExtResources] = useState<{
+    dir: string;
+    rules: Array<{ name: string; size: number }>;
+    claudeMd: string | null;
+  } | null>(null);
+  const [extCollapsed, setExtCollapsed] = useState(false);
+
   const [loadingSources, setLoadingSources] = useState(true);
   const [loadingFile, setLoadingFile] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -160,7 +169,6 @@ export function MemoryPage() {
   const groupedSources = useMemo(() => {
     const groups: Record<MemoryType, MemorySource[]> = {
       global: [],
-      heartbeat: [],
       session: [],
       date: [],
       conversation: [],
@@ -175,7 +183,6 @@ export function MemoryPage() {
   // Collapsed state: type-level and folder sub-group level
   const [collapsedTypes, setCollapsedTypes] = useState<Record<string, boolean>>({
     global: true,
-    heartbeat: true,
     session: true,
     date: true,
     conversation: true,
@@ -262,6 +269,14 @@ export function MemoryPage() {
   useEffect(() => {
     loadSources();
   }, [loadSources]);
+
+  // 宿主机外部资源单独加载（不随 selectedPath 变化重复请求）
+  useEffect(() => {
+    if (!isAdmin) return;
+    api.get<{ dir: string; rules: Array<{ name: string; size: number }>; claudeMd: string | null }>('/api/config/external-resources')
+      .then(setExtResources)
+      .catch(() => {});
+  }, [isAdmin]);
 
   useEffect(() => {
     const q = keyword.trim();
@@ -429,6 +444,69 @@ export function MemoryPage() {
             </div>
 
             <div className="space-y-2 max-h-[calc(100dvh-280px)] lg:max-h-[560px] overflow-auto pr-1">
+              {/* 宿主机配置（admin only） */}
+              {isAdmin && extResources && (extResources.rules.length > 0 || extResources.claudeMd) && (
+                <div>
+                  <button
+                    onClick={() => setExtCollapsed((v) => !v)}
+                    className="flex items-center gap-1 w-full text-left text-xs font-semibold text-muted-foreground mb-1 hover:text-foreground transition-colors"
+                  >
+                    {extCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                    <Monitor className="w-3.5 h-3.5" />
+                    宿主机配置 ({extResources.rules.length + (extResources.claudeMd ? 1 : 0)})
+                  </button>
+                  {!extCollapsed && (
+                    <div className="space-y-1 ml-1">
+                      {extResources.claudeMd && (
+                        <button
+                          onClick={() => {
+                            setSelectedPath('ext:CLAUDE.md');
+                            setContent(extResources.claudeMd!);
+                            setInitialContent(extResources.claudeMd!);
+                            setFileMeta({ path: 'ext:CLAUDE.md', content: extResources.claudeMd!, updatedAt: null, size: extResources.claudeMd!.length, writable: false });
+                            if (isMobile) setShowContent(true);
+                          }}
+                          className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
+                            selectedPath === 'ext:CLAUDE.md' ? 'border-primary bg-brand-50' : 'border-border hover:bg-muted/50'
+                          }`}
+                        >
+                          <div className="text-sm font-medium text-foreground">CLAUDE.md</div>
+                          <div className="text-[11px] text-muted-foreground mt-0.5">{extResources.dir}/CLAUDE.md</div>
+                          <div className="text-[11px] mt-1 text-muted-foreground">只读 · {extResources.claudeMd.length} B</div>
+                        </button>
+                      )}
+                      {extResources.rules.map((r) => (
+                        <button
+                          key={r.name}
+                          onClick={async () => {
+                            // 通过 API 读取 rule 文件内容
+                            try {
+                              const res = await fetch(`/api/config/external-resources/rule?name=${encodeURIComponent(r.name)}`, { credentials: 'include' });
+                              const text = res.ok ? await res.text() : '加载失败';
+                              const key = `ext:rules/${r.name}`;
+                              setSelectedPath(key);
+                              setContent(text);
+                              setInitialContent(text);
+                              setFileMeta({ path: key, content: text, updatedAt: null, size: r.size, writable: false });
+                              if (isMobile) setShowContent(true);
+                            } catch {
+                              toast.error('加载 rule 文件失败');
+                            }
+                          }}
+                          className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
+                            selectedPath === `ext:rules/${r.name}` ? 'border-primary bg-brand-50' : 'border-border hover:bg-muted/50'
+                          }`}
+                        >
+                          <div className="text-sm font-medium text-foreground">{r.name}</div>
+                          <div className="text-[11px] text-muted-foreground mt-0.5">{extResources.dir}/rules/{r.name}</div>
+                          <div className="text-[11px] mt-1 text-muted-foreground">只读 · {r.size} B</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {MEMORY_TYPES.map((type) => {
                 const items = groupedSources[type];
                 if (items.length === 0) return null;

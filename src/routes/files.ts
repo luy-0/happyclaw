@@ -19,6 +19,7 @@ import {
   MAX_FILE_SIZE,
   getGroupStorageUsage,
   invalidateGroupStorageUsage,
+  getFileRoot,
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
 import { execFile } from 'node:child_process';
@@ -38,6 +39,8 @@ const MIME_MAP: Record<string, string> = {
   gif: 'image/gif',
   svg: 'image/svg+xml',
   webp: 'image/webp',
+  bmp: 'image/bmp',
+  ico: 'image/x-icon',
   // 文本和代码
   txt: 'text/plain',
   md: 'text/markdown',
@@ -66,6 +69,19 @@ const MIME_MAP: Record<string, string> = {
   csv: 'text/csv',
   // PDF
   pdf: 'application/pdf',
+  // 视频
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  mkv: 'video/x-matroska',
+  // 音频
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  aac: 'audio/aac',
+  m4a: 'audio/mp4',
+  flac: 'audio/flac',
   // 压缩文件
   zip: 'application/zip',
   tar: 'application/x-tar',
@@ -103,31 +119,15 @@ const TEXT_EXTENSIONS = new Set([
   'svg',
 ]);
 
-// 允许 inline 预览的安全 MIME 类型（排除 HTML 和 SVG 以防止 XSS）
-const SAFE_PREVIEW_MIME_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-  'text/plain',
-  'text/markdown',
-  'text/css',
-  'text/csv',
-  'text/yaml',
-  'text/x-python',
-  'text/x-go',
-  'text/x-rust',
-  'text/x-java',
-  'text/x-c',
-  'text/x-c++',
-  'text/x-sh',
-  'text/x-toml',
-  'text/javascript',
-  'text/typescript',
-  'application/json',
-  'application/xml',
-  'application/pdf',
-]);
+// 不安全的扩展名（HTML/SVG 有 XSS 风险，压缩包不可预览）
+const UNSAFE_PREVIEW_EXTENSIONS = new Set(['html', 'svg', 'zip', 'tar', 'gz', '7z']);
+
+// 允许 inline 预览的安全 MIME 类型（从 MIME_MAP 中排除不安全扩展名自动推导）
+const SAFE_PREVIEW_MIME_TYPES = new Set(
+  Object.entries(MIME_MAP)
+    .filter(([ext]) => !UNSAFE_PREVIEW_EXTENSIONS.has(ext))
+    .map(([, mime]) => mime),
+);
 
 /**
  * 获取文件操作的根目录覆盖。
@@ -137,6 +137,24 @@ function getFileRootOverride(group: RegisteredGroup): string | undefined {
   return group.executionMode === 'host' && group.customCwd
     ? group.customCwd
     : undefined;
+}
+
+/**
+ * 计算 Agent 视角的绝对路径（供前端"复制路径"功能使用）。
+ * - container 模式：容器内挂载路径 /workspace/group/<relative>
+ * - host 模式：宿主机绝对路径（customCwd 或 data/groups/{folder}）+ relative
+ */
+function getAgentAbsolutePath(
+  group: RegisteredGroup,
+  relativePath: string,
+): string {
+  if (group.executionMode === 'host') {
+    const base = getFileRoot(group.folder, getFileRootOverride(group));
+    return relativePath ? path.join(base, relativePath) : base;
+  }
+  return relativePath
+    ? path.posix.join('/workspace/group', relativePath)
+    : '/workspace/group';
 }
 
 function buildAttachmentContentDisposition(fileName: string): string {
@@ -239,7 +257,11 @@ fileRoutes.get('/:jid/files', authMiddleware, (c) => {
 
   try {
     const result = listFiles(group.folder, subPath, getFileRootOverride(group));
-    return c.json(result);
+    const files = result.files.map((entry) => ({
+      ...entry,
+      absolutePath: getAgentAbsolutePath(group, entry.path),
+    }));
+    return c.json({ ...result, files });
   } catch (error) {
     logger.error({ err: error }, `Failed to list files for ${jid}`);
     return c.json({ error: 'Failed to list files' }, 500);
@@ -335,9 +357,33 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
         fs.mkdirSync(targetDir, { recursive: true });
       }
 
-      // 写入文件
+      // 写入文件：用 O_NOFOLLOW 防 leaf TOCTOU——validateAndResolvePath 与
+      // writeFileSync 之间，对 RW 工作区有写权限的 agent 可以临时把
+      // targetFilePath 替换成符号链接指向系统敏感路径，让上传的内容写到
+      // workspace 之外。父目录被换成 symlink 的场景仍依赖 validateAndResolvePath
+      // 的 ancestor realpath 校验拦截，但 leaf 由 O_NOFOLLOW 强保护。
+      // 用 fs.writeFileSync(fd, ...) 让 Node 内置循环处理 short-write。
       const buffer = await file.arrayBuffer();
-      fs.writeFileSync(targetFilePath, Buffer.from(buffer));
+      const data = Buffer.from(buffer);
+      const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+      if (noFollowFlag !== undefined) {
+        const flags =
+          fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_TRUNC |
+          noFollowFlag;
+        let fd: number | null = null;
+        try {
+          fd = fs.openSync(targetFilePath, flags, 0o644);
+          fs.writeFileSync(fd, data);
+        } finally {
+          if (fd !== null) {
+            try { fs.closeSync(fd); } catch { /* ignore */ }
+          }
+        }
+      } else {
+        fs.writeFileSync(targetFilePath, data);
+      }
 
       uploadedFiles.push(file.name);
     }
@@ -555,29 +601,98 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
     // 检测 MIME 类型（基于扩展名）
     const ext = path.extname(absolutePath).slice(1).toLowerCase();
     const mimeType = MIME_MAP[ext] || 'application/octet-stream';
-
-    // 读取文件并返回
-    const fileContent = fs.readFileSync(absolutePath);
     const fileName = path.basename(absolutePath);
+    const fileSize = stats.size;
 
-    // 安全头：始终添加 CSP sandbox 和 nosniff
-    c.header('Content-Security-Policy', "default-src 'none'; sandbox");
-    c.header('X-Content-Type-Options', 'nosniff');
+    // 判断是否为流媒体类型（视频/音频），需支持 Range 请求
+    const isStreamable =
+      mimeType.startsWith('video/') || mimeType.startsWith('audio/');
 
+    // 安全头
+    const securityHeaders: Record<string, string> = {
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'X-Content-Type-Options': 'nosniff',
+    };
+
+    // Content-Type 和 Content-Disposition
+    let contentType: string;
+    let disposition: string;
     if (SAFE_PREVIEW_MIME_TYPES.has(mimeType)) {
-      // 安全类型：允许 inline 预览
-      c.header('Content-Type', mimeType);
-      c.header('Content-Disposition', 'inline');
+      contentType = mimeType;
+      disposition = 'inline';
     } else {
-      // 不安全类型（HTML、SVG 等）：强制下载
-      c.header('Content-Type', 'application/octet-stream');
-      c.header(
-        'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(fileName)}"`,
-      );
+      contentType = 'application/octet-stream';
+      disposition = `attachment; filename="${encodeURIComponent(fileName)}"`;
     }
 
-    return c.body(fileContent);
+    const commonHeaders = {
+      ...securityHeaders,
+      'Content-Type': contentType,
+      'Content-Disposition': disposition,
+    };
+
+    // 流媒体类型：支持 Range 请求（浏览器 <video>/<audio> seek 依赖此机制）
+    if (isStreamable) {
+      const rangeHeader = c.req.header('range');
+      if (rangeHeader) {
+        const normalizedRange = rangeHeader.trim();
+        const isBytesRange =
+          normalizedRange.toLowerCase().startsWith('bytes=');
+        const isMultiRange = isBytesRange && normalizedRange.includes(',');
+
+        if (isBytesRange && !isMultiRange) {
+          const parsedRange = parseSingleRange(normalizedRange, fileSize);
+          if (!parsedRange) {
+            return new Response(null, {
+              status: 416,
+              headers: {
+                ...commonHeaders,
+                'Content-Range': `bytes */${fileSize}`,
+              },
+            });
+          }
+
+          const { start, end } = parsedRange;
+          const stream = Readable.toWeb(
+            fs.createReadStream(absolutePath, { start, end }),
+          ) as ReadableStream<Uint8Array>;
+          return new Response(stream, {
+            status: 206,
+            headers: {
+              ...commonHeaders,
+              'Accept-Ranges': 'bytes',
+              'Content-Length': String(end - start + 1),
+              'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            },
+          });
+        }
+      }
+
+      // 无 Range 或多区间回退：流式返回完整文件
+      const stream = Readable.toWeb(
+        fs.createReadStream(absolutePath),
+      ) as ReadableStream<Uint8Array>;
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          ...commonHeaders,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(fileSize),
+        },
+      });
+    }
+
+    // 非流媒体类型：也使用流式响应避免大文件占满内存
+    const stream = Readable.toWeb(
+      fs.createReadStream(absolutePath),
+    ) as ReadableStream<Uint8Array>;
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        ...commonHeaders,
+        'Content-Length': String(fileSize),
+      },
+    });
   } catch (error) {
     logger.error({ err: error }, `Failed to preview file for ${jid}`);
     return c.json({ error: 'Failed to preview file' }, 500);
@@ -727,10 +842,66 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
       }
     }
 
-    // 原子写入
+    // 原子写入：先 lstat 检查目标如已存在则不能是 symlink（防 TOCTOU 把
+    // absolutePath 替换成指向系统路径的链接 → rename 走的是目录项替换不会
+    // 跟随，但若先存在 symlink 时仍会替换它本身，对调用方语义没有破坏；
+    // 但仍然 lstat 校验目录祖先没被偷换）。
+    try {
+      const lst = fs.lstatSync(absolutePath);
+      if (lst.isSymbolicLink()) {
+        return c.json({ error: 'Refusing to overwrite symbolic link' }, 403);
+      }
+    } catch (err: any) {
+      if (err && err.code !== 'ENOENT') throw err;
+    }
     const tmp = `${absolutePath}.tmp`;
-    fs.writeFileSync(tmp, body.content, 'utf-8');
-    fs.renameSync(tmp, absolutePath);
+    // 用 fs.writeFileSync(fd, ...) 让 Node 内置循环处理 partial-write
+    // (NFS / 容器 IO 限流 / 磁盘满边界都可能 short-write 导致内容截断)。
+    // 配合 O_NOFOLLOW + O_EXCL 防 symlink 预放（Windows 不支持 NOFOLLOW，
+    // 走 fallback writeFileSync，由前置 lstat 守住 leaf）。
+    // tmp 失败务必 unlink，否则下次同文件 PUT 在 O_EXCL 处永久 EEXIST 锁死；
+    // rename 阶段失败也走 finally 清理。
+    const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+    let renameOk = false;
+    try {
+      if (noFollowFlag !== undefined) {
+        const flags =
+          fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_TRUNC |
+          fs.constants.O_EXCL |
+          noFollowFlag;
+        let fd: number | null = null;
+        try {
+          fd = fs.openSync(tmp, flags, 0o644);
+          // writeFileSync 接受 fd，内部循环处理 short-write
+          fs.writeFileSync(fd, body.content, 'utf-8');
+        } finally {
+          if (fd !== null) {
+            try { fs.closeSync(fd); } catch { /* ignore */ }
+          }
+        }
+      } else {
+        // Windows fallback：用 'wx' 等价的 O_EXCL 创建避免覆写预放 symlink。
+        try {
+          fs.writeFileSync(tmp, body.content, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
+        } catch (err: any) {
+          if (err && err.code === 'EEXIST') {
+            // 旧 tmp 残留：删后重试一次。
+            fs.unlinkSync(tmp);
+            fs.writeFileSync(tmp, body.content, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
+          } else {
+            throw err;
+          }
+        }
+      }
+      fs.renameSync(tmp, absolutePath);
+      renameOk = true;
+    } finally {
+      if (!renameOk) {
+        try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      }
+    }
 
     invalidateGroupStorageUsage(group.folder, rootOverride);
     return c.json({ success: true });

@@ -28,6 +28,7 @@ import {
   NewMessage,
   MessageCursor,
   MessageSourceKind,
+  ImContextBinding,
   RedeemCode,
   RegisteredGroup,
   ScheduledTask,
@@ -76,8 +77,8 @@ function stmts() {
       storeMessageInsert: db.prepare(
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
-          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
@@ -123,7 +124,7 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
          ORDER BY timestamp ASC, id ASC`,
@@ -141,14 +142,29 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
        FROM messages
        WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
          AND chat_jid IN (${placeholders})
          AND is_from_me = 0
-         AND COALESCE(source_kind, '') != 'user_command'
+         AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
        ORDER BY timestamp ASC, id ASC`,
     );
+    // Cap cache size to avoid unbounded growth in deployments where the
+    // distinct jidCount values shift over time. better-sqlite3 does not
+    // explicitly require finalization for prepared statements (it relies on
+    // GC), so dropping the reference is safe. 64 entries covers any plausible
+    // workload (the cache key is # of jids polled in one batch, normally 1..32).
+    if (_newMsgStmtCache.size >= 64) {
+      const firstKey = _newMsgStmtCache.keys().next().value as
+        | number
+        | undefined;
+      if (firstKey !== undefined) _newMsgStmtCache.delete(firstKey);
+    }
+    _newMsgStmtCache.set(jidCount, s);
+  } else {
+    // touch — LRU: re-insert to move to end (Map preserves insertion order).
+    _newMsgStmtCache.delete(jidCount);
     _newMsgStmtCache.set(jidCount, s);
   }
   return s;
@@ -160,6 +176,7 @@ interface StoredMessageMeta {
   sdkMessageUuid?: string | null;
   sourceKind?: MessageSourceKind | null;
   finalizationReason?: MessageFinalizationReason | null;
+  taskId?: string | null;
 }
 
 function hasColumn(tableName: string, columnName: string): boolean {
@@ -222,6 +239,34 @@ export function initDatabase(): void {
   // Enable WAL mode for better concurrency and performance
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
+  // Enable foreign-key enforcement. SQLite defaults to OFF for backward
+  // compatibility, so all FK declarations on existing schemas are silent
+  // no-ops without this PRAGMA. We log existing orphans (if any) but only
+  // for visibility — enforcement is reset to OFF when violations exist
+  // because turning it on with violations would refuse the next write.
+  // Operators can clean up via PRAGMA foreign_key_check then restart.
+  try {
+    db.exec('PRAGMA foreign_keys = ON');
+    const violations = db.prepare('PRAGMA foreign_key_check').all() as Array<{
+      table: string;
+      rowid: number;
+      parent: string;
+      fkid: number;
+    }>;
+    if (violations.length > 0) {
+      const summary = violations
+        .slice(0, 10)
+        .map((v) => `${v.table} → ${v.parent}`)
+        .join(', ');
+      logger.warn(
+        { violationCount: violations.length, sample: summary },
+        'Foreign-key violations detected; disabling enforcement to avoid blocking writes. Clean up orphans (PRAGMA foreign_key_check) and restart to re-enable.',
+      );
+      db.exec('PRAGMA foreign_keys = OFF');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to enable foreign-key enforcement');
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -305,6 +350,21 @@ export function initDatabase(): void {
       created_by TEXT,
       is_home INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS im_context_bindings (
+      source_jid TEXT NOT NULL,
+      context_type TEXT NOT NULL,
+      context_id TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      root_message_id TEXT,
+      title TEXT,
+      last_active_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (source_jid, context_type, context_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_icb_workspace ON im_context_bindings(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_icb_agent ON im_context_bindings(agent_id);
   `);
 
   // Auth tables
@@ -326,6 +386,7 @@ export function initDatabase(): void {
       ai_avatar_emoji TEXT,
       ai_avatar_color TEXT,
       ai_avatar_url TEXT,
+      default_require_mention INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       last_login_at TEXT,
@@ -411,7 +472,12 @@ export function initDatabase(): void {
       completed_at TEXT,
       result_summary TEXT,
       last_im_jid TEXT,
-      spawned_from_jid TEXT
+      spawned_from_jid TEXT,
+      source_kind TEXT,
+      thread_id TEXT,
+      root_message_id TEXT,
+      title_source TEXT,
+      last_active_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
     CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
@@ -634,6 +700,11 @@ export function initDatabase(): void {
   ensureColumn('users', 'ai_avatar_emoji', 'TEXT');
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
   ensureColumn('users', 'ai_avatar_url', 'TEXT');
+  ensureColumn(
+    'users',
+    'default_require_mention',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
   ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
@@ -655,12 +726,37 @@ export function initDatabase(): void {
   ensureColumn('registered_groups', 'mcp_mode', "TEXT DEFAULT 'inherit'");
   ensureColumn('registered_groups', 'selected_mcps', 'TEXT');
   ensureColumn('registered_groups', 'activation_mode', "TEXT DEFAULT 'auto'");
+  ensureColumn('registered_groups', 'owner_im_id', 'TEXT');
+  ensureColumn(
+    'registered_groups',
+    'conversation_source',
+    "TEXT DEFAULT 'manual'",
+  );
+  ensureColumn(
+    'registered_groups',
+    'conversation_nav_mode',
+    "TEXT DEFAULT 'horizontal'",
+  );
+  ensureColumn(
+    'registered_groups',
+    'binding_mode',
+    "TEXT DEFAULT 'single_context'",
+  );
+  ensureColumn('registered_groups', 'feishu_chat_mode', 'TEXT');
+  ensureColumn('registered_groups', 'feishu_group_message_type', 'TEXT');
+  ensureColumn('registered_groups', 'sender_allowlist', 'TEXT');
   ensureColumn('messages', 'token_usage', 'TEXT');
   ensureColumn('messages', 'turn_id', 'TEXT');
   ensureColumn('messages', 'session_id', 'TEXT');
   ensureColumn('messages', 'sdk_message_uuid', 'TEXT');
   ensureColumn('messages', 'source_kind', 'TEXT');
   ensureColumn('messages', 'finalization_reason', 'TEXT');
+  ensureColumn('messages', 'task_id', 'TEXT');
+  ensureColumn('agents', 'source_kind', 'TEXT');
+  ensureColumn('agents', 'thread_id', 'TEXT');
+  ensureColumn('agents', 'root_message_id', 'TEXT');
+  ensureColumn('agents', 'title_source', 'TEXT');
+  ensureColumn('agents', 'last_active_at', 'TEXT');
 
   // Add index on target_agent_id for fast lookup of IM bindings
   db.exec(
@@ -776,6 +872,7 @@ export function initDatabase(): void {
     'ai_avatar_emoji',
     'ai_avatar_color',
     'ai_avatar_url',
+    'default_require_mention',
     'created_at',
     'updated_at',
     'last_login_at',
@@ -1189,7 +1286,80 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE agents ADD COLUMN spawned_from_jid TEXT');
   }
 
-  const SCHEMA_VERSION = '33';
+  // v36 → v37: Add provider_id to sessions table for sticky provider binding.
+  // Prevents "Invalid signature in thinking block" errors when a Claude session
+  // resumed across container restarts gets routed to a different OAuth account.
+  if (
+    !db
+      .prepare("PRAGMA table_info('sessions')")
+      .all()
+      .some((c: any) => c.name === 'provider_id')
+  ) {
+    db.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT');
+  }
+
+  // v37 → v38: Added users.default_require_mention column (per-user default
+  // for require_mention on auto-registered IM group chats). The actual
+  // ensureColumn migration runs above with the other users.* additions —
+  // its position before assertSchema('users', …) matters because the
+  // schema check would otherwise reject pre-v38 databases on startup.
+
+  // v38 → v39: Lowercase usernames + add COLLATE NOCASE uniqueness.
+  // R1 added `username.toLowerCase()` to login/register/setup/admin-create/
+  // profile-update routes for case-insensitive auth; without this migration
+  // any pre-existing mixed-case username (e.g. 'Admin') is permanently
+  // locked out (login lowercases input → DB lookup misses → 401).
+  // We only run UPDATE; the existing UNIQUE constraint already prevents
+  // future mixed-case inserts because the routes lowercase before INSERT.
+  // Conflicts (e.g. both 'admin' and 'Admin' rows already exist) are rare
+  // because the original UNIQUE was case-sensitive, so they exist only when
+  // the operator manually inserted both. We log the conflict and refuse to
+  // mutate that row, leaving the operator to clean up by hand.
+  {
+    const v = getRouterStateInternal('schema_version');
+    const numV = v ? parseInt(v, 10) : 0;
+    if (numV < 39 || !v) {
+      const mixedCaseRows = db
+        .prepare(
+          // ORDER BY 让多次 dry-run 结果稳定 + 让"早创建的真账号"优先被
+          // lowercase 化，避免后注册的混淆账号顶替原账号。
+          "SELECT id, username FROM users WHERE username != lower(username) ORDER BY created_at ASC, id ASC",
+        )
+        .all() as Array<{ id: string; username: string }>;
+      if (mixedCaseRows.length > 0) {
+        const txn = db.transaction(() => {
+          for (const row of mixedCaseRows) {
+            const lower = row.username.toLowerCase();
+            const conflict = db
+              .prepare('SELECT id FROM users WHERE id != ? AND username = ?')
+              .get(row.id, lower) as { id: string } | undefined;
+            if (conflict) {
+              logger.error(
+                {
+                  userId: row.id,
+                  username: row.username,
+                  conflictUserId: conflict.id,
+                },
+                'Username case-normalization migration: conflict, leaving row as-is',
+              );
+              continue;
+            }
+            db.prepare('UPDATE users SET username = ? WHERE id = ?').run(
+              lower,
+              row.id,
+            );
+          }
+        });
+        txn();
+        logger.info(
+          { rows: mixedCaseRows.length },
+          'Username case-normalization migration v39 completed',
+        );
+      }
+    }
+  }
+
+  const SCHEMA_VERSION = '39';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1283,6 +1453,65 @@ export function setLastGroupSync(): void {
 }
 
 /**
+ * Coerce a value flowing through a TEXT-affinity column into a JS string.
+ *
+ * SQLite is dynamically typed: a TEXT column will silently accept a
+ * Buffer/Uint8Array binding and store it as BLOB. better-sqlite3 reads such
+ * cells back as Buffer, which propagates through JSON.stringify as
+ * `{type:"Buffer",data:[…]}` and breaks any consumer expecting a string.
+ *
+ * Wraps both write paths (where `warnField` surfaces the offending caller)
+ * and read paths (no `warnField`, silent normalization of legacy bad data).
+ */
+function toUtf8String(value: unknown, warnField?: string): string {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    const decoded = Buffer.from(value as Uint8Array).toString('utf8');
+    if (warnField) {
+      logger.warn(
+        { field: warnField, byteLen: (value as Uint8Array).byteLength, sample: decoded.slice(0, 80) },
+        'toUtf8String: Buffer on TEXT column, decoded as UTF-8',
+      );
+    }
+    return decoded;
+  }
+  const coerced = String(value);
+  if (warnField) {
+    logger.warn(
+      { field: warnField, jsType: typeof value, sample: coerced.slice(0, 80) },
+      'toUtf8String: non-string on TEXT column, coerced via String()',
+    );
+  }
+  return coerced;
+}
+
+/** Variant that preserves null (vs the default '' fallback). */
+function toUtf8StringOrNull(value: unknown): string | null {
+  return value == null ? null : toUtf8String(value);
+}
+
+/** Normalize a raw message row from sqlite: decode content + boolify is_from_me.
+ *  The is_from_me overload must come first — TS overload resolution stops at
+ *  the first match and `NewMessage & { is_from_me: number }` is a subtype of
+ *  `NewMessage`. */
+function normalizeMessageRow(
+  row: NewMessage & { is_from_me: number },
+): NewMessage & { is_from_me: boolean };
+function normalizeMessageRow(row: NewMessage): NewMessage;
+function normalizeMessageRow(row: NewMessage & { is_from_me?: number }): NewMessage & { is_from_me?: boolean } {
+  const { is_from_me, content, ...rest } = row;
+  const out: NewMessage & { is_from_me?: boolean } = {
+    ...rest,
+    content: toUtf8String(content),
+  };
+  if (typeof is_from_me === 'number') {
+    out.is_from_me = is_from_me === 1;
+  }
+  return out;
+}
+
+/**
  * Ensure a chat row exists in the chats table (avoids FK violation on messages insert).
  */
 export function ensureChatExists(chatJid: string): void {
@@ -1322,7 +1551,7 @@ export function storeMessageDirect(
     sourceJid ?? chatJid,
     sender,
     senderName,
-    content,
+    toUtf8String(content, 'messages.content'),
     timestamp,
     isFromMe ? 1 : 0,
     attachments ?? null,
@@ -1332,8 +1561,44 @@ export function storeMessageDirect(
     meta?.sdkMessageUuid ?? null,
     meta?.sourceKind ?? null,
     meta?.finalizationReason ?? null,
+    meta?.taskId ?? null,
   );
   return effectiveMsgId;
+}
+
+/**
+ * Overwrite the `attachments` JSON column for a single message row.
+ *
+ * Used by the plugin-command expander to persist the expanded-prompt
+ * sentinel after inline `!` commands run successfully (P1 round-14
+ * crash-safety): the next recovery pass reads the sentinel and reuses
+ * the stored prompt instead of re-executing inline.
+ */
+export function updateMessageAttachments(
+  chatJid: string,
+  msgId: string,
+  attachmentsJson: string,
+): void {
+  db.prepare(
+    `UPDATE messages SET attachments = ? WHERE id = ? AND chat_jid = ?`,
+  ).run(attachmentsJson, msgId, chatJid);
+}
+
+/**
+ * Read the `attachments` JSON column for a single message row, or null
+ * if the row is missing (caller treats null as "no persisted state").
+ */
+export function getMessageAttachments(
+  chatJid: string,
+  msgId: string,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT attachments FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1`,
+    )
+    .get(msgId, chatJid) as { attachments: string | null } | undefined;
+  if (!row) return null;
+  return row.attachments ?? null;
 }
 
 /**
@@ -1787,12 +2052,13 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newCursor: MessageCursor } {
   if (jids.length === 0) return { messages: [], newCursor: cursor };
 
-  const rows = getNewMessagesStmt(jids.length).all(
+  const rawRows = getNewMessagesStmt(jids.length).all(
     cursor.timestamp,
     cursor.timestamp,
     cursor.id,
     ...jids,
   ) as NewMessage[];
+  const rows = rawRows.map((r) => normalizeMessageRow(r));
   const last = rows[rows.length - 1];
   return {
     messages: rows,
@@ -1804,12 +2070,13 @@ export function getMessagesSince(
   chatJid: string,
   cursor: MessageCursor,
 ): NewMessage[] {
-  return stmts().getMessagesSince.all(
+  const rows = stmts().getMessagesSince.all(
     chatJid,
     cursor.timestamp,
     cursor.timestamp,
     cursor.id,
   ) as NewMessage[];
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 export function createTask(
@@ -1824,12 +2091,14 @@ export function createTask(
     task.id,
     task.group_folder,
     task.chat_jid,
-    task.prompt,
+    toUtf8String(task.prompt, 'scheduled_tasks.prompt'),
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'group',
     task.execution_type || 'agent',
-    task.script_command ?? null,
+    task.script_command == null
+      ? null
+      : toUtf8String(task.script_command, 'scheduled_tasks.script_command'),
     task.execution_mode ?? null,
     task.next_run,
     task.status,
@@ -1855,6 +2124,9 @@ function mapTaskRow(row: unknown): ScheduledTask {
   if (r.execution_mode === undefined) r.execution_mode = null;
   if (r.workspace_jid === undefined) r.workspace_jid = null;
   if (r.workspace_folder === undefined) r.workspace_folder = null;
+  // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
+  r.prompt = toUtf8String(r.prompt);
+  if (r.script_command !== undefined) r.script_command = toUtf8StringOrNull(r.script_command);
   return r as ScheduledTask;
 }
 
@@ -1894,6 +2166,8 @@ export function updateTask(
       | 'next_run'
       | 'status'
       | 'notify_channels'
+      | 'chat_jid'
+      | 'group_folder'
     >
   >,
 ): void {
@@ -1902,7 +2176,7 @@ export function updateTask(
 
   if (updates.prompt !== undefined) {
     fields.push('prompt = ?');
-    values.push(updates.prompt);
+    values.push(toUtf8String(updates.prompt, 'scheduled_tasks.prompt'));
   }
   if (updates.schedule_type !== undefined) {
     fields.push('schedule_type = ?');
@@ -1926,7 +2200,11 @@ export function updateTask(
   }
   if (updates.script_command !== undefined) {
     fields.push('script_command = ?');
-    values.push(updates.script_command);
+    values.push(
+      updates.script_command == null
+        ? null
+        : toUtf8String(updates.script_command, 'scheduled_tasks.script_command'),
+    );
   }
   if (updates.next_run !== undefined) {
     fields.push('next_run = ?');
@@ -1939,6 +2217,14 @@ export function updateTask(
   if (updates.notify_channels !== undefined) {
     fields.push('notify_channels = ?');
     values.push(updates.notify_channels != null ? JSON.stringify(updates.notify_channels) : null);
+  }
+  if (updates.chat_jid !== undefined) {
+    fields.push('chat_jid = ?');
+    values.push(updates.chat_jid);
+  }
+  if (updates.group_folder !== undefined) {
+    fields.push('group_folder = ?');
+    values.push(updates.group_folder);
   }
 
   if (fields.length === 0) return;
@@ -2009,6 +2295,35 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+}
+
+// Advance next_run for a task we deliberately did NOT execute (e.g. overdue
+// beyond the backfill grace window). Does not touch last_run, so the task
+// detail view continues to reflect the last *actual* run.
+export function advanceSkippedTask(id: string, nextRun: string | null): void {
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+    WHERE id = ?
+  `,
+  ).run(nextRun, nextRun, id);
+}
+
+// Pause a recurring task that just ran but whose schedule produces no next_run
+// (corrupted schedule_value, cron parse failure). Unlike updateTaskAfterRun(null)
+// it does NOT flip status to 'completed' (which would silently disable it);
+// it records THIS run's last_run/last_result so the task detail view is accurate
+// and clears next_run so the owner can fix the schedule and re-activate.
+export function pauseTaskAfterRun(id: string, lastResult: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused'
+    WHERE id = ?
+  `,
+  ).run(now, lastResult, id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -2157,8 +2472,84 @@ export function deleteSession(
   ).run(groupFolder, effectiveAgentId);
 }
 
+/**
+ * Get the provider_id bound to a session (group_folder + agent_id).
+ * Returns undefined if no row or no binding recorded.
+ *
+ * Used by ProviderPool sticky-selection: when resuming a Claude session that
+ * already produced thinking blocks, route back to the same provider/account so
+ * thinking-block signatures validate.
+ */
+export function getSessionProviderId(
+  groupFolder: string,
+  agentId?: string | null,
+): string | undefined {
+  const effectiveAgentId = agentId || '';
+  const row = db
+    .prepare(
+      'SELECT provider_id FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    )
+    .get(groupFolder, effectiveAgentId) as
+    | { provider_id: string | null }
+    | undefined;
+  return row?.provider_id ?? undefined;
+}
+
+/**
+ * Bind a session to a specific provider_id, or clear the binding (provider_id=null).
+ * Upserts a sessions row if one does not yet exist (with empty session_id).
+ */
+export function setSessionProviderId(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  providerId: string | null,
+): void {
+  const effectiveAgentId = agentId || '';
+  db.prepare(
+    `INSERT INTO sessions (group_folder, session_id, agent_id, provider_id)
+     VALUES (?, '', ?, ?)
+     ON CONFLICT(group_folder, agent_id) DO UPDATE SET provider_id = excluded.provider_id`,
+  ).run(groupFolder, effectiveAgentId, providerId);
+}
+
 export function deleteAllSessionsForFolder(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
+/**
+ * Delete all session rows bound to the given provider_id.
+ *
+ * Used when a provider's protocol-level fields (anthropicBaseUrl /
+ * anthropicModel) change: any session whose history contains thinking blocks /
+ * model-specific framing produced by this provider must restart fresh,
+ * otherwise resuming under the new config can fail with "Invalid signature in
+ * thinking block" or "model mismatch" errors. Sessions bound to *other*
+ * providers are left intact so unrelated sticky bindings survive a partial
+ * config update — see issue #476.
+ *
+ * Returns the affected `group_folder` values so callers can also evict the
+ * in-memory sessions cache and the row count for telemetry.
+ */
+export function deleteSessionsByProviderId(providerId: string): {
+  deletedCount: number;
+  affectedFolders: string[];
+} {
+  const tx = db.transaction((id: string) => {
+    const rows = db
+      .prepare(
+        'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?',
+      )
+      .all(id) as Array<{ group_folder: string }>;
+    const affectedFolders = rows.map((r) => r.group_folder);
+    const result = db
+      .prepare('DELETE FROM sessions WHERE provider_id = ?')
+      .run(id);
+    return {
+      deletedCount: result.changes,
+      affectedFolders,
+    };
+  });
+  return tx(providerId);
 }
 
 export function getAllSessions(): Record<string, string> {
@@ -2208,22 +2599,66 @@ type RegisteredGroupRow = {
   reply_policy: string | null;
   require_mention: number;
   activation_mode: string | null;
+  owner_im_id: string | null;
   mcp_mode: string | null;
   selected_mcps: string | null;
+  conversation_source: string | null;
+  conversation_nav_mode: string | null;
+  binding_mode: string | null;
+  feishu_chat_mode: string | null;
+  feishu_group_message_type: string | null;
+  sender_allowlist: string | null;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
 function parseGroupRow(
   row: RegisteredGroupRow,
 ): RegisteredGroup & { jid: string } {
+  // 防御性 JSON.parse：parseGroupRow 在启动期 loadState 路径上被调用，单条
+  // 损坏的 row（手工 SQL / 部分写入 / migration 失误）不能让进程退出。
+  // 用 warn 日志保留可观测性，损坏字段 fallback 到 undefined。
+  let containerConfig: RegisteredGroup['containerConfig'];
+  if (row.container_config) {
+    try {
+      containerConfig = JSON.parse(row.container_config);
+    } catch (err) {
+      logger.warn(
+        { jid: row.jid, err, raw: row.container_config.slice(0, 200) },
+        'parseGroupRow: container_config JSON malformed, dropping',
+      );
+    }
+  }
+  let senderAllowlist: string[] | undefined;
+  if (row.sender_allowlist != null) {
+    try {
+      const parsed = JSON.parse(row.sender_allowlist) as unknown;
+      if (Array.isArray(parsed) && parsed.every((v) => typeof v === 'string')) {
+        senderAllowlist = parsed as string[];
+      } else {
+        // Fail-closed：semantics 层把 [] 视为「禁止所有发送者」。坏数据回退
+        // 到 [] 比 undefined（=允许全部）更安全 —— 与 R0 的 owner-only 默认
+        // 一致，不会把限制群默默改成开放群。
+        senderAllowlist = [];
+        logger.warn(
+          { jid: row.jid },
+          'parseGroupRow: sender_allowlist not a string[], falling back to [] (fail-closed)',
+        );
+      }
+    } catch (err) {
+      // 解析失败同样 fail-closed：[] = 禁止所有，等待运维修复。
+      senderAllowlist = [];
+      logger.warn(
+        { jid: row.jid, err, raw: row.sender_allowlist.slice(0, 200) },
+        'parseGroupRow: sender_allowlist JSON malformed, falling back to [] (fail-closed)',
+      );
+    }
+  }
   return {
     jid: row.jid,
     name: row.name,
     folder: row.folder,
     added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
+    containerConfig,
     executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
     customCwd: row.custom_cwd ?? undefined,
     initSourcePath: row.init_source_path ?? undefined,
@@ -2235,21 +2670,34 @@ function parseGroupRow(
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
     activation_mode: parseActivationMode(row.activation_mode),
+    owner_im_id: row.owner_im_id ?? undefined,
+    conversation_source:
+      row.conversation_source === 'feishu_thread' ? 'feishu_thread' : 'manual',
+    conversation_nav_mode:
+      row.conversation_nav_mode === 'vertical_threads'
+        ? 'vertical_threads'
+        : 'horizontal',
+    binding_mode:
+      row.binding_mode === 'thread_map' ? 'thread_map' : 'single_context',
+    feishu_chat_mode: row.feishu_chat_mode ?? undefined,
+    feishu_group_message_type: row.feishu_group_message_type ?? undefined,
+    sender_allowlist: senderAllowlist,
   };
 }
 
-const VALID_ACTIVATION_MODES = new Set([
+export const VALID_ACTIVATION_MODES = new Set([
   'auto',
   'always',
   'when_mentioned',
+  'owner_mentioned',
   'disabled',
 ]);
 
 function parseActivationMode(
   raw: string | null,
-): 'auto' | 'always' | 'when_mentioned' | 'disabled' {
+): 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled' {
   if (raw && VALID_ACTIVATION_MODES.has(raw))
-    return raw as 'auto' | 'always' | 'when_mentioned' | 'disabled';
+    return raw as 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
   return 'auto';
 }
 
@@ -2265,8 +2713,8 @@ export function getRegisteredGroup(
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, mcp_mode, selected_mcps)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -2285,13 +2733,68 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.reply_policy ?? 'source_only',
     group.require_mention === true ? 1 : 0,
     group.activation_mode ?? 'auto',
+    group.owner_im_id ?? null,
     'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
     null, // selected_mcps: deprecated, always null
+    group.conversation_source ?? 'manual',
+    group.conversation_nav_mode ?? 'horizontal',
+    group.binding_mode ?? 'single_context',
+    group.feishu_chat_mode ?? null,
+    group.feishu_group_message_type ?? null,
+    group.sender_allowlist != null ? JSON.stringify(group.sender_allowlist) : null,
   );
 }
 
 export function deleteRegisteredGroup(jid: string): void {
   db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+}
+
+/**
+ * Find groups owned by `userId` whose sender_allowlist is the empty array `[]` —
+ * the "owner-locked trap" state where no one (not even the owner) can trigger
+ * the bot. Created by buildOnNewChat when a Feishu group is auto-registered
+ * before the owner has DM'd the bot. Used by Feishu owner backfill.
+ */
+export function findEmptyAllowlistFeishuGroupsForUser(userId: string): string[] {
+  const rows = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE created_by = ? AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'",
+    )
+    .all(userId) as Array<{ jid: string }>;
+  return rows.map((r) => r.jid);
+}
+
+/**
+ * Replace empty `sender_allowlist=[]` with `[ownerOpenId]` for the user's
+ * Feishu groups. Returns the JIDs that were updated. Run once when the
+ * Feishu owner is first identified via P2P DM, to unstick groups that were
+ * registered before the owner was known.
+ */
+export function backfillEmptyAllowlistsForUser(
+  userId: string,
+  ownerOpenId: string,
+): string[] {
+  const jids = findEmptyAllowlistFeishuGroupsForUser(userId);
+  if (jids.length === 0) return [];
+  const allowlistJson = JSON.stringify([ownerOpenId]);
+  const stmt = db.prepare(
+    'UPDATE registered_groups SET sender_allowlist = ? WHERE jid = ?',
+  );
+  const tx = db.transaction((targets: string[]) => {
+    for (const jid of targets) stmt.run(allowlistJson, jid);
+  });
+  tx(jids);
+  return jids;
+}
+
+/**
+ * Clear `sender_allowlist` for a single group (set to NULL = unrestricted).
+ * Used as a manual escape hatch from the owner-locked trap.
+ */
+export function clearSenderAllowlist(jid: string): void {
+  db.prepare(
+    'UPDATE registered_groups SET sender_allowlist = NULL WHERE jid = ?',
+  ).run(jid);
 }
 
 /** Get all JIDs that share the same folder (e.g., all JIDs with folder='main'). */
@@ -2346,6 +2849,108 @@ export function getGroupsByTargetMainJid(
     .prepare('SELECT * FROM registered_groups WHERE target_main_jid = ?')
     .all(webJid) as RegisteredGroupRow[];
   return rows.map((row) => ({ jid: row.jid, group: parseGroupRow(row) }));
+}
+
+function mapImContextBindingRow(
+  row: Record<string, unknown>,
+): ImContextBinding {
+  return {
+    source_jid: String(row.source_jid),
+    context_type: 'thread',
+    context_id: String(row.context_id),
+    workspace_jid: String(row.workspace_jid),
+    agent_id: String(row.agent_id),
+    root_message_id:
+      typeof row.root_message_id === 'string' ? row.root_message_id : null,
+    title: typeof row.title === 'string' ? row.title : null,
+    last_active_at: String(row.last_active_at),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+export function getImContextBinding(
+  sourceJid: string,
+  contextType: 'thread',
+  contextId: string,
+): ImContextBinding | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM im_context_bindings WHERE source_jid = ? AND context_type = ? AND context_id = ?',
+    )
+    .get(sourceJid, contextType, contextId) as Record<string, unknown> | undefined;
+  return row ? mapImContextBindingRow(row) : undefined;
+}
+
+export function upsertImContextBinding(binding: ImContextBinding): void {
+  db.prepare(
+    `INSERT INTO im_context_bindings (
+      source_jid, context_type, context_id, workspace_jid, agent_id,
+      root_message_id, title, last_active_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(source_jid, context_type, context_id) DO UPDATE SET
+      workspace_jid = excluded.workspace_jid,
+      agent_id = excluded.agent_id,
+      -- COALESCE: 首条消息设定 root_message_id/title 后，后续消息传 null 不会覆盖
+      root_message_id = COALESCE(excluded.root_message_id, im_context_bindings.root_message_id),
+      title = COALESCE(excluded.title, im_context_bindings.title),
+      last_active_at = excluded.last_active_at,
+      updated_at = excluded.updated_at`,
+  ).run(
+    binding.source_jid,
+    binding.context_type,
+    binding.context_id,
+    binding.workspace_jid,
+    binding.agent_id,
+    binding.root_message_id,
+    binding.title,
+    binding.last_active_at,
+    binding.created_at,
+    binding.updated_at,
+  );
+}
+
+export function listImContextBindingsByWorkspace(
+  workspaceJid: string,
+): ImContextBinding[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM im_context_bindings WHERE workspace_jid = ? ORDER BY last_active_at DESC, created_at DESC',
+    )
+    .all(workspaceJid) as Record<string, unknown>[];
+  return rows.map(mapImContextBindingRow);
+}
+
+export function deleteImContextBindingsByWorkspace(workspaceJid: string): void {
+  db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
+    workspaceJid,
+  );
+}
+
+export function deleteImContextBindingsByAgent(agentId: string): void {
+  db.prepare('DELETE FROM im_context_bindings WHERE agent_id = ?').run(agentId);
+}
+
+/** Lightweight update: only touch last_active_at + updated_at on an existing binding. */
+export function touchImContextBindingActivity(
+  sourceJid: string,
+  contextType: 'thread',
+  contextId: string,
+  lastActiveAt: string,
+): void {
+  db.prepare(
+    'UPDATE im_context_bindings SET last_active_at = ?, updated_at = ? WHERE source_jid = ? AND context_type = ? AND context_id = ?',
+  ).run(lastActiveAt, lastActiveAt, sourceJid, contextType, contextId);
+}
+
+/** List feishu_thread agent IDs for a workspace JID (for cleanup on unbind). */
+export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
+  const rows = db
+    .prepare(
+      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind = 'feishu_thread'",
+    )
+    .all(workspaceJid) as { id: string }[];
+  return rows.map((r) => r.id);
 }
 
 /**
@@ -2479,6 +3084,33 @@ export function deleteChatHistory(chatJid: string): void {
   tx(chatJid);
 }
 
+/**
+ * Delete an IM group's registered_groups entry and all jid-scoped data
+ * (messages, chat record, pinned references). Does NOT touch folder-scoped
+ * data (sessions, scheduled_tasks, group_members) because IM groups typically
+ * share their folder with the owner's home workspace.
+ *
+ * Used when an IM group is detected as dead (bot removed, group disbanded,
+ * health-check unreachable, or repeated send failures) and for the manual
+ * "delete this IM binding" UI button.
+ */
+export function deleteImGroupRecord(jid: string): void {
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+    db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
+    db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
+    db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
+    // Feishu thread agents (source_kind='feishu_thread') and other chat-scoped
+    // agents reference this jid via agents.chat_jid — without this, deleting
+    // an IM group leaves orphan agent rows visible in the agents list.
+    db.prepare('DELETE FROM agents WHERE chat_jid = ?').run(jid);
+    db.prepare(
+      'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
+    ).run(jid);
+  });
+  tx();
+}
+
 export function deleteGroupData(jid: string, folder: string): void {
   const tx = db.transaction(() => {
     // 1. 删除定时任务运行日志 + 定时任务
@@ -2566,10 +3198,7 @@ export function getMessagesPage(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -2592,10 +3221,7 @@ export function getMessagesAfter(
     )
     .all(chatJid, after, limit) as Array<NewMessage & { is_from_me: number }>;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -2629,10 +3255,7 @@ export function getMessagesPageMulti(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -2660,10 +3283,7 @@ export function getMessagesAfterMulti(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -2709,10 +3329,7 @@ export function getMessagesByTimeRange(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -2736,23 +3353,38 @@ export function getGroupsByOwner(
     created_by: string | null;
     is_home: number;
     selected_skills: string | null;
+    target_main_jid: string | null;
+    target_agent_id: string | null;
   }>;
 
-  return rows.map((row) => ({
-    jid: row.jid,
-    name: row.name,
-    folder: row.folder,
-    added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
-    executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
-    customCwd: row.custom_cwd ?? undefined,
-    initSourcePath: row.init_source_path ?? undefined,
-    initGitUrl: row.init_git_url ?? undefined,
-    created_by: row.created_by ?? undefined,
-    is_home: row.is_home === 1,
-  }));
+  return rows.map((row) => {
+    let containerConfig: RegisteredGroup['containerConfig'];
+    if (row.container_config) {
+      try {
+        containerConfig = JSON.parse(row.container_config);
+      } catch (err) {
+        logger.warn(
+          { jid: row.jid, err },
+          'getGroupsByOwner: container_config JSON malformed, dropping',
+        );
+      }
+    }
+    return {
+      jid: row.jid,
+      name: row.name,
+      folder: row.folder,
+      added_at: row.added_at,
+      containerConfig,
+      executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
+      customCwd: row.custom_cwd ?? undefined,
+      initSourcePath: row.init_source_path ?? undefined,
+      initGitUrl: row.init_git_url ?? undefined,
+      created_by: row.created_by ?? undefined,
+      is_home: row.is_home === 1,
+      target_main_jid: row.target_main_jid ?? undefined,
+      target_agent_id: row.target_agent_id ?? undefined,
+    };
+  });
 }
 
 // ===================== Auth CRUD =====================
@@ -2819,6 +3451,7 @@ function mapUserRow(row: Record<string, unknown>): User {
       typeof row.ai_avatar_color === 'string' ? row.ai_avatar_color : null,
     ai_avatar_url:
       typeof row.ai_avatar_url === 'string' ? row.ai_avatar_url : null,
+    default_require_mention: !!row.default_require_mention,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
     last_login_at:
@@ -2845,6 +3478,7 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     ai_avatar_emoji: user.ai_avatar_emoji,
     ai_avatar_color: user.ai_avatar_color,
     ai_avatar_url: user.ai_avatar_url,
+    default_require_mention: user.default_require_mention,
     created_at: user.created_at,
     last_login_at: user.last_login_at,
     last_active_at: lastActiveAt,
@@ -3032,6 +3666,8 @@ export function listUsers(options: ListUsersOptions = {}): ListUsersResult {
   if (status) {
     whereParts.push('u.status = ?');
     params.push(status);
+  } else {
+    whereParts.push("u.status != 'deleted'");
   }
   if (query) {
     whereParts.push(
@@ -3130,6 +3766,7 @@ export function updateUserFields(
       | 'ai_avatar_emoji'
       | 'ai_avatar_color'
       | 'ai_avatar_url'
+      | 'default_require_mention'
       | 'deleted_at'
     >
   >,
@@ -3204,6 +3841,10 @@ export function updateUserFields(
   if (updates.ai_avatar_url !== undefined) {
     fields.push('ai_avatar_url = ?');
     values.push(updates.ai_avatar_url);
+  }
+  if (updates.default_require_mention !== undefined) {
+    fields.push('default_require_mention = ?');
+    values.push(updates.default_require_mention ? 1 : 0);
   }
   if (updates.deleted_at !== undefined) {
     fields.push('deleted_at = ?');
@@ -3770,8 +4411,8 @@ export function getUserMemberFolders(
 
 export function createAgent(agent: SubAgent): void {
   db.prepare(
-    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid, source_kind, thread_id, root_message_id, title_source, last_active_at, last_im_jid)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     agent.id,
     agent.group_folder,
@@ -3785,6 +4426,12 @@ export function createAgent(agent: SubAgent): void {
     agent.completed_at ?? null,
     agent.result_summary ?? null,
     agent.spawned_from_jid ?? null,
+    agent.source_kind ?? null,
+    agent.thread_id ?? null,
+    agent.root_message_id ?? null,
+    agent.title_source ?? null,
+    agent.last_active_at ?? null,
+    agent.last_im_jid ?? null,
   );
 }
 
@@ -3843,6 +4490,53 @@ export function updateAgentInfo(
     name,
     prompt,
     id,
+  );
+}
+
+export function updateAgentContextInfo(
+  id: string,
+  updates: Partial<
+    Pick<
+      SubAgent,
+      | 'name'
+      | 'source_kind'
+      | 'thread_id'
+      | 'root_message_id'
+      | 'title_source'
+      | 'last_active_at'
+    >
+  >,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  if (updates.name !== undefined) {
+    fields.push('name = ?');
+    values.push(updates.name);
+  }
+  if (updates.source_kind !== undefined) {
+    fields.push('source_kind = ?');
+    values.push(updates.source_kind);
+  }
+  if (updates.thread_id !== undefined) {
+    fields.push('thread_id = ?');
+    values.push(updates.thread_id);
+  }
+  if (updates.root_message_id !== undefined) {
+    fields.push('root_message_id = ?');
+    values.push(updates.root_message_id);
+  }
+  if (updates.title_source !== undefined) {
+    fields.push('title_source = ?');
+    values.push(updates.title_source);
+  }
+  if (updates.last_active_at !== undefined) {
+    fields.push('last_active_at = ?');
+    values.push(updates.last_active_at);
+  }
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE agents SET ${fields.join(', ')} WHERE id = ?`).run(
+    ...values,
   );
 }
 
@@ -3917,6 +4611,7 @@ export function listActiveConversationAgents(): SubAgent[] {
 export function deleteAgent(id: string): void {
   // Delete associated session
   db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
+  deleteImContextBindingsByAgent(id);
   db.prepare('DELETE FROM agents WHERE id = ?').run(id);
 }
 
@@ -3939,6 +4634,23 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
     spawned_from_jid:
       typeof row.spawned_from_jid === 'string' ? row.spawned_from_jid : null,
+    source_kind:
+      typeof row.source_kind === 'string'
+        ? (row.source_kind as 'manual' | 'feishu_thread' | 'auto_im')
+        : null,
+    thread_id: typeof row.thread_id === 'string' ? row.thread_id : null,
+    root_message_id:
+      typeof row.root_message_id === 'string' ? row.root_message_id : null,
+    title_source:
+      typeof row.title_source === 'string'
+        ? (row.title_source as
+            | 'manual'
+            | 'feishu_root'
+            | 'auto'
+            | 'auto_pending')
+        : null,
+    last_active_at:
+      typeof row.last_active_at === 'string' ? row.last_active_at : null,
   };
 }
 
@@ -4190,13 +4902,16 @@ export function updateBillingPlan(
 }
 
 export function deleteBillingPlan(id: string): boolean {
-  // Don't delete if users are subscribed
-  const hasSubscribers = db
+  // Don't delete if any subscription (any status) references this plan.
+  // PRAGMA foreign_keys=ON 会因 cancelled/expired 残留行让 DELETE 抛
+  // SQLITE_CONSTRAINT_FOREIGNKEY 把请求 500；先在应用层校验给 caller 一个
+  // 干净的 false 返回，运维需要手动迁移残留订阅再删 plan。
+  const hasReferences = db
     .prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ? AND status = 'active'",
+      'SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ?',
     )
     .get(id) as { cnt: number };
-  if (hasSubscribers.cnt > 0) return false;
+  if (hasReferences.cnt > 0) return false;
   const result = db.prepare('DELETE FROM billing_plans WHERE id = ?').run(id);
   return result.changes > 0;
 }
@@ -4277,33 +4992,39 @@ export function getUserActiveSubscription(
 }
 
 export function createUserSubscription(sub: UserSubscription): void {
-  // Cancel existing active subscriptions
-  db.prepare(
-    "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'active'",
-  ).run(new Date().toISOString(), sub.user_id);
+  // Wrap in a transaction so partial failure can't leave the user without an
+  // active subscription (cancel succeeded, insert/update failed). Same shape
+  // as expireSubscriptions / batchAssignPlan elsewhere in this file.
+  const txn = db.transaction(() => {
+    // Cancel existing active subscriptions
+    db.prepare(
+      "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'active'",
+    ).run(new Date().toISOString(), sub.user_id);
 
-  db.prepare(
-    `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, cancelled_at, trial_ends_at, notes, auto_renew, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    sub.id,
-    sub.user_id,
-    sub.plan_id,
-    sub.status,
-    sub.started_at,
-    sub.expires_at,
-    sub.cancelled_at,
-    sub.trial_ends_at,
-    sub.notes,
-    sub.auto_renew ? 1 : 0,
-    sub.created_at,
-  );
+    db.prepare(
+      `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, cancelled_at, trial_ends_at, notes, auto_renew, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      sub.id,
+      sub.user_id,
+      sub.plan_id,
+      sub.status,
+      sub.started_at,
+      sub.expires_at,
+      sub.cancelled_at,
+      sub.trial_ends_at,
+      sub.notes,
+      sub.auto_renew ? 1 : 0,
+      sub.created_at,
+    );
 
-  // Update user's subscription_plan_id
-  db.prepare('UPDATE users SET subscription_plan_id = ? WHERE id = ?').run(
-    sub.plan_id,
-    sub.user_id,
-  );
+    // Update user's subscription_plan_id
+    db.prepare('UPDATE users SET subscription_plan_id = ? WHERE id = ?').run(
+      sub.plan_id,
+      sub.user_id,
+    );
+  });
+  txn();
 }
 
 export function cancelUserSubscription(userId: string): void {
@@ -4742,6 +5463,27 @@ export function incrementMonthlyUsage(
   ).run(userId, month, inputTokens, outputTokens, costUsd, now);
 }
 
+/**
+ * Atomic monthly+daily usage increment. Wraps the two UPSERTs in a single
+ * SQLite transaction so a crash between them can't leave the two tables
+ * divergent for that turn (silent drift over time). billing.ts uses this
+ * instead of calling the two helpers in sequence.
+ */
+export function incrementUsageBoth(
+  userId: string,
+  month: string,
+  date: string,
+  inputTokens: number,
+  outputTokens: number,
+  costUsd: number,
+): void {
+  const txn = db.transaction(() => {
+    incrementMonthlyUsage(userId, month, inputTokens, outputTokens, costUsd);
+    incrementDailyUsage(userId, date, inputTokens, outputTokens, costUsd);
+  });
+  txn();
+}
+
 export function getUserMonthlyUsageHistory(
   userId: string,
   months = 6,
@@ -4893,9 +5635,9 @@ export function getBillingAuditLog(
       event_type: String(r.event_type) as BillingAuditEventType,
       user_id: String(r.user_id),
       actor_id: typeof r.actor_id === 'string' ? r.actor_id : null,
-      details: typeof r.details === 'string'
-        ? (JSON.parse(r.details) as Record<string, unknown>)
-        : null,
+      // 防御性 parse：单行损坏不应让整个审计 API 500（事故排查的关键时刻
+      // 不能因一行坏数据看不到日志）。parseJsonDetails 出错时返回 null。
+      details: parseJsonDetails(r.details),
       created_at: String(r.created_at),
     })),
     total,

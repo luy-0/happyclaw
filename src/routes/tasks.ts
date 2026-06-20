@@ -33,12 +33,25 @@ import {
   getWebDeps,
 } from '../web-context.js';
 import { getRunningTaskIds } from '../task-scheduler.js';
+import { getChannelType, extractChatId } from '../im-channel.js';
 
 const tasksRoutes = new Hono<{ Variables: Variables }>();
 
+/**
+ * 防止共享工作区里 member A 改 / 跑 / 删 member B 的任务。admin 例外、
+ * 历史 task.created_by=null 的也放行（兼容老数据；管理员可视情况手动迁移）。
+ * 返回 null = 通过；返回 Response = 404（统一伪装为 not_found，避免泄漏存在性）。
+ */
+function denyForeignTask(c: any, existing: { created_by?: string | null }, authUser: AuthUser): Response | null {
+  if (authUser.role === 'admin') return null;
+  if (!existing.created_by) return null; // legacy task without owner — admin-only effectively
+  if (existing.created_by === authUser.id) return null;
+  return c.json({ error: 'Task not found' }, 404);
+}
+
 // --- Routes ---
 
-tasksRoutes.get('/', authMiddleware, (c) => {
+tasksRoutes.get('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const allGroups = getAllRegisteredGroups();
   const tasks = getAllTasks().filter((task) => {
@@ -57,7 +70,42 @@ tasksRoutes.get('/', authMiddleware, (c) => {
   });
   const visibleTaskIds = new Set(tasks.map((t) => t.id));
   const filteredRunningIds = getRunningTaskIds().filter((id) => visibleTaskIds.has(id));
-  return c.json({ tasks, runningTaskIds: filteredRunningIds });
+
+  // Build jid → name mapping for all registered groups (including IM channels).
+  // Mirror the visibility rule used by GET /api/groups (src/routes/groups.ts:190-192):
+  // non-admins must not see host workspaces in the task-target dropdown, even
+  // though POST /api/tasks would reject them with 403 — rendering them here
+  // would be a misleading UI affordance. Authorization is still enforced on
+  // write; this filter is purely for surface consistency.
+  const groupNames: Record<string, string> = {};
+  for (const [jid, group] of Object.entries(allGroups)) {
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) continue;
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) continue;
+    groupNames[jid] = group.name || jid;
+  }
+
+  // Enrich Feishu group names with real chat names from API.
+  // Only enrich JIDs actually referenced by visible tasks to avoid N+1 calls
+  // against Feishu Open API when the user has many registered groups.
+  const deps = getWebDeps();
+  if (deps?.getFeishuChatInfo) {
+    const referencedJids = new Set(tasks.map((t) => t.chat_jid));
+    const feishuJids = Object.keys(groupNames).filter(
+      (jid) => referencedJids.has(jid) && getChannelType(jid) === 'feishu',
+    );
+    const enrichPromises = feishuJids.map(async (jid) => {
+      try {
+        const chatId = extractChatId(jid);
+        const info = await deps.getFeishuChatInfo!(authUser.id, chatId);
+        if (info?.name) groupNames[jid] = info.name;
+      } catch (err) {
+        logger.debug({ jid, err }, 'feishu chat name enrichment failed');
+      }
+    });
+    await Promise.allSettled(enrichPromises);
+  }
+
+  return c.json({ tasks, runningTaskIds: filteredRunningIds, groupNames });
 });
 
 tasksRoutes.post('/', authMiddleware, async (c) => {
@@ -118,15 +166,26 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: '只有管理员可以创建脚本类型任务' }, 403);
   }
 
-  // Determine execution_mode
+  // Determine execution_mode by inheriting from the source workspace.
+  // - Source is host: default host (admin-only via hasHostExecutionPermission
+  //   check above), allow explicit container downgrade.
+  // - Source is container: default container; explicit host request rejected
+  //   even for admins, to keep task execution consistent with its workspace.
+  const sourceIsHost = isHostExecutionGroup(group);
   let taskExecutionMode: 'host' | 'container';
-  if (authUser.role === 'admin') {
-    taskExecutionMode = validation.data.execution_mode || 'host';
-  } else {
-    if (validation.data.execution_mode === 'host') {
-      return c.json({ error: '只有管理员可以创建宿主机任务' }, 403);
+  if (validation.data.execution_mode === 'host') {
+    if (!sourceIsHost) {
+      return c.json(
+        { error: '当前工作区运行在容器模式，任务不能使用宿主机执行模式' },
+        400,
+      );
     }
+    // Non-admin already blocked above by isHostExecutionGroup + hasHostExecutionPermission check
+    taskExecutionMode = 'host';
+  } else if (validation.data.execution_mode === 'container') {
     taskExecutionMode = 'container';
+  } else {
+    taskExecutionMode = sourceIsHost ? 'host' : 'container';
   }
 
   const taskId = crypto.randomUUID();
@@ -193,6 +252,10 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
       );
     }
   }
+  {
+    const denial = denyForeignTask(c, existing, authUser);
+    if (denial) return denial;
+  }
   const body = await c.req.json().catch(() => ({}));
 
   const validation = TaskPatchSchema.safeParse(body);
@@ -217,9 +280,82 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     return c.json({ error: '只有管理员可以设置宿主机执行模式' }, 403);
   }
 
-  // Auto-recalculate next_run when schedule changes (avoid pulling cron-parser into frontend)
-  const patchData = { ...validation.data };
-  if (patchData.schedule_type !== undefined || patchData.schedule_value !== undefined) {
+  // Validate chat_jid if being changed
+  const patchData = { ...validation.data } as typeof validation.data & { group_folder?: string };
+  let effectiveTargetGroup: ReturnType<typeof getRegisteredGroup> = group;
+  if (validation.data.chat_jid !== undefined) {
+    const targetGroup = getRegisteredGroup(validation.data.chat_jid);
+    if (!targetGroup) {
+      return c.json({ error: '目标群组不存在' }, 404);
+    }
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)) {
+      return c.json({ error: '无权访问目标群组' }, 403);
+    }
+    // Keep group_folder in sync with chat_jid
+    patchData.group_folder = targetGroup.folder;
+    effectiveTargetGroup = targetGroup;
+  }
+
+  // Final-state consistency: after the patch, if the task runs as 'host', the
+  // target workspace must itself be a host workspace. Container workspaces
+  // reject host execution for ALL roles (including admin) — execution mode
+  // must match the source workspace's capabilities.
+  const finalExecutionMode =
+    patchData.execution_mode ?? existing.execution_mode;
+  if (
+    finalExecutionMode === 'host' &&
+    effectiveTargetGroup &&
+    !isHostExecutionGroup(effectiveTargetGroup)
+  ) {
+    return c.json(
+      {
+        error:
+          '目标工作区运行在容器模式，任务不能使用宿主机执行模式。请同时把执行模式改为 container。',
+      },
+      400,
+    );
+  }
+
+  // Auto-recalculate next_run when the schedule changes (avoid pulling
+  // cron-parser into the frontend), OR when resuming a task whose next_run was
+  // cleared. A recurring task that couldn't compute a next run is paused with
+  // next_run=NULL; the UI resume sends only {status:'active'}, so without this
+  // it would flip to active-but-never-scheduled (getDueTasks requires next_run
+  // IS NOT NULL). If the schedule is genuinely corrupt the recompute throws and
+  // returns 400, telling the owner to fix schedule_value before resuming.
+  const scheduleChanged =
+    patchData.schedule_type !== undefined ||
+    patchData.schedule_value !== undefined;
+  // Only recompute on resume for a RECURRING task whose next_run was cleared and
+  // when the caller didn't supply an explicit next_run:
+  //  - exclude 'once' so a completed once-task (status='completed', next_run=NULL,
+  //    schedule_value = its original PAST timestamp) can't be resurrected and
+  //    immediately re-fired by a bare {status:'active'} PATCH;
+  //  - honor a caller-supplied next_run instead of recomputing (and 400-ing) from
+  //    a possibly-corrupt schedule_value.
+  const resumingWithoutNextRun =
+    patchData.status === 'active' &&
+    existing.status !== 'active' &&
+    existing.next_run == null &&
+    existing.schedule_type !== 'once' &&
+    patchData.next_run === undefined;
+  // A completed once-task can't be "resumed": its schedule is a past one-shot
+  // timestamp. Re-activating it would either re-fire the one-shot action or
+  // (with the once guard above suppressing recompute) strand it active-but-never
+  // -scheduled (getDueTasks needs next_run IS NOT NULL). Reject unless the caller
+  // also changes the schedule, which makes it a deliberate fresh run.
+  if (
+    patchData.status === 'active' &&
+    existing.status === 'completed' &&
+    existing.schedule_type === 'once' &&
+    !scheduleChanged
+  ) {
+    return c.json(
+      { error: '已完成的一次性任务无法重新启用，请修改其调度时间或新建任务。' },
+      400,
+    );
+  }
+  if (scheduleChanged || resumingWithoutNextRun) {
     const schedType = patchData.schedule_type ?? existing.schedule_type;
     const schedValue = patchData.schedule_value ?? existing.schedule_value;
     try {
@@ -228,9 +364,20 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
           .next()
           .toISOString() || new Date().toISOString();
       } else if (schedType === 'interval') {
-        const ms = parseInt(schedValue, 10);
+        // Number() not parseInt(): parseInt('1e16',10) === 1 silently truncates
+        // and the patch ends up with a 1ms interval. Same upper bound as create.
+        const ms = Number(schedValue);
         if (!Number.isFinite(ms) || ms <= 0) {
           return c.json({ error: 'Invalid interval value' }, 400);
+        }
+        const MAX_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
+        if (ms > MAX_INTERVAL_MS) {
+          return c.json(
+            {
+              error: `Interval exceeds maximum (${MAX_INTERVAL_MS} ms = 1 year). Use cron for longer schedules.`,
+            },
+            400,
+          );
         }
         patchData.next_run = new Date(Date.now() + ms).toISOString();
       } else if (schedType === 'once') {
@@ -269,6 +416,10 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
         403,
       );
     }
+  }
+  {
+    const denial = denyForeignTask(c, existing, authUser);
+    if (denial) return denial;
   }
   // Only admin can delete script tasks
   if (existing.execution_type === 'script' && authUser.role !== 'admin') {
@@ -327,6 +478,10 @@ tasksRoutes.post('/:id/run', authMiddleware, (c) => {
       );
     }
   }
+  {
+    const denial = denyForeignTask(c, existing, authUser);
+    if (denial) return denial;
+  }
 
   // Only admin can run script tasks
   if (existing.execution_type === 'script' && authUser.role !== 'admin') {
@@ -362,6 +517,12 @@ tasksRoutes.get('/:id/logs', authMiddleware, (c) => {
         403,
       );
     }
+  }
+  // 与 PATCH/DELETE/RUN 对齐：shared workspace 中 member A 不应能读
+  // member B 的任务日志（含 prompt、stderr、tool 输出）。
+  {
+    const denial = denyForeignTask(c, existing, authUser);
+    if (denial) return denial;
   }
   const limitRaw = parseInt(c.req.query('limit') || '20', 10);
   const limit = Math.min(
@@ -441,25 +602,65 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
   }
   const notifyChannels: string[] | null = body.notify_channels ?? null;
 
-  // Resolve home group
-  const homeGroup = getUserHomeGroup(authUser.id);
-  if (!homeGroup) return c.json({ error: 'Home group not found' }, 400);
+  // Optional user-supplied target workspace. If absent, fall back to the
+  // user's home group for backward compatibility.
+  const requestedChatJid =
+    typeof body.chat_jid === 'string' && body.chat_jid ? body.chat_jid : null;
+  const requestedContextMode =
+    body.context_mode === 'group' || body.context_mode === 'isolated'
+      ? (body.context_mode as 'group' | 'isolated')
+      : null;
+
+  let groupFolder: string;
+  let chatJid: string;
+  let sourceIsHost: boolean;
+
+  if (requestedChatJid) {
+    // User-selected workspace: run the same validation chain as POST /api/tasks
+    // so the AI path cannot be used to bypass group-access / host-exec checks.
+    const group = getRegisteredGroup(requestedChatJid);
+    if (!group) return c.json({ error: 'Group not found' }, 404);
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+      return c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      );
+    }
+    groupFolder = group.folder;
+    chatJid = requestedChatJid;
+    sourceIsHost = isHostExecutionGroup(group);
+  } else {
+    const homeGroup = getUserHomeGroup(authUser.id);
+    if (!homeGroup) return c.json({ error: 'Home group not found' }, 400);
+    groupFolder = homeGroup.folder;
+    chatJid = homeGroup.jid;
+    const registered = getRegisteredGroup(homeGroup.jid);
+    sourceIsHost = registered ? isHostExecutionGroup(registered) : false;
+  }
 
   const taskId = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  // Determine execution_mode
-  const taskExecutionMode = authUser.role === 'admin' ? 'host' : 'container';
+  // Inherit execution_mode from the resolved source workspace (same rule as
+  // POST /api/tasks). Previously hard-coded to admin=host / member=container,
+  // which would misattribute tasks whose target workspace is container-mode
+  // even for admin, or vice-versa.
+  const taskExecutionMode: 'host' | 'container' = sourceIsHost
+    ? 'host'
+    : 'container';
 
   // Create task immediately with 'parsing' status and description as prompt
   createTask({
     id: taskId,
-    group_folder: homeGroup.folder,
-    chat_jid: homeGroup.jid,
+    group_folder: groupFolder,
+    chat_jid: chatJid,
     prompt: description,
     schedule_type: 'cron',
     schedule_value: '0 0 * * *', // placeholder, will be updated after parsing
-    context_mode: 'group',
+    context_mode: requestedContextMode ?? 'group',
     execution_type: 'agent',
     execution_mode: taskExecutionMode,
     script_command: null,

@@ -16,8 +16,10 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
+import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
 import { getChannelFromJid } from './channel-prefixes.js';
 
 import type {
@@ -29,9 +31,14 @@ import type {
   ParsedMessage,
   StreamEvent,
 } from './types.js';
+import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
 import { sanitizeFilename, generateFallbackName } from './utils.js';
+import {
+  extractSessionHistory as extractSessionHistoryImpl,
+  parseTranscript,
+} from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
@@ -64,7 +71,10 @@ const DEFAULT_ALLOWED_TOOLS = [
   'WebSearch', 'WebFetch',
   'Task', 'TaskOutput', 'TaskStop',
   'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill',
+  // 'Skill' removed: since SDK 0.3.x skills are enabled via the `skills` option
+  // (skills: 'all' below), not by listing a 'Skill' tool here. Keeping the dead
+  // entry just invited confusion.
+  'TodoWrite', 'ToolSearch',
   'NotebookEdit',
   'mcp__happyclaw__*'
 ];
@@ -79,74 +89,205 @@ const MEMORY_FLUSH_ALLOWED_TOOLS = [
 
 // Memory flush 期间禁用的工具（disallowedTools 会从模型上下文中完全移除这些工具）
 // 注意：allowedTools 仅控制自动审批，不限制工具可见性；
-//       bypassPermissions 模式下所有工具都自动通过，所以必须用 disallowedTools 来限制
-const MEMORY_FLUSH_DISALLOWED_TOOLS = [
+//       bypassPermissions 模式下所有工具都自动通过，所以必须用 disallowedTools 来限制。
+// mcp__happyclaw__* 部分不在这里硬编码，而是在 main() 里按 createMcpTools() 的注册全集
+// 动态派生（见 memoryFlushDisallowedTools），只保留 memory_append/get/search，
+// 避免后续新增 MCP 工具后再次遗漏屏蔽（如曾漏掉的 send_image/send_file/discord_*/*_skill）。
+const MEMORY_FLUSH_DISALLOWED_BUILTINS = [
   'Bash', 'Write', 'WebSearch', 'WebFetch', 'Glob', 'Grep',
   'Task', 'TaskOutput', 'TaskStop',
   'TeamCreate', 'TeamDelete', 'SendMessage',
   'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit',
-  'mcp__happyclaw__send_message',
-  'mcp__happyclaw__schedule_task',
-  'mcp__happyclaw__list_tasks',
-  'mcp__happyclaw__pause_task',
-  'mcp__happyclaw__resume_task',
-  'mcp__happyclaw__cancel_task',
-  'mcp__happyclaw__register_group',
 ];
+// 记忆刷新期间仍需保留可用的 MCP 工具（读写记忆正是 flush 的目的）。
+const MEMORY_FLUSH_KEEP_MCP = new Set([
+  'mcp__happyclaw__memory_append',
+  'mcp__happyclaw__memory_get',
+  'mcp__happyclaw__memory_search',
+]);
 
 const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
 
-// ── 系统提示词优化：安全守则（从独立 Markdown 文件加载，始终注入所有容器） ──
+// ── 系统提示词从独立 Markdown 文件加载（启动期一次性 readFileSync 缓存到模块级常量）──
+// 文件位于 container/agent-runner/prompts/，便于改提示词无需重编译 + CR 友好。
 
-const SECURITY_RULES_PATH = path.join(
+const PROMPTS_DIR = path.join(
   path.dirname(new URL(import.meta.url).pathname),
   '..',
   'prompts',
-  'security-rules.md',
 );
-const SECURITY_RULES = fs.readFileSync(SECURITY_RULES_PATH, 'utf-8');
 
-// globalClaudeMd 截断保护：防止用户 CLAUDE.md 过大导致系统提示词膨胀
-const GLOBAL_CLAUDE_MD_MAX_CHARS = 8000;
-
-/** Head+Tail 截断：保留头 75% + 尾 25%，中间标记已截断 */
-function truncateWithHeadTail(content: string, maxChars: number): string {
-  if (content.length <= maxChars) return content;
-  const headSize = Math.floor(maxChars * 0.75);
-  const tailSize = Math.max(0, maxChars - headSize - 30);
-  return content.slice(0, headSize) + '\n\n[...内容过长，已截断...]\n\n' + content.slice(-tailSize);
+function loadPrompt(...segments: string[]): string {
+  return fs.readFileSync(path.join(PROMPTS_DIR, ...segments), 'utf-8').trimEnd();
 }
 
-/** 按渠道生成格式指南（仅 IM 渠道需要，Web 前端原生支持 Markdown + Mermaid） */
-function buildChannelGuidelines(channel: string): string {
-  switch (channel) {
-    case 'feishu':
-      return [
-        '## 飞书消息格式',
-        '',
-        '当前消息来自飞书。飞书卡片支持的 Markdown：**加粗**、_斜体_、`行内代码`、代码块、标题、列表、链接。',
-        '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown + Mermaid 图表渲染，因此**不要因为来源是飞书就限制输出格式**。',
-        '可使用 `send_image` 和 `send_file` 工具直接发送文件到飞书。',
-      ].join('\n');
-    case 'telegram':
-      return [
-        '## Telegram 消息格式',
-        '',
-        '当前消息来自 Telegram。Markdown 自动转换为 Telegram HTML，长消息自动分片（3800 字符）。',
-        '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown + Mermaid 图表渲染，因此**不要因为来源是 Telegram 就限制输出格式**。',
-        '可使用 `send_image` 和 `send_file` 工具直接发送文件到 Telegram。',
-      ].join('\n');
-    case 'qq':
-      return [
-        '## QQ 消息格式',
-        '',
-        '当前消息来自 QQ。Markdown 自动转换为纯文本，长消息自动分片（5000 字符）。',
-        '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown + Mermaid 图表渲染，因此**不要因为来源是 QQ 就限制输出格式**。',
-      ].join('\n');
-    default:
-      return '';
+const SECURITY_RULES = loadPrompt('security-rules.md');
+const INTERACTION_GUIDELINES = loadPrompt('interaction.md');
+const SKILL_ROUTING_GUIDELINES = loadPrompt('skill-routing.md');
+const OUTPUT_GUIDELINES = loadPrompt('output.md');
+const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
+const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
+const CONVERSATION_AGENT_GUIDELINES = loadPrompt('agent-override.md');
+const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
+const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
+
+const GUIDELINES_BLOCK = `<guidelines>\n${OUTPUT_GUIDELINES}\n${WEB_FETCH_GUIDELINES}\n${BACKGROUND_TASK_GUIDELINES}\n</guidelines>`;
+const CONVERSATION_AGENT_BLOCK = `<agent-override>\n${CONVERSATION_AGENT_GUIDELINES}\n</agent-override>`;
+
+interface PromptPiece {
+  name: string;
+  text: string;
+}
+
+interface SdkContextUsage {
+  memoryFiles?: Array<{ path: string; type?: string; tokens?: number }>;
+  skills?: {
+    includedSkills: number;
+    totalSkills: number;
+    tokens: number;
+    skillFrontmatter?: Array<{ name: string; source: string; tokens: number }>;
+  };
+  systemPromptSections?: Array<{ name: string; tokens: number }>;
+  totalTokens: number;
+  maxTokens: number;
+  percentage: number;
+}
+
+function byteLength(text: string): number {
+  return Buffer.byteLength(text, 'utf-8');
+}
+
+function buildPromptAudit(pieces: PromptPiece[]): ClaudeContextAudit['happyclawPrompt'] {
+  const files = pieces.map((piece) => ({
+    name: piece.name,
+    bytes: byteLength(piece.text),
+  }));
+  return {
+    files,
+    totalBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+  };
+}
+
+function buildSecurityRulesPrompt(disableMemoryLayer: boolean): string {
+  if (!disableMemoryLayer) return SECURITY_RULES;
+  return SECURITY_RULES.replace(
+    /\n### 黄线操作[\s\S]*?(?=\n### Skill \/ MCP 安装审查)/,
+    '',
+  );
+}
+
+function runtimeContextAuditBase(containerInput: ContainerInput): ClaudeContextAudit {
+  return {
+    executionMode: containerInput.contextAudit?.executionMode ?? 'container',
+    cwd: WORKSPACE_GROUP,
+    claudeConfigDir: process.env.CLAUDE_CONFIG_DIR,
+    externalClaudeDir: containerInput.contextAudit?.externalClaudeDir,
+    claudeMd: containerInput.contextAudit?.claudeMd ?? { status: 'unknown' },
+    rules: containerInput.contextAudit?.rules ?? { status: 'unknown', fileCount: 0 },
+    skills: containerInput.contextAudit?.skills ?? { sources: [] },
+    happyclawPrompt: containerInput.contextAudit?.happyclawPrompt ?? { totalBytes: 0, files: [] },
+    warnings: [...(containerInput.contextAudit?.warnings ?? [])],
+  };
+}
+
+function classifySkillSource(source: string): ClaudeContextAudit['skills']['sources'][number]['name'] {
+  if (source.includes('/opt/builtin-skills')) return 'builtin';
+  if (source.includes('/external-skills') || source.includes('/.claude/skills')) return 'external';
+  if (source.includes('/project-skills') || source.includes('/container/skills')) return 'project';
+  if (source.includes('/user-skills') || source.includes('/data/skills/')) return 'user';
+  if (source.includes('/plugins/')) return 'plugin';
+  return 'unknown';
+}
+
+function pathMatches(candidate: string, expected?: string): boolean {
+  if (!expected) return false;
+  return candidate === expected || candidate.endsWith(expected) || expected.endsWith(candidate);
+}
+
+function enrichContextAudit(
+  baseAudit: ClaudeContextAudit,
+  promptAudit: ClaudeContextAudit['happyclawPrompt'],
+  ctxUsage?: SdkContextUsage,
+): ClaudeContextAudit {
+  const audit: ClaudeContextAudit = {
+    ...baseAudit,
+    cwd: WORKSPACE_GROUP,
+    claudeConfigDir: process.env.CLAUDE_CONFIG_DIR,
+    happyclawPrompt: promptAudit,
+    warnings: [...baseAudit.warnings],
+    claudeMd: { ...baseAudit.claudeMd },
+    rules: { ...baseAudit.rules },
+    skills: {
+      ...baseAudit.skills,
+      sources: [...baseAudit.skills.sources],
+    },
+  };
+
+  if (!ctxUsage) {
+    audit.warnings.push('SDK context usage unavailable');
+    return audit;
   }
+
+  const memoryFiles = ctxUsage.memoryFiles ?? [];
+  const claudeMemory = memoryFiles.find((file) =>
+    pathMatches(file.path, audit.claudeMd.runtimePath)
+    || pathMatches(file.path, audit.claudeMd.sourcePath)
+  );
+  if (claudeMemory) {
+    audit.claudeMd.loaded = true;
+    audit.claudeMd.tokens = claudeMemory.tokens;
+  } else if (audit.claudeMd.status === 'linked' || audit.claudeMd.status === 'mounted') {
+    audit.claudeMd.loaded = false;
+    audit.warnings.push('CLAUDE.md not reported by SDK memoryFiles');
+  }
+
+  const loadedRuleFiles = memoryFiles
+    .filter((file) =>
+      pathMatches(file.path, audit.rules.runtimePath)
+      || pathMatches(file.path, audit.rules.sourcePath)
+      || file.path.includes('/rules/')
+    )
+    .map((file) => ({ path: file.path, tokens: file.tokens }));
+  audit.rules.loadedFiles = loadedRuleFiles;
+  audit.rules.loadedFileCount = loadedRuleFiles.length;
+  if (audit.rules.fileCount > 0 && loadedRuleFiles.length === 0) {
+    audit.warnings.push('rules not loaded by SDK');
+  }
+
+  if (ctxUsage.skills) {
+    audit.skills.totalSkills = ctxUsage.skills.totalSkills;
+    audit.skills.includedSkills = ctxUsage.skills.includedSkills;
+    audit.skills.tokens = ctxUsage.skills.tokens;
+    if (ctxUsage.skills.totalSkills > 150) audit.warnings.push('skills count > 150');
+    if (ctxUsage.skills.tokens > 15000) audit.warnings.push('skills tokens > 15000');
+
+    const tokensBySource = new Map<string, number>();
+    for (const skill of ctxUsage.skills.skillFrontmatter ?? []) {
+      const key = classifySkillSource(skill.source);
+      tokensBySource.set(key, (tokensBySource.get(key) ?? 0) + (skill.tokens ?? 0));
+    }
+    audit.skills.sources = audit.skills.sources.map((source) => ({
+      ...source,
+      tokens: tokensBySource.get(source.name) ?? source.tokens,
+    }));
+  }
+
+  return audit;
 }
+
+// 启动期扫描 prompts/channels/*.md，文件名（去 .md 后缀）= channel key（feishu / telegram / qq / dingtalk / ...）
+// 新增渠道时只需在 channels/ 下加一个 .md 文件，无需改代码。
+const CHANNEL_GUIDELINES: Record<string, string> = (() => {
+  const channelsDir = path.join(PROMPTS_DIR, 'channels');
+  const result: Record<string, string> = {};
+  if (!fs.existsSync(channelsDir)) return result;
+  for (const file of fs.readdirSync(channelsDir)) {
+    if (!file.endsWith('.md')) continue;
+    const channelKey = file.slice(0, -'.md'.length);
+    result[channelKey] = fs.readFileSync(path.join(channelsDir, file), 'utf-8').trimEnd();
+  }
+  return result;
+})();
 
 /**
  * 规范化图片 MIME：
@@ -253,14 +394,28 @@ class MessageStream {
   private done = false;
 
   push(text: string, images?: Array<{ data: string; mimeType?: string }>): string[] {
+    // stream.done=true 后禁止写入已关闭的 SDK transport，否则触发 "ProcessTransport is not ready for writing"
+    if (this.done) {
+      return ['Stream already ended, message will be processed in the next query'];
+    }
+
     const rejectedReasons: string[] = [];
+    const originalImageCount = images?.length ?? 0;
     let filteredImages = images;
 
-    // 过滤超限图片，在发送给 SDK 之前拦截
     if (filteredImages && filteredImages.length > 0) {
       const { valid, rejected } = filterOversizedImages(filteredImages);
       rejectedReasons.push(...rejected);
       filteredImages = valid.length > 0 ? valid : undefined;
+    }
+
+    // 全部图片被过滤 + text 为空时，替换为说明文本，避免 SDK 收到空 user message
+    // 进而让主模型回复"消息是空的"。典型触发：Web 用户直接粘贴长图（height > 8000px）无文字。
+    let effectiveText = text;
+    const allImagesDropped =
+      originalImageCount > 0 && (!filteredImages || filteredImages.length === 0);
+    if (allImagesDropped && !effectiveText.trim()) {
+      effectiveText = `[用户发送了 ${originalImageCount} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
     }
 
     let content:
@@ -270,7 +425,7 @@ class MessageStream {
     if (filteredImages && filteredImages.length > 0) {
       // 多模态消息：text + images
       content = [
-        { type: 'text', text },
+        { type: 'text', text: effectiveText },
         ...filteredImages.map((img) => ({
           type: 'image' as const,
           source: {
@@ -282,7 +437,7 @@ class MessageStream {
       ];
     } else {
       // 纯文本消息
-      content = text;
+      content = effectiveText;
     }
 
     this.queue.push({
@@ -293,6 +448,10 @@ class MessageStream {
     });
     this.waiting?.();
     return rejectedReasons;
+  }
+
+  get ended(): boolean {
+    return this.done;
   }
 
   end(): void {
@@ -427,14 +586,16 @@ function trimSessionJsonl(jsonlPath: string): void {
       if (lines[i].trim()) nonEmptyLines.push({ index: i, line: lines[i] });
     }
 
-    // Find the last compact_boundary entry
+    // Find the last compact_boundary entry (and any preserved segment it references)
     let lastBoundaryPos = -1;
+    let preservedHeadUuid: string | undefined;
     let parseSkipped = 0;
     for (let i = nonEmptyLines.length - 1; i >= 0; i--) {
       try {
         const entry = JSON.parse(nonEmptyLines[i].line);
         if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           lastBoundaryPos = i;
+          preservedHeadUuid = entry.compact_metadata?.preserved_segment?.head_uuid;
           break;
         }
       } catch {
@@ -451,9 +612,24 @@ function trimSessionJsonl(jsonlPath: string): void {
       return;
     }
 
-    // Keep entries from last compact_boundary onwards
-    const trimmedLines = nonEmptyLines.slice(lastBoundaryPos).map(e => e.line);
-    const removedCount = lastBoundaryPos;
+    // partial compaction 时 boundary 带 preserved_segment{head_uuid, anchor_uuid, tail_uuid}：
+    // 保留段内容是 head_uuid..tail_uuid，SDK 的 resume loader 会在 anchor_uuid 处把它拼回。
+    // 若裁切越过 head_uuid，会连同这些消息及其 uuid 一起删掉，导致 loader 找不到锚点、resume
+    // 丢上下文。因此把裁切起点回退到 head_uuid 所在行，保住整段保留消息。
+    let trimStartPos = lastBoundaryPos;
+    if (preservedHeadUuid) {
+      const preservedPos = nonEmptyLines.findIndex((e) => {
+        try { return JSON.parse(e.line).uuid === preservedHeadUuid; } catch { return false; }
+      });
+      if (preservedPos >= 0 && preservedPos < trimStartPos) {
+        trimStartPos = preservedPos;
+        log(`Session trim: preserving segment from head_uuid=${preservedHeadUuid.slice(0, 8)} (pos ${preservedPos} < boundary ${lastBoundaryPos})`);
+      }
+    }
+
+    // Keep entries from trimStartPos onwards
+    const trimmedLines = nonEmptyLines.slice(trimStartPos).map(e => e.line);
+    const removedCount = trimStartPos;
 
     const TRIM_MIN_ENTRIES = 50; // Skip trimming if fewer entries before boundary (not worth the I/O)
     if (removedCount < TRIM_MIN_ENTRIES) {
@@ -484,6 +660,7 @@ function trimSessionJsonl(jsonlPath: string): void {
 function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
+  disableMemoryLayer: boolean,
   deps: { emit: (output: ContainerOutput) => void; getFullText: () => string; resetFullText: () => void },
 ): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -554,7 +731,8 @@ function createPreCompactHook(
     hadCompaction = true;
 
     // Flag memory flush for home containers (full memory write access)
-    if (isHome) {
+    // Skip in native Claude mode — user's ~/.claude/ Playbook handles memory persistence
+    if (isHome && !disableMemoryLayer) {
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
     }
@@ -563,30 +741,24 @@ function createPreCompactHook(
   };
 }
 
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
-  }
-
-  return messages;
+/**
+ * Wrapper around the pure extractSessionHistory implementation in
+ * session-history.ts. Resolves the SDK transcript directory using the
+ * runtime CLAUDE_CONFIG_DIR + WORKSPACE_GROUP layout, then delegates.
+ */
+function extractSessionHistory(oldSessionId: string): string | null {
+  const configDir =
+    process.env.CLAUDE_CONFIG_DIR ||
+    path.join(process.env.HOME || '/home/node', '.claude');
+  // SDK stores transcripts at: <configDir>/projects/<encoded-cwd>/<sessionId>.jsonl
+  // where encoded-cwd replaces '/' with '-'
+  const encodedCwd = WORKSPACE_GROUP.replace(/\//g, '-');
+  const transcriptDir = path.join(configDir, 'projects', encodedCwd);
+  return extractSessionHistoryImpl({
+    transcriptDir,
+    sessionId: oldSessionId,
+    log,
+  });
 }
 
 function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
@@ -700,7 +872,12 @@ function shouldDrain(): boolean {
  * Returns messages found (with optional images), or empty array.
  */
 interface IpcDrainResult {
-  messages: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }>;
+  messages: Array<{
+    text: string;
+    images?: Array<{ data: string; mimeType?: string }>;
+    taskId?: string;
+    sourceJid?: string;
+  }>;
 }
 
 function drainIpcInput(): IpcDrainResult {
@@ -719,6 +896,8 @@ function drainIpcInput(): IpcDrainResult {
           result.messages.push({
             text: data.text,
             images: data.images,
+            taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
+            sourceJid: typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
           });
         }
       } catch (err) {
@@ -790,7 +969,7 @@ function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages (with optional images), or null if _close.
  */
-function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }> } | null> {
+function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string } | null> {
   return new Promise((resolve) => {
     let resolved = false;
     const tryDrain = () => {
@@ -821,9 +1000,26 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
       if (messages.length > 0) {
         const combinedText = messages.map((m) => m.text).join('\n');
         const allImages = messages.flatMap((m) => m.images || []);
+        // If any drained message carries a taskId, attribute the combined turn
+        // to it (take the last one — later messages supersede earlier in a batch).
+        let combinedTaskId: string | undefined;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].taskId) { combinedTaskId = messages[i].taskId; break; }
+        }
+        // Same convention for sourceJid: per-channel MCP tools should see the
+        // chat the most recent message arrived from.
+        let combinedSourceJid: string | undefined;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].sourceJid) { combinedSourceJid = messages[i].sourceJid; break; }
+        }
         resolved = true;
         ipcWatcher?.close();
-        resolve({ text: combinedText, images: allImages.length > 0 ? allImages : undefined });
+        resolve({
+          text: combinedText,
+          images: allImages.length > 0 ? allImages : undefined,
+          taskId: combinedTaskId,
+          sourceJid: combinedSourceJid,
+        });
         return;
       }
     };
@@ -834,75 +1030,25 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   });
 }
 
-function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string {
-  if (isHome) {
-    // Home container (admin or member): full memory system with read/write access to user's global CLAUDE.md
-    return [
-      '',
-      '## 记忆系统',
-      '',
-      '你拥有跨会话的持久记忆能力，请积极使用。',
-      '',
-      '### 回忆',
-      '在回答关于过去的工作、决策、日期、偏好或待办事项之前：',
-      '先用 `memory_search` 搜索，再用 `memory_get` 获取完整上下文。',
-      '',
-      '### 存储——两层记忆架构',
-      '',
-      '获知重要信息后**必须立即保存**，不要等到上下文压缩。',
-      '根据信息的**时效性**选择存储位置：',
-      '',
-      '#### 全局记忆（永久）→ 直接编辑 `/workspace/global/CLAUDE.md`',
-      '',
-      '**优先使用全局记忆。** 适用于所有**跨会话仍然有用**的信息：',
-      '- 用户身份：姓名、生日、联系方式、地址、工作单位',
-      '- 长期偏好：沟通风格、称呼方式、喜好厌恶、技术栈偏好',
-      '- 身份配置：你的名字、角色设定、行为准则',
-      '- 常用项目与上下文：反复提到的仓库、服务、架构信息',
-      '- 用户明确要求「记住」的任何内容',
-      '',
-      '使用 `Read` 工具读取当前内容，再用 `Edit` 工具**原地更新对应字段**。',
-      '文件中标记「待记录」的字段发现信息后**必须立即填写**。',
-      '不要追加重复信息，保持文件简洁有序。',
-      '',
-      '#### 日期记忆（时效性）→ 调用 `memory_append`',
-      '',
-      '适用于**过一段时间会过时**的信息：',
-      '- 项目进展：今天做了什么、决定了什么、遇到了什么问题',
-      '- 临时技术决策：选型理由、架构方案、变更记录',
-      '- 待办与承诺：约定事项、截止日期、后续跟进',
-      '- 会议/讨论要点：关键结论、行动项',
-      '',
-      '`memory_append` 自动保存到独立的记忆目录（不在工作区内）。',
-      '',
-      '#### 判断标准',
-      '> **默认优先全局记忆。** 问自己：这条信息下次对话还可能用到吗？',
-      '> - 是 / 可能 → **全局记忆**（编辑 `/workspace/global/CLAUDE.md`）',
-      '> - 明确只跟今天有关 → 日期记忆（`memory_append`）',
-      '> - 用户说「记住这个」→ **一定写全局记忆**',
-      '',
-      '系统也会在上下文压缩前提示你保存记忆。',
-    ].join('\n');
-  }
-  // Non-home group container: read-only access to home memory, use Claude auto memory
-  return [
-    '',
-    '## 记忆',
-    '',
-    '### 查询主工作区记忆',
-    '可使用 `memory_search` 和 `memory_get` 工具搜索主工作区的记忆（全局记忆和日期记忆）。',
-    '需要回忆过去的决策、偏好或项目上下文时使用这些工具。',
-    '',
-    '### 本地记忆',
-    '重要信息直接记录在当前工作区的 CLAUDE.md 或其他文件中。',
-    'Claude 会自动维护你的会话记忆，无需额外操作。',
-    '',
-    '全局记忆（`/workspace/global/CLAUDE.md`）为只读参考。',
-  ].join('\n');
+function buildMemoryRecallPrompt(isHome: boolean, disableMemoryLayer: boolean): string {
+  // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
+  if (disableMemoryLayer) return '';
+  return isHome ? MEMORY_SYSTEM_HOME : MEMORY_SYSTEM_GUEST;
 }
 
-/** 从 settings.json 读取用户配置的 MCP servers（stdio/http/sse 类型） */
+/** 读取用户配置的 MCP servers（stdio/http/sse 类型） */
 function loadUserMcpServers(): Record<string, unknown> {
+  // 禁用记忆层模式下 CLAUDE_CONFIG_DIR 指向 ~/.claude/，HappyClaw 管理的 per-user MCP
+  // 不在那份 settings.json 里，container-runner 通过 env 透传。优先读 env。
+  const envJson = process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
+  if (envJson) {
+    try {
+      const parsed = JSON.parse(envJson);
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch { /* fall through to settings.json */ }
+  }
   const configDir = process.env.CLAUDE_CONFIG_DIR
     || path.join(process.env.HOME || '/home/node', '.claude');
   const settingsFile = path.join(configDir, 'settings.json');
@@ -915,6 +1061,22 @@ function loadUserMcpServers(): Record<string, unknown> {
     }
   } catch { /* ignore parse errors */ }
   return {};
+}
+
+function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined): void {
+  const configDir = process.env.CLAUDE_CONFIG_DIR
+    || path.join(process.env.HOME || '/home/node', '.claude');
+  const result = pruneProcessedHistoryImagesInTranscriptFile({
+    claudeConfigDir: configDir,
+    sessionId,
+    getImageDimensions,
+  });
+  if (result.didMutate) {
+    log(
+      `History image prune: removed ${result.prunedImages} image block(s)` +
+      `${result.transcriptPath ? ` from ${result.transcriptPath}` : ''}`,
+    );
+  }
 }
 
 /**
@@ -935,8 +1097,13 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> }> {
   const stream = new MessageStream();
+  // Track messages piped into this query.  When the query is interrupted,
+  // these messages would otherwise be lost (consumed by the aborted query).
+  // The main loop uses them as the next prompt so the user's queued intent
+  // continues after the cancelled turn (#421, Claude Code-style queuing).
+  const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> = [];
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let canonicalAssistantText: string | undefined;
@@ -984,6 +1151,25 @@ async function runQuery(
   let queryRef: { interrupt(): Promise<void> } | null = null;
   let messageCount = 0;
   let resultCount = 0;
+  let postResultInterruptRequested = false;
+  // SDK transport is not ready until system/init is received. Piping user messages
+  // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
+  let sdkTransportReady = false;
+
+  // 收尾阶段中止挂起的工具调用：当 stream 准备关闭（_close/_drain/post-result-timeout）时，
+  // SDK 可能仍卡在最终回复之后的某个工具调用上，光 stream.end() 不会让它退出。
+  // 这里主动 query.interrupt() 中止那个卡住的工具调用，让 for-await 自然结束、runner 回到
+  // waitForIpcMessage() 保持 warm——不杀整个 runner。interrupt 引发的 SDK 错误由 catch 分支
+  // 通过 postResultInterruptRequested 归类为 non-fatal（不退避、不上报为失败）。
+  const interruptQueryForShutdown = (reason: string) => {
+    if (!queryRef) return;
+    if (postResultInterruptRequested) return;
+    postResultInterruptRequested = true;
+    log(`${reason}, interrupting current query before closing stream`);
+    queryRef
+      .interrupt()
+      .catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
+  };
 
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
@@ -991,6 +1177,7 @@ async function runQuery(
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
+      interruptQueryForShutdown('Close sentinel detected during query');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1016,6 +1203,7 @@ async function runQuery(
     if (resultCount > 0 && shouldDrain()) {
       log('Drain sentinel detected after query result, ending stream');
       closedDuringQuery = true;
+      interruptQueryForShutdown('Drain sentinel detected after query result');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1027,6 +1215,7 @@ async function runQuery(
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
+      interruptQueryForShutdown('Post-result timeout');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1040,9 +1229,28 @@ async function runQuery(
       return; // No setTimeout needed — watcher will trigger next check on file change
     }
 
+    // 预防性 invariant：当前所有 stream.end() 路径（sentinel handlers / interrupt-before-query
+    // / immediate-interrupt）都在同一同步 tick 把 ipcPolling=false，理论上 !ipcPolling 早退
+    // 已覆盖 stream.ended=true 的情况；此守护保留作为未来重构时的 invariant 断言，
+    // 避免后续改动引入"流已关闭但 polling 未停"的竞态窗口（消息会被 drain 后又被 stream.push 拒绝丢失）。
+    if (stream.ended) {
+      log('Stream already ended, skipping IPC drain (messages will be picked up by waitForIpcMessage)');
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
+
+    // Don't pipe user messages before system/init — the SDK ProcessTransport is not
+    // ready yet and streamInput() will throw "ProcessTransport is not ready for writing".
+    // IPC files remain on disk; we'll drain them once sdkTransportReady is set.
+    if (!sdkTransportReady) {
+      return;
+    }
+
     const { messages } = drainIpcInput();
     for (const msg of messages) {
       log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
+      pipedMessagesDuringQuery.push(msg);
       const rejected = stream.push(msg.text, msg.images);
       for (const reason of rejected) {
         emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
@@ -1060,190 +1268,156 @@ async function runQuery(
 
   const processor = new StreamEventProcessor(emit, log);
 
-  // Build system prompt: memory recall guidance + global CLAUDE.md (for non-admin-home)
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
-  const globalClaudeMdPath = path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
-
-  // Home containers: inject full global CLAUDE.md for immediate context.
-  // Non-home containers: global CLAUDE.md is accessible via filesystem (mounted readonly)
-  // but NOT injected into system prompt to avoid context pollution that causes
-  // the agent to "continue" unrelated previous work.
-  let globalClaudeMd = '';
-  if (isHome && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-    globalClaudeMd = truncateWithHeadTail(globalClaudeMd, GLOBAL_CLAUDE_MD_MAX_CHARS);
-  }
-  const outputGuidelines = [
-    '',
-    '## 输出格式',
-    '',
-    '### 图片引用',
-    '当你生成了图片文件并需要在回复中展示时，使用 Markdown 图片语法引用**相对路径**（相对于当前工作目录）：',
-    '`![描述](filename.png)`',
-    '',
-    '**禁止使用绝对路径**（如 `/workspace/group/filename.png`）。Web 界面会自动将相对路径解析为正确的文件下载地址。',
-    '',
-    '### 技术图表',
-    '需要输出技术图表（流程图、时序图、架构图、ER 图、类图、状态图、甘特图等）时，**使用 Mermaid 语法**，用 ```mermaid 代码块包裹。',
-    'Web 界面会自动将 Mermaid 代码渲染为可视化图表。',
-  ].join('\n');
-
-  const webFetchGuidelines = [
-    '',
-    '## 网页访问策略',
-    '',
-    '访问外部网页时优先使用 WebFetch（速度快）。',
-    '如果 WebFetch 失败（403、被拦截、内容为空或需要 JavaScript 渲染），',
-    '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
-  ].join('\n');
-
-  // Read HEARTBEAT.md (recent work summary) — only for home containers.
-  // Non-home containers are task-isolated and should not see unrelated work history,
-  // which can mislead the agent into "continuing" previous tasks instead of
-  // focusing on the user's current message.
-  let heartbeatContent = '';
-  if (isHome) {
-    const heartbeatPath = path.join(WORKSPACE_GLOBAL, 'HEARTBEAT.md');
-    if (fs.existsSync(heartbeatPath)) {
-      try {
-        const raw = fs.readFileSync(heartbeatPath, 'utf-8');
-        const truncated = raw.length > 2048 ? raw.slice(0, 2048) + '\n\n[...截断]' : raw;
-        heartbeatContent = [
-          '',
-          '## 近期工作参考（仅供背景了解）',
-          '',
-          '> 以下是系统自动生成的近期工作摘要，仅供参考。',
-          '> **不要主动继续这些工作**，除非用户明确要求「继续」或主动提到相关话题。',
-          '> 请专注于用户当前的消息。',
-          '',
-          truncated,
-        ].join('\n');
-      } catch { /* skip */ }
-    }
-  }
-
-  const backgroundTaskGuidelines = [
-    '',
-    '## 后台任务',
-    '',
-    '当用户要求执行耗时较长的批量任务（如批量文件处理、大规模数据操作等），',
-    '你应该使用 Task 工具并设置 `run_in_background: true`，让任务在后台运行。',
-    '这样用户无需等待，可以继续与你交流其他事项。',
-    '任务结束时你会自动收到通知，届时在对话中向用户汇报即可。',
-    '告知用户：「已为您在后台启动该任务，完成后我会第一时间反馈。现在有其他问题也可以随时问我。」',
-    '',
-    '### 任务通知处理（重要）',
-    '',
-    '当你收到多条后台任务的完成或失败通知时：',
-    '- **禁止逐条回复**。不要对每条通知都调用 `send_message`，这会导致 IM 群刷屏。',
-    '- **等待所有通知到齐后，汇总为一条消息回复用户**，例如：「N 个任务完成，M 个失败，失败原因：...」',
-    '- 对于已知的无害失败（如浏览器进程被回收、临时资源超时），**不需要通知用户**，静默忽略即可。',
-  ].join('\n');
-
-  // Interaction guidelines to prevent the agent from confusing MCP tool
-  // descriptions with user input, or proactively describing available tools.
-  const interactionGuidelines = [
-    '',
-    '## 交互原则',
-    '',
-    '**始终专注于用户当前的实际消息。**',
-    '',
-    '- 你可能拥有多种 MCP 工具（如外卖点餐、优惠券查询等），这些是你的辅助能力，**不是用户发送的内容**。',
-    '- **不要主动介绍、列举或描述你的可用工具**，除非用户明确询问「你能做什么」或「你有什么功能」。',
-    '- 当用户需要某个功能时，直接使用对应工具完成任务即可，无需事先解释工具的存在。',
-    '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
-  ].join('\n');
-
-  // Conversation agents (sub-conversations with agentId) get special behavioral guidelines
-  // to prevent excessive send_message usage and duplicate responses.
-  const conversationAgentGuidelines = containerInput.agentId ? [
-    '',
-    '## 子会话行为规则（最高优先级，覆盖其他冲突指令）',
-    '',
-    '你正在一个**子会话**中运行，不是主会话。以下规则覆盖全局记忆中的"响应行为准则"：',
-    '',
-    '1. **不要用 `send_message` 发送"收到"之类的确认消息** — 你的正常文本输出就是回复，不需要额外发消息',
-    '2. **每次回复只产生一条消息** — 把分析、结论、建议整合到一条回复中，不要拆成多条',
-    '3. **只在以下情况使用 `send_message`**：',
-    '   - 执行超过 2 分钟的长任务时，发送一次进度更新（不是确认收到）',
-    '   - 用户明确要求你"先回复一下"时',
-    '4. **你的正常文本输出会自动发送给用户**，不需要通过 `send_message` 转发',
-    '5. **回复语言使用简体中文**，除非用户用其他语言提问',
-  ].join('\n') : '';
+  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
 
   const channel = getChannelFromJid(containerInput.chatJid);
-  const channelGuidelines = buildChannelGuidelines(channel);
+  const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
+  const memoryPromptName = !disableMemoryLayer
+    ? isHome
+      ? 'memory-system.home.md'
+      : 'memory-system.guest.md'
+    : null;
 
-  const systemPromptAppend = [
-    // L1: Identity — 用户身份与偏好（仅主容器注入）
-    globalClaudeMd && `<user-profile>\n${globalClaudeMd}\n</user-profile>`,
+  const promptPieces: PromptPiece[] = [
+    { name: 'interaction.md', text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>` },
+    { name: 'skill-routing.md', text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>` },
+    { name: 'security-rules.md', text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>` },
+    ...(memoryRecall && memoryPromptName
+      ? [{ name: memoryPromptName, text: `<memory-system>\n${memoryRecall}\n</memory-system>` }]
+      : []),
+    { name: 'guidelines', text: GUIDELINES_BLOCK },
+    ...(channelGuidelines
+      ? [{ name: `channels/${channel}.md`, text: `<channel-format>\n${channelGuidelines}\n</channel-format>` }]
+      : []),
+    ...(containerInput.agentId
+      ? [{ name: 'agent-override.md', text: CONVERSATION_AGENT_BLOCK }]
+      : []),
+  ];
+  const systemPromptAppend = promptPieces.map((piece) => piece.text).join('\n');
+  const promptAudit = buildPromptAudit(promptPieces);
+  const contextAuditBase = runtimeContextAuditBase(containerInput);
 
-    // L2: Behavior — 核心行为约束（始终注入所有容器）
-    `<behavior>\n${interactionGuidelines}\n</behavior>`,
-    `<security>\n${SECURITY_RULES}\n</security>`,
-
-    // L3: Context — 记忆系统与工作背景
-    `<memory-system>\n${memoryRecall}\n</memory-system>`,
-    heartbeatContent && `<recent-work>\n${heartbeatContent}\n</recent-work>`,
-
-    // L4: Reference — 输出格式与工具使用指南
-    `<output-format>\n${outputGuidelines}\n</output-format>`,
-    `<web-access>\n${webFetchGuidelines}\n</web-access>`,
-    `<background-tasks>\n${backgroundTaskGuidelines}\n</background-tasks>`,
-    channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
-
-    // Override: Sub-Agent 行为覆盖
-    conversationAgentGuidelines && `<agent-override>\n${conversationAgentGuidelines}\n</agent-override>`,
-  ].filter(Boolean).join('\n');
+  // 调试观察：HAPPYCLAW_DUMP_PROMPT=true 时把最终 system prompt 输出到 stderr
+  // host 已通过 logs/ 捕获 stderr，方便对比改 prompts/*.md 前后的差异
+  if (process.env.HAPPYCLAW_DUMP_PROMPT === 'true') {
+    log(`PROMPT DUMP (${systemPromptAppend.length} chars):\n${systemPromptAppend}\n--- END PROMPT DUMP ---`);
+  }
 
   // Home containers (admin & member) can access global and memory directories.
   // Non-home containers only access memory directory; global CLAUDE.md is NOT
   // injected into systemPrompt but remains accessible via filesystem (readonly mount).
-  const extraDirs = isHome
-    ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
-    : [WORKSPACE_MEMORY];
+  // 禁用记忆层时 WORKSPACE_GLOBAL/MEMORY 环境变量未设置，fallback 到 /workspace/xxx
+  // 容器路径在宿主机不存在，会让 SDK 报警告；此时直接给空数组。
+  const extraDirs = disableMemoryLayer
+    ? []
+    : isHome
+      ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
+      : [WORKSPACE_MEMORY];
 
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
     interruptedDuringQuery = true;
     suppressOutputAfterInterrupt = true;
     ipcPolling = false;
+    // 这条 early-return 在下方 try 块之前，不被 finally 覆盖，需就地关闭 watcher（close 幂等）。
+    ipcQueryWatcher.close();
     stream.end();
-    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+  }
+
+  // SystemSettings.autoCompactWindow（通过 AUTO_COMPACT_WINDOW 环境变量注入）
+  // 0 = SDK 默认（约 1M）；>0 = 通过 settings flag-layer 提前触发对话压缩
+  const autoCompactWindow = parseInt(process.env.AUTO_COMPACT_WINDOW ?? '0', 10);
+  const flagSettings: Record<string, unknown> = {};
+  if (Number.isFinite(autoCompactWindow) && autoCompactWindow > 0) {
+    flagSettings.autoCompactWindow = autoCompactWindow;
+  }
+
+  // Resolve the actual claude CLI path using `which`.
+  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-linux-x64 等）在 npm 上是空包，
+  // 无法通过 node_modules/.bin/ 找到 working binary。通过 which 找到实际路径后传给 SDK。
+  let pathToClaudeCodeExecutable: string | undefined;
+  try {
+    const resolvedPath = execFileSync('which', ['claude'], { timeout: 5_000, encoding: 'utf-8' }).trim();
+    if (resolvedPath) {
+      pathToClaudeCodeExecutable = resolvedPath;
+    }
+  } catch {
+    // Fallback: try to find it in common locations
+    const commonPaths = [
+      '/usr/local/bin/claude',
+      '/usr/bin/claude',
+      path.join(process.env.HOME || '/root', '.local/bin/claude'),
+      // 容器内 agent-runner 的本地依赖（package.json 声明了 @anthropic-ai/claude-code）
+      '/app/node_modules/.bin/claude',
+    ];
+    for (const p of commonPaths) {
+      if (fs.existsSync(p)) {
+        pathToClaudeCodeExecutable = p;
+        break;
+      }
+    }
+  }
+
+  // Claude Code plugins injected by HappyClaw main process via ContainerInput.
+  // SDK converts this array to `--plugin-dir <path>` args for the spawned
+  // claude CLI, which loads each plugin's commands/agents/hooks/skills/mcp.
+  // Paths are already runtime-translated upstream (container-internal for
+  // Docker, host absolute for host mode).
+  const userPlugins =
+    containerInput.plugins && containerInput.plugins.length > 0
+      ? containerInput.plugins
+      : undefined;
+  if (userPlugins) {
+    log(`Loading ${userPlugins.length} plugin(s): ${userPlugins.map((p) => p.path).join(', ')}`);
   }
 
   try {
     const q = query({
-    prompt: stream,
-    options: {
-      model: CLAUDE_MODEL,
-      cwd: WORKSPACE_GROUP,
-      additionalDirectories: extraDirs,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
-      allowedTools,
-      ...(disallowedTools && { disallowedTools }),
-      thinking: { type: 'adaptive' as const },
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      agentProgressSummaries: true,
-      settingSources: ['project', 'user'],
-      includePartialMessages: true,
-      mcpServers: {
-        ...loadUserMcpServers(),     // 用户配置的 MCP（stdio/http/sse），SDK 原生支持
-        happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, {
-          emit,
-          getFullText: () => processor.getFullText(),
-          resetFullText: () => processor.resetFullTextAccumulator(),
-        })] }]
-      },
-      agents: PREDEFINED_AGENTS,
-    }
-  });
+      prompt: stream,
+      options: {
+        ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
+        model: CLAUDE_MODEL,
+        cwd: WORKSPACE_GROUP,
+        additionalDirectories: extraDirs,
+        resume: sessionId,
+        ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
+        systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
+        allowedTools,
+        ...(disallowedTools && { disallowedTools }),
+        thinking: { type: 'adaptive' as const, display: 'summarized' as const },
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        agentProgressSummaries: true,
+        settingSources: ['project', 'user'],
+        // 启用全部已发现的技能到主会话。SDK 0.3.x 起 skills 是"打开技能的唯一正确位置"
+        // （用了它就无需再往 allowedTools 塞已废弃的 'Skill'）。'all' = 启用所有发现的技能，
+        // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
+        skills: 'all',
+        includePartialMessages: true,
+        // Forward sub-agent (Task) text/thinking as stream events so the card's
+        // sub-agent transcript lights up live instead of only filling in when the
+        // Task completes. The stream-processor already renders these
+        // (agentScope:'subagent' deltas, stream-processor.ts ~979); this flag is
+        // what actually makes the SDK emit them.
+        forwardSubagentText: true,
+        ...(Object.keys(flagSettings).length > 0 ? { settings: flagSettings as any } : {}),
+        ...(userPlugins && { plugins: userPlugins }),
+        mcpServers: {
+          ...loadUserMcpServers(),     // 用户配置的 MCP（stdio/http/sse），SDK 原生支持
+          happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
+        },
+        hooks: {
+          PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
+            emit,
+            getFullText: () => processor.getFullText(),
+            resetFullText: () => processor.resetFullTextAccumulator(),
+          })] }]
+        },
+        agents: PREDEFINED_AGENTS,
+      }
+    });
     queryRef = q;
     if (shouldInterrupt()) {
       log('Interrupt sentinel already present when query started, interrupting immediately');
@@ -1310,6 +1484,10 @@ async function runQuery(
       }
     }
 
+    if (processor.processMiscMessage(message as any)) {
+      continue;
+    }
+
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     const msgParentToolUseId = (message as any).parent_tool_use_id ?? null;
@@ -1337,7 +1515,15 @@ async function runQuery(
     }
 
     // ── 子 Agent 消息转 StreamEvent ──
-    processor.processSubAgentMessage(message as any);
+    if (processor.processSubAgentMessage(message as any)) {
+      continue;
+    }
+
+    // ── Main-agent tool results → tool_result stream events ──
+    // (sub-agent results are handled inside processSubAgentMessage above)
+    if (message.type === 'user') {
+      processor.processMainToolResults(message as any);
+    }
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
@@ -1351,7 +1537,13 @@ async function runQuery(
               .join('')
           : '';
         if (topLevelText) {
-          canonicalAssistantText = topLevelText;
+          // Accumulate rather than overwrite. The SDK splits assistant output
+          // into multiple messages around each tool_use call (text → tool_use →
+          // text → tool_use → text...), so taking only the last message's text
+          // drops everything emitted before the first tool call. The canonical
+          // text must be the concatenation of all top-level text content blocks
+          // in this turn.
+          canonicalAssistantText = (canonicalAssistantText || '') + topLevelText;
           canonicalAssistantUuid = assistantMsg.uuid as string;
         }
       }
@@ -1361,11 +1553,48 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
-    }
+      // Mark transport ready and drain any IPC messages that arrived before init.
+      sdkTransportReady = true;
+      pollIpcDuringQuery();
 
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as unknown as { task_id: string; tool_use_id?: string; status: string; summary: string };
-      processor.processTaskNotification(tn);
+      // Log skills and context usage for observability.
+      // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
+      // error logs on older SDK versions where the method is absent.
+      const getCtxUsage = (q as unknown as { getContextUsage?: () => Promise<SdkContextUsage> }).getContextUsage;
+      let contextUsage: SdkContextUsage | undefined;
+      if (typeof getCtxUsage === 'function') {
+        try {
+          contextUsage = await getCtxUsage.call(q);
+          if (contextUsage.skills) {
+            log(`Skills: ${contextUsage.skills.includedSkills}/${contextUsage.skills.totalSkills} loaded, ${contextUsage.skills.tokens} tokens`);
+          }
+          log(`Context: ${contextUsage.totalTokens}/${contextUsage.maxTokens} tokens (${contextUsage.percentage.toFixed(1)}%)`);
+        } catch (ctxErr) {
+          log(`[debug] getContextUsage failed: ${ctxErr instanceof Error ? ctxErr.message : String(ctxErr)}`);
+        }
+      }
+      const contextAudit = enrichContextAudit(contextAuditBase, promptAudit, contextUsage);
+      // 1M 上下文缩水告警：默认 opus[1m] 期望约 1M 上下文窗口，若 SDK / 模型资格判定
+      // 静默退回（例如 200K），在此立即暴露而非等到溢出。push 进 warnings 会让下方
+      // emit 的 displayLevel 自动升为 'primary'，在前端醒目展示。
+      if (CLAUDE_MODEL.includes('[1m]') && contextUsage && contextUsage.maxTokens > 0 && contextUsage.maxTokens < 900_000) {
+        contextAudit.warnings.push(
+          `上下文窗口仅 ${Math.round(contextUsage.maxTokens / 1000)}K tokens（预期约 1M），1M 上下文可能未生效`,
+        );
+        log(`[WARN] 1M context not active: maxTokens=${contextUsage.maxTokens}`);
+      }
+      emit({
+        status: 'stream',
+        result: null,
+        streamEvent: {
+          eventType: 'context_audit',
+          agentScope: 'system',
+          displayLevel: contextAudit.warnings.length > 0 ? 'primary' : 'detail',
+          title: 'Agent Context',
+          summary: `${contextAudit.skills.includedSkills ?? contextAudit.skills.totalSkills ?? 0} skills · ${contextAudit.rules.fileCount} rules`,
+          contextAudit,
+        },
+      });
     }
 
     if (message.type === 'result') {
@@ -1383,7 +1612,7 @@ async function runQuery(
         // so the caller can retry with a fresh session instead of crashing.
         if (!newSessionId) {
           log(`Session resume failed (no init): ${resultSubtype}`);
-          return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true };
+          return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery, sessionResumeFailed: true };
         }
         const detail = textResult?.trim()
           ? textResult.trim()
@@ -1407,12 +1636,12 @@ async function runQuery(
           });
         }
         processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
+        return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
       }
       if (textResult && isUnrecoverableTranscriptError(textResult)) {
         log(`Unrecoverable transcript error in result: ${textResult.slice(0, 200)}`);
         processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery };
+        return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
       }
 
       const { effectiveResult } = processor.processResult(textResult);
@@ -1429,18 +1658,25 @@ async function runQuery(
       // another result is emitted within the same query (e.g. user sent
       // a follow-up via IPC mid-query), it won't overwrite this one (#214).
       containerInput.turnId = generateTurnId();
+      // 同步重置已累积的 assistant 文本缓冲：单次 query 内若产生第二条 result
+      // （mid-query follow-up），canonicalAssistantText 不应携带上一 turn 的文本，
+      // 否则第二条回复会重复前一 turn 的内容前缀（与 turnId 轮转对称）。
+      canonicalAssistantText = undefined;
+      canonicalAssistantUuid = undefined;
 
       // Emit usage stream event with token counts and cost
       const resultMsg = message as Record<string, unknown>;
       const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
       const sdkModelUsage = resultMsg.modelUsage as Record<string, Record<string, number>> | undefined;
       if (sdkUsage) {
-        const modelUsageSummary: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }> = {};
+        const modelUsageSummary: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }> = {};
         if (sdkModelUsage && Object.keys(sdkModelUsage).length > 0) {
           for (const [model, mu] of Object.entries(sdkModelUsage)) {
             modelUsageSummary[model] = {
               inputTokens: mu.inputTokens || 0,
               outputTokens: mu.outputTokens || 0,
+              cacheReadInputTokens: mu.cacheReadInputTokens || 0,
+              cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
               costUSD: mu.costUSD || 0,
             };
           }
@@ -1449,6 +1685,8 @@ async function runQuery(
           modelUsageSummary[CLAUDE_MODEL] = {
             inputTokens: sdkUsage.input_tokens || 0,
             outputTokens: sdkUsage.output_tokens || 0,
+            cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
+            cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
             costUSD: (resultMsg.total_cost_usd as number) || 0,
           };
         }
@@ -1479,16 +1717,12 @@ async function runQuery(
     }
   }
 
-  // Cleanup residual state
+  // Cleanup residual state（IPC watcher 统一由下方 finally 关闭）
   processor.cleanup();
 
-  ipcPolling = false;
-  ipcQueryWatcher.close();
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
   } catch (err) {
-    ipcPolling = false;
-    ipcQueryWatcher.close();
     const errorMessage = err instanceof Error ? err.message : String(err);
 
     // 检测上下文溢出错误
@@ -1506,19 +1740,36 @@ async function runQuery(
           finalizationReason: 'error',
         });
       }
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // 检测不可恢复的转录错误
     if (isUnrecoverableTranscriptError(errorMessage)) {
       log(`Unrecoverable transcript error: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+      // 收尾：catch 路径跳过了正常出口的 processor.cleanup()，残留 <200 字符的
+      // 缓冲尾巴（未达 flush 阈值、定时器未触发）会永久丢失，导致 interrupt_partial 缺尾。
+      // cleanup() 幂等安全（seenTextualResult 时丢尾避重复，否则 flushBuffers）。
+      processor.cleanup();
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+    }
+
+    // Shutdown 触发的 interrupt（_close/_drain/post-result-timeout）：interruptQueryForShutdown()
+    // 调用 query.interrupt() 中止挂起的工具调用，SDK 随后可能抛出 error_during_execution。
+    // 这与 _interrupt sentinel 是同一类"主动中止"，不是真正的执行失败——必须按 interrupted
+    // 同级处理为 non-fatal。否则在 result 尚未发射（resultCount===0，如 _close 在 query 刚起步就到）
+    // 时会落到下方 re-throw，被外层当 error 退避，把一次干净的 shutdown 误报成失败。
+    if (postResultInterruptRequested) {
+      log(`runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`);
+      // 同 interruptedDuringQuery：补 cleanup() 刷新残留缓冲尾巴，避免 shutdown
+      // 中断时未达阈值的最后一小段文本丢失。
+      processor.cleanup();
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // SDK 在 yield result 后可能再抛异常（如检测到 result text 含错误内容），
@@ -1530,7 +1781,7 @@ async function runQuery(
       if (err instanceof Error && err.stack) {
         log(`runQuery post-result error stack:\n${err.stack}`);
       }
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // 其他错误：记录完整堆栈后继续抛出
@@ -1540,6 +1791,13 @@ async function runQuery(
     }
     // 继续抛出
     throw err;
+  } finally {
+    // IPC watcher 清理：覆盖 try 块内的正常出口、catch 抛出，以及 try 内所有 early-return
+    // （resume 失败 / 上下文溢出 / 不可恢复 transcript 错误）。query 启动前的中断 early-return
+    // 在 try 之外，已就地 close()。finally 必然执行，避免长生命周期容器累积 FSWatcher + 后备
+    // 定时器，以及旧 watcher 抢先 drain 本应进入新 query 的 IPC 消息。
+    ipcPolling = false;
+    ipcQueryWatcher.close();
   }
 }
 
@@ -1583,17 +1841,30 @@ async function main(): Promise<void> {
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
+  // 禁用 HappyClaw 记忆层：不注册 memory MCP 工具，让 Agent 按用户本机 Playbook 行事
+  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
+
   // Create in-process SDK MCP server (replaces the stdio subprocess)
+  // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
+  // below so that createMcpTools() closures observe updates via ctx reference.
+  // See the per-turn updates at the bottom of the query loop.
+  //
+  // chatJid is initialized to the IM source of the message that triggered
+  // this run (when known) — falls back to the container's startup chatJid.
+  // This lets per-channel MCP tools (discord_*, etc.) see the actual incoming
+  // chat even when the home container is shared across channels.
   const mcpToolsConfig = {
-    chatJid: containerInput.chatJid,
+    chatJid: containerInput.currentSourceJid || containerInput.chatJid,
     groupFolder: containerInput.groupFolder,
     isHome,
     isAdminHome,
     isScheduledTask: containerInput.isScheduledTask || false,
+    currentTaskId: containerInput.messageTaskId ?? null,
     workspaceIpc: WORKSPACE_IPC,
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
+    disableMemoryLayer,
   };
   const buildMcpServerConfig = () => createSdkMcpServer({
     name: 'happyclaw',
@@ -1601,7 +1872,18 @@ async function main(): Promise<void> {
     tools: createMcpTools(mcpToolsConfig),
   });
   let mcpServerConfig = buildMcpServerConfig();
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
+
+  // 记忆刷新阶段的 disallowedTools：内置危险工具 + 除记忆工具外的全部已注册 MCP 工具。
+  // 从 createMcpTools() 的注册全集动态派生，确保新增工具自动纳入屏蔽，避免再次遗漏
+  // （send_image/send_file/install_skill/uninstall_skill/discord_* 等）。
+  const memoryFlushDisallowedTools = [
+    ...MEMORY_FLUSH_DISALLOWED_BUILTINS,
+    ...createMcpTools(mcpToolsConfig)
+      .map((t) => `mcp__happyclaw__${t.name}`)
+      .filter((n) => !MEMORY_FLUSH_KEEP_MCP.has(n)),
+  ];
+
+  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, disableMemoryLayer);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
@@ -1621,6 +1903,8 @@ async function main(): Promise<void> {
       '[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]',
       '',
       '重要：你正在定时任务模式下运行。你的最终输出不会自动发送给用户。你必须使用 mcp__happyclaw__send_message 工具来发送消息，否则用户将收不到任何内容。',
+      '',
+      '注意：只在完成任务后调用一次 send_message 发送最终结果，不要发送中间状态或重复消息。',
     ];
     const scheduledTaskPrefix = scheduledTaskPrefixLines.join('\n');
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
@@ -1633,6 +1917,23 @@ async function main(): Promise<void> {
     if (pendingImages.length > 0) {
       promptImages = [...(promptImages || []), ...pendingImages];
     }
+    // The latest drained message reflects the freshest incoming chat —
+    // override the startup chatJid so per-channel MCP tools see it correctly.
+    for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
+      const sj = pendingDrain.messages[i].sourceJid;
+      if (sj) { mcpToolsConfig.chatJid = sj; break; }
+    }
+    // Likewise carry the task identity. A group-mode scheduled task injected
+    // into this cold-start window (process registered, SDK transport not yet
+    // ready) arrives via IPC with a taskId; without propagating it here the
+    // first query's send_message would route as a non-task message and the task
+    // notify would be lost (#559, on the boot-drain path the piped-message
+    // taskId plumbing doesn't cover). Only override when a taskId is present so
+    // a plain message in the batch doesn't wipe the startup messageTaskId.
+    for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
+      const tid = pendingDrain.messages[i].taskId;
+      if (tid) { mcpToolsConfig.currentTaskId = tid; break; }
+    }
   }
 
   // Query loop: run query -> wait for IPC message -> run new query -> repeat
@@ -1641,13 +1942,29 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   let consecutiveCompactions = 0;
   const MAX_CONSECUTIVE_COMPACTIONS = 3;
+  // 暂存的会话历史上下文：当 auto-continue 阶段发生 sessionResumeFailed 时，
+  // 历史无法直接拼到 auto-continue prompt（因为 fall-through 等下一条 IPC 消息后才重启 query），
+  // 需要在下一轮主循环 query 之前消费它，避免新会话完全丢失上下文。
+  let pendingHistoryContext: string | null = null;
   try {
     while (true) {
+      pruneProcessedHistoryImagesInTranscript(sessionId);
+
       // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
       // 注意：_drain 不在此处清理 — 如果 _drain 存在，说明有待处理的消息，
       // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
       try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
       clearInterruptRequested();
+
+      // 消费 auto-continue 阶段暂存的 history context（如果存在）。
+      // 对应 sessionResumeFailed 在 auto-continue 路径上的镜像处理：
+      // 此时 sessionId 已被清空，pendingHistoryContext 是从旧 JSONL 转录中
+      // 提取的最近对话历史，需在 fresh session 启动前注入到 prompt 前面。
+      if (pendingHistoryContext) {
+        prompt = pendingHistoryContext + prompt;
+        log('Injected pending session history context (from auto-continue resume failure) into prompt');
+        pendingHistoryContext = null;
+      }
 
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
@@ -1672,8 +1989,18 @@ async function main(): Promise<void> {
       }
 
       // Session resume 失败（SDK 无法恢复旧会话）：清除 session，以新会话重试
+      // 同时从旧会话的 JSONL 转录中提取最近对话历史，注入到 prompt 中，
+      // 避免新会话完全丢失上下文（类似 recoveryGroups 机制）。
       if (queryResult.sessionResumeFailed) {
         log(`Session resume failed, retrying with fresh session (old: ${sessionId})`);
+        // Extract recent history from the old session transcript before clearing
+        if (sessionId) {
+          const historyContext = extractSessionHistory(sessionId);
+          if (historyContext) {
+            prompt = historyContext + prompt;
+            log(`Injected session history context into prompt for fresh session retry`);
+          }
+        }
         sessionId = undefined;
         latestSessionId = undefined;
         resumeAt = undefined;
@@ -1682,6 +2009,8 @@ async function main(): Promise<void> {
         mcpServerConfig = buildMcpServerConfig();
         continue;
       }
+
+      pruneProcessedHistoryImagesInTranscript(sessionId);
 
       // 不可恢复的转录错误（如超大图片或 MIME 错配被固化在会话历史中）
       if (queryResult.unrecoverableTranscriptError) {
@@ -1735,9 +2064,8 @@ async function main(): Promise<void> {
         break;
       }
 
-      // 中断后：跳过 memory flush 和 session update，等待下一条消息
+      // 中断后：跳过 memory flush 和 session update
       if (queryResult.interruptedDuringQuery) {
-        log('Query interrupted by user, waiting for next message');
         // 中断后清除 resumeAt：被中断的 assistant 消息可能未完整提交到 session 历史。
         // 使用 undefined 让 SDK 自行选择恢复点，避免因指向不完整消息的 UUID 导致 resume 失败。
         resumeAt = undefined;
@@ -1747,9 +2075,33 @@ async function main(): Promise<void> {
           streamEvent: { eventType: 'status', statusText: 'interrupted' },
           newSessionId: sessionId,  // 确保主进程持久化 session ID
         });
-        // 清理可能残留的 _interrupt 文件
+        // 清理可能残留的 _interrupt / _drain 文件
         try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
-        // 不 break，等待下一条消息
+        try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
+        clearInterruptRequested();
+        consecutiveCompactions = 0;
+
+        // Claude Code-style 排队行为：被中断的 query 已经消费了 pipe 进来的消息，
+        // 但这些消息尚未得到回复。将它们写回 IPC 目录作为新文件，通过 waitForIpcMessage
+        // 正常路径走下一个 query，避免 MCP server "Already connected" 问题 (#421)。
+        if (queryResult.pipedMessagesDuringQuery.length > 0) {
+          const piped = queryResult.pipedMessagesDuringQuery;
+          log(`Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`);
+          for (const msg of piped) {
+            const filename = `${Date.now()}-requeue-${Math.random().toString(36).slice(2, 8)}.json`;
+            const filepath = path.join(IPC_INPUT_DIR, filename);
+            const tempPath = `${filepath}.tmp`;
+            try {
+              fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: msg.text, images: msg.images, taskId: msg.taskId, sourceJid: msg.sourceJid }));
+              fs.renameSync(tempPath, filepath);
+            } catch (err) {
+              log(`Failed to re-enqueue piped message: ${err}`);
+            }
+          }
+        }
+
+        // 等待下一条消息（包括刚重新入队的 piped 消息）
+        log('Query interrupted by user, waiting for next message');
         const nextMessage = await waitForIpcMessage();
         if (nextMessage === null) {
           log('Close sentinel received after interrupt, exiting');
@@ -1757,11 +2109,16 @@ async function main(): Promise<void> {
           writeOutput({ status: 'success', result: null, newSessionId: sessionId });
           break;
         }
-        clearInterruptRequested();
-        consecutiveCompactions = 0;
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
         containerInput.turnId = generateTurnId();
+        // See main-loop comment: reset task attribution for this new turn.
+        mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+        // Update chatJid so per-channel MCP tools see the correct incoming chat.
+        if (nextMessage.sourceJid) mcpToolsConfig.chatJid = nextMessage.sourceJid;
+        // Rebuild MCP server to avoid "Already connected to a transport" error
+        // when the previous query was aborted mid-stream (#421).
+        mcpServerConfig = buildMcpServerConfig();
         continue;
       }
 
@@ -1790,7 +2147,7 @@ async function main(): Promise<void> {
           resumeAt,
           false,
           MEMORY_FLUSH_ALLOWED_TOOLS,
-          MEMORY_FLUSH_DISALLOWED_TOOLS,
+          memoryFlushDisallowedTools,
         );
         if (flushResult.newSessionId) { sessionId = flushResult.newSessionId; latestSessionId = sessionId; }
         if (flushResult.lastAssistantUuid) resumeAt = flushResult.lastAssistantUuid;
@@ -1858,16 +2215,19 @@ async function main(): Promise<void> {
             writeOutput({ status: 'closed', result: null });
             break;
           }
-          // Handle abnormal states from auto-continue runQuery (these were
-          // previously handled by the main loop's `continue` re-entry; now that
-          // auto-continue is a standalone call we must check them explicitly).
           if (autoContResult.sessionResumeFailed) {
             log('WARN: Session resume failed during auto-continue, clearing session');
+            if (sessionId) {
+              const historyContext = extractSessionHistory(sessionId);
+              if (historyContext) {
+                pendingHistoryContext = historyContext;
+                log('Stashed session history context for next user-initiated query');
+              }
+            }
             sessionId = undefined;
             latestSessionId = undefined;
             resumeAt = undefined;
             mcpServerConfig = buildMcpServerConfig();
-            // Fall through to wait for next IPC message with a fresh session.
           }
           if (autoContResult.unrecoverableTranscriptError) {
             log('WARN: Unrecoverable transcript error during auto-continue, signaling reset');
@@ -1911,6 +2271,14 @@ async function main(): Promise<void> {
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
       containerInput.turnId = generateTurnId();
+      // Clear per-turn task attribution: the previous query may have been a
+      // scheduled-task turn, but this new IPC message is a regular follow-up
+      // unless it explicitly carried a taskId (see nextMessage.taskId below).
+      // Forgetting to clear would cause regular user replies to be broadcast
+      // to the task's notify channels, hijacking later conversation.
+      mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+      // Update chatJid so per-channel MCP tools see the correct incoming chat.
+      if (nextMessage.sourceJid) mcpToolsConfig.chatJid = nextMessage.sourceJid;
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1999,6 +2367,14 @@ process.on('unhandledRejection', (reason: unknown) => {
   }
   if (isWithinInterruptGraceWindow()) {
     console.error('Unhandled rejection during interrupt (non-fatal):', reason);
+    return;
+  }
+  // SDK throws this when streamInput() is called before the ProcessTransport is ready.
+  // The sdkTransportReady guard in pollIpcDuringQuery should prevent this, but catch
+  // it here as a safety net to avoid crashing the agent on any residual race windows.
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (msg.includes('ProcessTransport is not ready for writing')) {
+    console.error('Suppressing ProcessTransport race (non-fatal):', reason);
     return;
   }
   console.error('Unhandled rejection:', reason);

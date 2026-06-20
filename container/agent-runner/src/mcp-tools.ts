@@ -22,10 +22,17 @@ export interface McpContext {
   isHome: boolean;
   isAdminHome: boolean;
   isScheduledTask?: boolean;
+  /** Mutable: set when the current IPC turn was triggered by a task prompt.
+   * Cleared between turns by the agent-runner main loop so that regular
+   * follow-up messages aren't misattributed to the prior task. */
+  currentTaskId?: string | null;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
   workspaceMemory: string;
+  // 禁用 HappyClaw 的 memory MCP 工具（memory_append/search/get），
+  // 让 Agent 完全按用户本机 ~/.claude/ 下的 Playbook 约定管理记忆
+  disableMemoryLayer?: boolean;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -76,6 +83,10 @@ async function pollIpcResult(
     await new Promise((resolve) => setTimeout(resolve, pollInterval));
   }
   throw new Error(`Timeout waiting for IPC result (${timeoutMs / 1000}s)`);
+}
+
+function newRequestId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 // --- Memory helpers ---
@@ -150,6 +161,37 @@ function parseMemoryFileReference(fileRef: string): {
 }
 
 /**
+ * Build the IPC payload shared by send_message / send_image MCP tools.
+ *
+ * Always stamps `chatJid`, `groupFolder`, `timestamp`. Conditionally stamps
+ * `isScheduledTask` (when ctx.isScheduledTask is truthy) and `taskId` (when
+ * ctx.currentTaskId is non-empty). The conditional stamping matters for host-
+ * side routing: a missing `taskId` key means "regular user-turn reply", while
+ * a present `taskId` key triggers the task-broadcast branch in the IPC
+ * consumer. `extras` carries per-tool fields (`type`, `text`, `imageBase64`, …).
+ *
+ * Pure function; exported for unit testing.
+ */
+export function buildSendMessageData(
+  ctx: McpContext,
+  extras: Record<string, unknown>,
+): Record<string, unknown> {
+  const data: Record<string, unknown> = {
+    chatJid: ctx.chatJid,
+    groupFolder: ctx.groupFolder,
+    timestamp: new Date().toISOString(),
+    ...extras,
+  };
+  if (ctx.isScheduledTask) {
+    data.isScheduledTask = true;
+  }
+  if (ctx.currentTaskId) {
+    data.taskId = ctx.currentTaskId;
+  }
+  return data;
+}
+
+/**
  * Create all HappyClaw MCP tool definitions for in-process SDK MCP server.
  */
 export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
@@ -165,16 +207,10 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
       "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
       { text: z.string().describe('The message text to send') },
       async (args) => {
-        const data: Record<string, unknown> = {
+        const data = buildSendMessageData(ctx, {
           type: 'message',
-          chatJid: ctx.chatJid,
           text: args.text,
-          groupFolder: ctx.groupFolder,
-          timestamp: new Date().toISOString(),
-        };
-        if (ctx.isScheduledTask) {
-          data.isScheduledTask = true;
-        }
+        });
         writeIpcFile(MESSAGES_DIR, data);
         return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
       },
@@ -183,7 +219,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_image ---
     tool(
       'send_image',
-      "Send an image file from the workspace to the user or group via IM (Feishu/Telegram/DingTalk). The file must be an image (PNG, JPEG, GIF, WebP, etc.) and must exist in the workspace. Use this when you've generated or downloaded an image and want to share it with the user. Optionally include a caption.",
+      'Send an image file from the workspace to the user via IM. Supports PNG/JPEG/GIF/WebP. Optional caption.',
       {
         file_path: z
           .string()
@@ -278,19 +314,13 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           };
         }
 
-        const data: Record<string, unknown> = {
+        const data = buildSendMessageData(ctx, {
           type: 'image',
-          chatJid: ctx.chatJid,
           imageBase64: base64,
           mimeType,
           caption: args.caption || undefined,
           fileName: path.basename(resolved),
-          groupFolder: ctx.groupFolder,
-          timestamp: new Date().toISOString(),
-        };
-        if (ctx.isScheduledTask) {
-          data.isScheduledTask = true;
-        }
+        });
         writeIpcFile(MESSAGES_DIR, data);
         return {
           content: [
@@ -306,7 +336,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_file ---
     tool(
       'send_file',
-      `Send a file to the current chat (the user you're talking to) via IM (Feishu/Telegram/DingTalk). The file path is relative to the workspace/group directory.
+      `Send a file to the current chat (the user you're talking to) via IM (Feishu/Telegram/DingTalk/QQ/Discord). The file path is relative to the workspace/group directory.
 Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
       {
         filePath: z
@@ -602,7 +632,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks.",
       {},
       async () => {
-        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
             TASKS_DIR,
@@ -753,6 +783,13 @@ You can optionally specify execution_mode: "container" (default, isolated Docker
         name: z.string().describe('Display name for the group'),
         folder: z
           .string()
+          // Strict regex: prevent path traversal / absolute paths flowing into
+          // host's path.join(GROUPS_DIR, folder). The host re-validates with
+          // the same shape — this is the documentation copy.
+          .regex(
+            /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/,
+            'folder must be alphanumerics + ._- (no slashes, no leading dot, ≤128 chars)',
+          )
           .describe(
             'Folder name for group files (lowercase, hyphens, e.g., "family-chat")',
           ),
@@ -794,6 +831,251 @@ You can optionally specify execution_mode: "container" (default, isolated Docker
         };
       },
     ),
+
+    // --- discord_get_history ---
+    tool(
+      'discord_get_history',
+      `Fetch recent messages from the current Discord channel or DM. Only works when the current chat is a Discord channel.
+Returns up to 100 messages per call (default 50), ordered oldest-first. Use "before" with a message ID to paginate older messages.`,
+      {
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe('Number of messages to fetch (1-100, default 50)'),
+        before: z
+          .string()
+          .regex(/^\d{17,20}$/, 'must be a Discord snowflake')
+          .optional()
+          .describe(
+            'Message ID (snowflake) — only return messages older than this. Use the "id" of the oldest message in your previous batch to paginate.',
+          ),
+      },
+      async (args) => {
+        if (!ctx.chatJid.startsWith('discord:')) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: discord_get_history only works in Discord channels. Current chat: ${ctx.chatJid}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'discord_get_history',
+              chatJid: ctx.chatJid,
+              limit: args.limit,
+              before: args.before,
+              requestId,
+              timestamp: new Date().toISOString(),
+            },
+            'discord_get_history_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Error fetching Discord history: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const messages = (result.messages || []) as Array<{
+            id: string;
+            authorName: string;
+            authorBot: boolean;
+            content: string;
+            timestamp: string;
+            attachments: Array<{ name: string; url: string }>;
+            replyToId?: string;
+            edited: boolean;
+          }>;
+          if (messages.length === 0) {
+            return {
+              content: [
+                { type: 'text' as const, text: 'No messages found in this channel.' },
+              ],
+            };
+          }
+          const formatted = messages
+            .map((m) => {
+              const tag = m.authorBot ? ' [bot]' : '';
+              const editFlag = m.edited ? ' (edited)' : '';
+              const replyFlag = m.replyToId ? ` ↪${m.replyToId}` : '';
+              const attachStr =
+                m.attachments.length > 0
+                  ? `\n  📎 ${m.attachments.map((a) => a.name).join(', ')}`
+                  : '';
+              return `[${m.timestamp}] ${m.authorName}${tag}${replyFlag}${editFlag} (id=${m.id})\n  ${m.content || '(empty)'}${attachStr}`;
+            })
+            .join('\n\n');
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Discord history (${messages.length} messages, oldest first):\n\n${formatted}`,
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Timeout waiting for Discord history response.',
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- discord_get_channel_info ---
+    tool(
+      'discord_get_channel_info',
+      `Get metadata for the current Discord channel: name, type (guild_text/dm/etc), topic, NSFW flag, parent (category) ID, and guild ID.
+Only works when the current chat is a Discord channel.`,
+      {},
+      async () => {
+        if (!ctx.chatJid.startsWith('discord:')) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: discord_get_channel_info only works in Discord channels. Current chat: ${ctx.chatJid}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'discord_get_channel_info',
+              chatJid: ctx.chatJid,
+              requestId,
+              timestamp: new Date().toISOString(),
+            },
+            'discord_get_channel_info_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Error fetching Discord channel info: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Discord channel info:\n${JSON.stringify(result.channel, null, 2)}`,
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Timeout waiting for Discord channel info response.',
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- discord_get_server_info ---
+    tool(
+      'discord_get_server_info',
+      `Get metadata for the Discord server (guild) the current channel belongs to: name, description, owner ID, member count, icon URL.
+Returns null if the current chat is a DM (DMs do not belong to a server). Only works when the current chat is a Discord channel.`,
+      {},
+      async () => {
+        if (!ctx.chatJid.startsWith('discord:')) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: discord_get_server_info only works in Discord channels. Current chat: ${ctx.chatJid}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'discord_get_server_info',
+              chatJid: ctx.chatJid,
+              requestId,
+              timestamp: new Date().toISOString(),
+            },
+            'discord_get_server_info_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Error fetching Discord server info: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          if (result.guild === null) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: 'This is a DM channel — no server (guild) information available.',
+                },
+              ],
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Discord server info:\n${JSON.stringify(result.guild, null, 2)}`,
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Timeout waiting for Discord server info response.',
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
   ];
 
   // Skill 安装/卸载仅限主容器（与 memory_* 工具一致）
@@ -828,7 +1110,7 @@ Example packages: "anthropic/memory", "anthropic/think", "owner/repo", "owner/re
             };
           }
 
-          const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const requestId = newRequestId();
           try {
             const result = await pollIpcResult(
               TASKS_DIR,
@@ -904,7 +1186,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
             };
           }
 
-          const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const requestId = newRequestId();
           try {
             const result = await pollIpcResult(
               TASKS_DIR,
@@ -953,8 +1235,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers)
-  if (ctx.isHome) {
+  // --- memory_append --- (only available for home containers, skipped in native Claude mode)
+  if (ctx.isHome && !ctx.disableMemoryLayer) {
     tools.push(
       tool(
         'memory_append',
@@ -1074,8 +1356,9 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_search --- (available for all containers)
-  tools.push(
+  // --- memory_search + memory_get --- (skipped in native Claude mode)
+  if (!ctx.disableMemoryLayer) {
+    tools.push(
     tool(
       'memory_search',
       `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
@@ -1282,6 +1565,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
       },
     ),
   );
+  }
 
   return tools;
 }

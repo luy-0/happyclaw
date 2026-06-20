@@ -13,8 +13,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR } from './config.js';
+import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
+import { resolveHostNodeBinary } from './node-resolver.js';
 import {
   loadMountAllowlist,
   validateAdditionalMounts,
@@ -26,16 +27,39 @@ import {
   getEnabledProviders,
   getBalancingConfig,
   getSystemSettings,
+  getEffectiveExternalDir,
   mergeClaudeEnvConfig,
   resolveProviderById,
   shellQuoteEnvLines,
   writeCredentialsFile,
 } from './runtime-config.js';
 import { providerPool } from './provider-pool.js';
+import {
+  deleteSession,
+  getSessionProviderId,
+  setSessionProviderId,
+} from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import { loadUserMcpServers } from './mcp-utils.js';
+import {
+  getUserRuntimeRoot,
+  loadUserPlugins,
+  CONTAINER_PLUGINS_PATH,
+  type SdkPluginConfig,
+} from './plugin-utils.js';
+import { materializeUserRuntime } from './plugin-materializer.js';
+import { invalidateUserCommandIndex } from './plugin-command-index.js';
+import {
+  checkHostCapabilities,
+  logCapabilityPreflight,
+} from './agent-capabilities.js';
+import {
+  buildClaudeContextPlan,
+  syncHostClaudeContext,
+} from './claude-context-resolver.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
+import type { ClaudeContextAudit } from './stream-event.types.js';
 import {
   attachStderrHandler,
   attachStdoutHandler,
@@ -49,6 +73,78 @@ import {
 } from './agent-output-parser.js';
 
 /**
+ * 宿主机的 ~/.claude.json 路径。
+ * 所有工作区共享此文件，确保 deviceId (userID) 一致。
+ * 即使 HappyClaw 项目删除重建，此文件始终存在于宿主机上。
+ */
+function getHostClaudeJsonPath(): string {
+  return path.join(os.homedir(), '.claude.json');
+}
+
+/**
+ * 确保宿主机 ~/.claude.json 存在。
+ * 如不存在则创建空 JSON，Claude Code 首次运行时会自动生成 userID。
+ */
+function ensureHostClaudeJson(): string {
+  const p = getHostClaudeJsonPath();
+  try {
+    fs.writeFileSync(p, '{}', { mode: 0o600, flag: 'wx' });
+  } catch (err: any) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+  return p;
+}
+
+/**
+ * 为 Docker 容器生成精简版 .claude.json。
+ * 宿主机 ~/.claude.json 中的 cachedGrowthBookFeatures 含 tengu_bridge_repl_v2 等
+ * feature flags，SDK 初始化时会据此尝试建立 bridge 连接，在容器网络环境中无法完成
+ * 导致进程挂起。剥离该字段后其余内容原样保留（userID 等）。
+ * 同时剥离 oauthAccount：容器内不走宿主机的 OAuth 登录态，认证完全由
+ * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY 环境变量控制，避免 SDK 误检
+ * OAuth 凭据后跳过标准 Bearer header（第三方 provider 返回 404）。
+ */
+function getContainerClaudeJsonPath(): string {
+  const containerJsonDir = path.join(DATA_DIR, 'config');
+  fs.mkdirSync(containerJsonDir, { recursive: true });
+  const containerJsonPath = path.join(containerJsonDir, 'container-claude-json.json');
+
+  try {
+    const hostJson = JSON.parse(fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'));
+    const stripped = { ...hostJson };
+    delete stripped.cachedGrowthBookFeatures;
+    delete stripped.oauthAccount;
+    stripped.autoUpdates = false;
+    fs.writeFileSync(containerJsonPath, JSON.stringify(stripped, null, 2) + '\n', { mode: 0o644 });
+  } catch {
+    fs.writeFileSync(containerJsonPath, '{"hasCompletedOnboarding":true,"autoUpdates":false}\n', { mode: 0o644 });
+  }
+
+  return containerJsonPath;
+}
+
+/**
+ * 确保 localPath 是指向 targetPath 的 symlink。
+ * 如果 localPath 是普通文件或指向错误目标的 symlink，替换它。
+ */
+function ensureSymlinkTo(localPath: string, targetPath: string): void {
+  try {
+    const st = fs.lstatSync(localPath);
+    if (st.isSymbolicLink() && fs.readlinkSync(localPath) === targetPath) {
+      return; // 已经是正确的 symlink
+    }
+    fs.unlinkSync(localPath); // 普通文件或错误 symlink，删除
+  } catch {
+    // 文件不存在，继续创建
+  }
+  try {
+    fs.symlinkSync(targetPath, localPath);
+  } catch (err) {
+    logger.warn({ err, localPath, targetPath }, 'Failed to create symlink for .claude.json, deviceId may differ');
+  }
+}
+
+/**
  * Required env flags for settings.json — 每次容器/进程启动时强制写入，不可被用户覆盖。
  * 合并模式：仅覆盖这些 key，保留用户自定义的其他 key。
  */
@@ -56,6 +152,11 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  // 禁用 SDK 附件注入（token_usage, changed_files, todo_reminders 等 20+ 种动态消息）。
+  // 这些附件在每次 query() 时动态生成但不持久化到 JSONL，导致跨进程的消息数组
+  // 前缀不匹配，prompt cache 永远失效（cache_read 始终 = 11224 静态 system prompt）。
+  // 禁用后历史消息的缓存前缀跨 query() 保持一致，实现 1M 上下文下的增量缓存。
+  CLAUDE_CODE_DISABLE_ATTACHMENTS: '1',
 };
 
 /** Read existing settings.json, deep-merge required env keys and mcpServers, write only if changed */
@@ -102,6 +203,10 @@ export interface ContainerInput {
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
+  /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
+   * Used by per-channel MCP tools (discord_*, etc.) to identify the current
+   * incoming chat. Undefined when chatJid already encodes the IM source. */
+  currentSourceJid?: string;
   /** @deprecated Use isHome + isAdminHome instead */
   isMain: boolean;
   turnId?: string;
@@ -110,9 +215,21 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   /** Isolated task run ID — determines IPC namespace (tasks-run/{taskRunId}/) */
   taskRunId?: string;
+  /** If the last unprocessed message was emitted by a scheduled task prompt,
+   * this is that task's ID; propagated into agent-runner so MCP send_message
+   * outputs can be attributed back to the task record. */
+  messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;
+  /**
+   * Claude Code plugins to inject into the SDK query (via `options.plugins`).
+   * Populated just-in-time by runContainerAgent/runHostAgent from the owner's
+   * plugins.json; never set by the caller.
+   */
+  plugins?: Array<{ type: 'local'; path: string }>;
+  /** Runtime context audit bootstrap; agent-runner enriches it with SDK usage. */
+  contextAudit?: ClaudeContextAudit;
 }
 
 export interface ContainerOutput {
@@ -120,6 +237,7 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  providerFailure?: boolean;
   streamEvent?: StreamEvent;
   turnId?: string;
   sessionId?: string;
@@ -154,12 +272,98 @@ interface ResolvedProvider {
 }
 
 /**
+ * One-time provider overrides per group folder.
+ * Set by switchProvider(), consumed (and deleted) by trySelectPoolProvider().
+ */
+const providerOverrides = new Map<string, string>();
+
+export function setProviderOverride(groupFolder: string, providerId: string): void {
+  providerOverrides.set(groupFolder, providerId);
+}
+
+/**
+ * Read-only prediction of whether the next provider selection will *clear* the
+ * resumable Claude session because it has to switch away from the bound
+ * provider (the binding is unhealthy or no longer enabled, or a one-time
+ * override targets a different provider). Mirrors the `resetSession` conditions
+ * in trySelectPoolProvider without mutating sticky bindings.
+ *
+ * The orchestration layer calls this *before* building the prompt so a
+ * proactive provider switch injects recent conversation history into the fresh
+ * session — matching the reactive (mid-stream provider-failure) path. Without
+ * this, the first turn under the new provider would see an empty conversation.
+ *
+ * Conservative by design: a false positive only injects redundant history
+ * (harmless), never the reverse.
+ */
+export function willClearSessionOnProviderSwitch(
+  groupFolder: string,
+  agentId?: string | null,
+): boolean {
+  // Env-level provider override means the pool is bypassed entirely — no
+  // pool-driven switch, so the session is never cleared on this account.
+  const override = getContainerEnvConfig(groupFolder);
+  if (
+    override.anthropicApiKey ||
+    override.anthropicAuthToken ||
+    override.anthropicBaseUrl
+  ) {
+    return false;
+  }
+
+  const boundId = getSessionProviderId(groupFolder, agentId);
+  if (!boundId) return false;
+
+  // One-time override (from switchProvider) targeting a different provider will
+  // reset. Peek without consuming — trySelectPoolProvider consumes it later.
+  const overrideProviderId = providerOverrides.get(groupFolder);
+  if (overrideProviderId) {
+    return overrideProviderId !== boundId;
+  }
+
+  const enabledProviders = getEnabledProviders();
+  if (enabledProviders.length === 0) return false;
+
+  // Bound provider removed/disabled → a fresh one gets picked → reset.
+  const stillEnabled = enabledProviders.some((p) => p.id === boundId);
+  if (!stillEnabled) return true;
+
+  // Single enabled provider equal to the binding → sticky, no reset.
+  if (enabledProviders.length === 1) {
+    return enabledProviders[0].id !== boundId;
+  }
+
+  // Multiple providers: sticky reuse only when the binding is still healthy.
+  // Unhealthy binding falls through to pool selection, which prefers a
+  // different healthy provider → reset.
+  const balancing = getBalancingConfig();
+  providerPool.refreshFromConfig(enabledProviders, balancing);
+  return !providerPool.getHealthStatus(boundId).healthy;
+}
+
+/**
  * Try to select a provider from the pool. Returns profileId + resolved config,
- * or null if pool mode is off (≤1 enabled) / group has provider override / selection fails.
+ * or null if no providers are enabled / group has env-level provider override / selection fails.
+ * For single-provider setups, returns the provider for display without pool balancing.
+ * One-time overrides (from switchProvider) are consumed on use.
+ *
+ * Session-sticky binding (when groupFolder + agentId identifies a resumable Claude
+ * session): if the session has a previously-bound provider that is still enabled,
+ * prefer it over load-balancing. This prevents "Invalid signature in thinking
+ * block" 400 errors when a conversation that produced thinking blocks under
+ * provider A gets resumed in a fresh container that the pool routes to provider B
+ * (different OAuth account / API key). Each successful selection updates the
+ * binding via setSessionProviderId().
  */
 function trySelectPoolProvider(
   groupFolder: string,
-): { profileId: string; resolved: ResolvedProvider } | null {
+  agentId?: string | null,
+): {
+  profileId: string;
+  resolved: ResolvedProvider;
+  previousProviderId?: string;
+  resetSession?: boolean;
+} | null {
   const override = getContainerEnvConfig(groupFolder);
   const hasOverride = !!(
     override.anthropicApiKey ||
@@ -168,28 +372,150 @@ function trySelectPoolProvider(
   );
   if (hasOverride) return null;
 
+  const existingBoundId = getSessionProviderId(groupFolder, agentId);
+
+  // Check one-time override (consumed on use)
+  const overrideProviderId = providerOverrides.get(groupFolder);
+  if (overrideProviderId) {
+    providerOverrides.delete(groupFolder);
+    try {
+      const resolved = resolveProviderById(overrideProviderId);
+      providerPool.acquireSession(overrideProviderId);
+      // Override path also updates sticky binding so subsequent runs follow.
+      setSessionProviderId(groupFolder, agentId, overrideProviderId);
+      logger.info(
+        { groupFolder, providerId: overrideProviderId },
+        'Using one-time provider override',
+      );
+      return {
+        profileId: overrideProviderId,
+        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        previousProviderId: existingBoundId,
+        resetSession:
+          !!existingBoundId && existingBoundId !== overrideProviderId,
+      };
+    } catch (err) {
+      logger.warn(
+        { err, providerId: overrideProviderId },
+        'Provider override failed, falling back to pool',
+      );
+    }
+  }
+
   // Refresh pool state from V4 config
   const enabledProviders = getEnabledProviders();
-  if (enabledProviders.length <= 1) return null; // No pool needed for 0-1 providers
-
+  if (enabledProviders.length === 0) return null;
   const balancing = getBalancingConfig();
   providerPool.refreshFromConfig(enabledProviders, balancing);
+  const boundId = existingBoundId;
+
+  // Sticky path: respect previous session→provider binding when the bound
+  // provider is still enabled. Skip when only one provider exists (single
+  // provider already gives stickiness implicitly).
+  if (enabledProviders.length > 1) {
+    if (boundId && enabledProviders.some((p) => p.id === boundId)) {
+      const boundHealth = providerPool.getHealthStatus(boundId);
+      if (!boundHealth.healthy) {
+        logger.info(
+          { groupFolder, agentId: agentId || null, providerId: boundId },
+          'Sticky provider is unhealthy, falling back to pool selection',
+        );
+      } else {
+        try {
+          const resolved = resolveProviderById(boundId);
+          providerPool.acquireSession(boundId);
+          logger.debug(
+            { groupFolder, agentId: agentId || null, providerId: boundId },
+            'Reusing sticky provider binding for resumed session',
+          );
+          return {
+            profileId: boundId,
+            resolved: {
+              config: resolved.config,
+              customEnv: resolved.customEnv,
+            },
+          };
+        } catch (err) {
+          logger.warn(
+            { err, providerId: boundId },
+            'Sticky provider resolution failed, falling back to pool selection',
+          );
+        }
+      }
+    } else if (boundId) {
+      // Bound provider was disabled or removed — fall through and pick a fresh one.
+      logger.info(
+        { groupFolder, agentId: agentId || null, providerId: boundId },
+        'Sticky provider no longer enabled, falling back to pool selection',
+      );
+    }
+  }
+
+  // Single provider: return its ID for display, acquire session for consistency
+  if (enabledProviders.length === 1) {
+    try {
+      const resolved = resolveProviderById(enabledProviders[0].id);
+      providerPool.acquireSession(enabledProviders[0].id);
+      setSessionProviderId(groupFolder, agentId, enabledProviders[0].id);
+      return {
+        profileId: enabledProviders[0].id,
+        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        previousProviderId: boundId,
+        resetSession: !!boundId && boundId !== enabledProviders[0].id,
+      };
+    } catch {
+      return null;
+    }
+  }
 
   try {
     const profileId = providerPool.selectProvider();
     const resolved = resolveProviderById(profileId);
     providerPool.acquireSession(profileId);
+    setSessionProviderId(groupFolder, agentId, profileId);
     return {
       profileId,
       resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      previousProviderId: boundId,
+      resetSession: !!boundId && boundId !== profileId,
     };
   } catch (err) {
-    logger.warn({ err }, 'Provider pool selection failed, falling back to active profile');
+    logger.warn(
+      { err },
+      'Provider pool selection failed, falling back to active profile',
+    );
     return null;
   }
 }
 
-function buildVolumeMounts(
+/**
+ * Best-effort pre-spawn materialize for host-mode plugins. Mirrors the docker
+ * path's behaviour in `buildVolumeMounts`: v2 config can exist before the
+ * runtime/ tree is built (first enable, or after orphan GC), and
+ * `loadUserPlugins({runtime:'host'})` only emits paths whose manifests exist
+ * on disk. Without this call host agents would silently start with 0 plugins
+ * even when the user has plugins enabled. Failure is logged, never thrown —
+ * the agent simply starts with whatever subset is already materialized.
+ */
+export function prepareHostPlugins(ownerId: string | null | undefined): SdkPluginConfig[] {
+  if (!ownerId) return [];
+  try {
+    materializeUserRuntime(ownerId);
+  } catch (err) {
+    logger.warn(
+      { ownerId, err },
+      'prepareHostPlugins: materializeUserRuntime failed; host agent will see no plugins',
+    );
+  }
+  // Drop the user's command index cache so a stale empty entry (e.g. a prior
+  // /commands hit before runtime existed, see plugin-command-index.ts:235) is
+  // rebuilt against the now-materialized tree. Invalidate on both success and
+  // failure paths: a partial materialize still wants the cache rebuilt.
+  invalidateUserCommandIndex(ownerId);
+  return loadUserPlugins(ownerId, { runtime: 'host' });
+}
+
+export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
   mountUserSkills = true,
@@ -271,6 +597,16 @@ function buildVolumeMounts(
       )
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   mkdirForContainer(groupSessionsDir);
+  const claudeContextPlan = buildClaudeContextPlan({
+    executionMode: 'container',
+    group,
+    ownerHomeFolder,
+    externalClaudeDir: getEffectiveExternalDir(),
+    projectRoot,
+    dataDir: DATA_DIR,
+    groupSessionsDir,
+    mountUserSkills,
+  });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
   ensureSettingsJson(settingsFile, mcpServers);
@@ -281,11 +617,29 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // 清理 session 目录中 SDK 遗留的 .claude.json（含 cachedGrowthBookFeatures，会导致初始化挂起）。
+  // 精简版（不含 feature flags）约 200-400B，SDK 写回的完整版通常 > 10KB。
+  const STRIPPED_CLAUDE_JSON_MAX_SIZE = 500;
+  const sessionClaudeJson = path.join(groupSessionsDir, '.claude.json');
+  try {
+    const st = fs.lstatSync(sessionClaudeJson);
+    if (!st.isSymbolicLink() && st.size > STRIPPED_CLAUDE_JSON_MAX_SIZE) {
+      fs.unlinkSync(sessionClaudeJson);
+    }
+  } catch { /* not found, ok */ }
+
+  // 挂载精简版 .claude.json（剥离 cachedGrowthBookFeatures），保留 deviceId 一致性
+  const containerJson = getContainerClaudeJsonPath();
+  mounts.push({
+    hostPath: containerJson,
+    containerPath: '/home/node/.claude.json',
+    readonly: true,
+  });
+
   // Skills：以只读卷挂载宿主机目录（由 entrypoint 创建符号链接）
   // 用户的所有 skills 在其所有工作区中全量生效
-  const projectSkillsDir = path.join(projectRoot, 'container', 'skills');
-  const userSkillsDir =
-    mountUserSkills && ownerId ? path.join(DATA_DIR, 'skills', ownerId) : null;
+  const projectSkillsDir = claudeContextPlan.projectSkillsDir;
+  const userSkillsDir = claudeContextPlan.userSkillsDir ?? null;
 
   // Ensure user skills directory exists so it can always be mounted.
   // Skills may be installed after the group is created; without pre-creating,
@@ -306,6 +660,61 @@ function buildVolumeMounts(
     mounts.push({
       hostPath: userSkillsDir,
       containerPath: '/workspace/user-skills',
+      readonly: true,
+    });
+  }
+
+  // Per-user feishu-cli OAuth state (token.json + config.yaml).
+  // Without this mount, every container restart loses the user's feishu OAuth
+  // authorization, forcing re-auth every IDLE_TIMEOUT (#477).
+  if (ownerId) {
+    const userFeishuCliDir = path.join(
+      DATA_DIR,
+      'config',
+      'user-cli',
+      ownerId,
+      'feishu-cli',
+    );
+    mkdirForContainer(userFeishuCliDir);
+    mounts.push({
+      hostPath: userFeishuCliDir,
+      containerPath: '/home/node/.feishu-cli',
+      readonly: false,
+    });
+  }
+
+  // Claude Code plugins (per-user runtime): read-only mount so the CLI inside
+  // the container can load the same plugin directories referenced by
+  // ContainerInput.plugins.
+  //
+  // Admin home runs in `host` mode and bypasses container mounts entirely,
+  // so plugin materialization for that path happens inside runHostAgent's
+  // host-runtime loadUserPlugins. Here we only handle docker-mode containers.
+  //
+  // Materialize is synchronous so the runtime tree is on disk before the mount
+  // source is picked — loadUserPlugins(docker) returns paths shaped like
+  // /workspace/plugins/snapshots/{snap}/{mp}/{plugin}, which only resolve when
+  // runtime/{userId}/ is mounted at /workspace/plugins. The runtime root is
+  // mkdir'd unconditionally so the bind mount target exists even for users
+  // with no enabled plugins yet (an empty mount surfaces nothing to the CLI,
+  // matching their config).
+  if (ownerId) {
+    const runtimeRoot = getUserRuntimeRoot(ownerId);
+    fs.mkdirSync(runtimeRoot, { recursive: true });
+    try {
+      materializeUserRuntime(ownerId);
+    } catch (err) {
+      logger.warn(
+        { ownerId, err },
+        'buildVolumeMounts: materializeUserRuntime failed; container will see no plugins',
+      );
+    }
+    // Mirror prepareHostPlugins: drop a stale empty command index that may
+    // have been cached before this runtime tree existed (plugin-command-index.ts:235).
+    invalidateUserCommandIndex(ownerId);
+    mounts.push({
+      hostPath: runtimeRoot,
+      containerPath: CONTAINER_PLUGINS_PATH,
       readonly: true,
     });
   }
@@ -348,6 +757,16 @@ function buildVolumeMounts(
     containerOverride,
     resolvedProvider?.customEnv,
   );
+  // SystemSettings.autoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
+  const sysSettings = getSystemSettings();
+  if (sysSettings.autoCompactWindow > 0) {
+    envLines.push(`AUTO_COMPACT_WINDOW=${sysSettings.autoCompactWindow}`);
+  }
+  // SubAgent 模型：仅在显式配置了非默认值时注入。默认 'inherit' 与省略 model 等价，
+  // 此时不注入，避免覆盖用户可能在 provider customEnv 里设的 SUBAGENT_MODEL（与 autoCompact 对称）。
+  if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
+    envLines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
+  }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -382,6 +801,15 @@ function buildVolumeMounts(
     }
   }
 
+  // Third-party provider: remove any stale .credentials.json so the SDK
+  // does not detect OAuth credentials from a previous official-provider run.
+  if (mergedConfig.anthropicBaseUrl) {
+    try {
+      const staleCreds = path.join(groupSessionsDir, '.credentials.json');
+      if (fs.existsSync(staleCreds)) fs.unlinkSync(staleCreds);
+    } catch { /* ignore */ }
+  }
+
   // Mount agent-runner source from host — recompiled on container startup.
   // Bypasses Docker 镜像构建缓存，确保代码变更生效。
   const agentRunnerSrc = path.join(
@@ -396,30 +824,43 @@ function buildVolumeMounts(
     readonly: true,
   });
 
-  // Admin's ~/.claude/ config: mount CLAUDE.md and rules/ into /workspace/
+  // Admin's effective Claude config: mount CLAUDE.md and rules/ into /workspace/
   // so the SDK's directory traversal (cwd → root) discovers them at /workspace/ level.
-  // Only for admin-created workspaces (ownerHomeFolder === 'main').
-  const isCreatorAdmin = ownerHomeFolder === 'main';
-  if (isCreatorAdmin) {
-    const hostClaudeDir = path.join(os.homedir(), '.claude');
-    const hostClaudeMd = path.join(hostClaudeDir, 'CLAUDE.md');
-    const hostRulesDir = path.join(hostClaudeDir, 'rules');
-
-    if (fs.existsSync(hostClaudeMd)) {
+  // Only for admin-created workspaces; ordinary users must not inherit host-global config.
+  if (claudeContextPlan.isAdminOwned) {
+    if (claudeContextPlan.claudeMdSource && fs.existsSync(claudeContextPlan.claudeMdSource)) {
       mounts.push({
-        hostPath: hostClaudeMd,
+        hostPath: claudeContextPlan.claudeMdSource,
         containerPath: '/workspace/CLAUDE.md',
         readonly: true,
       });
     }
-    if (fs.existsSync(hostRulesDir)) {
+    if (claudeContextPlan.rulesSourceDir && fs.existsSync(claudeContextPlan.rulesSourceDir)) {
       mounts.push({
-        hostPath: hostRulesDir,
+        hostPath: claudeContextPlan.rulesSourceDir,
         containerPath: '/workspace/.claude/rules',
         readonly: true,
       });
     }
+    if (claudeContextPlan.externalSkillsDir && fs.existsSync(claudeContextPlan.externalSkillsDir)) {
+      mounts.push({
+        hostPath: claudeContextPlan.externalSkillsDir,
+        containerPath: '/workspace/external-skills',
+        readonly: true,
+      });
+    }
   }
+
+  // Per-group persistent extra directory: provides a durable /workspace/extra/ even when
+  // no additionalMounts are configured. User-configured additionalMounts from the allowlist
+  // are mounted as subdirectories (/workspace/extra/{name}) and overlay on top.
+  const extraDir = path.join(DATA_DIR, 'extra', group.folder);
+  mkdirForContainer(extraDir);
+  mounts.push({
+    hostPath: extraDir,
+    containerPath: '/workspace/extra',
+    readonly: false,
+  });
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -437,8 +878,12 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  tz: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Set timezone so container Node.js processes use local time (Asia/Shanghai)
+  args.push('-e', `TZ=${tz}`);
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
@@ -457,7 +902,7 @@ function buildContainerArgs(
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onProcess: (proc: ChildProcess, containerName: string, selectedProviderId: string | null) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
@@ -467,9 +912,30 @@ export async function runContainerAgent(
   mkdirForContainer(groupDir);
 
   // ─── Provider Pool selection ───
-  const poolResult = trySelectPoolProvider(group.folder);
+  const poolResult = trySelectPoolProvider(group.folder, input.agentId);
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
+  let providerFailureReported = false;
+  if (poolResult?.resetSession && input.sessionId) {
+    logger.info(
+      {
+        groupFolder: group.folder,
+        agentId: input.agentId || null,
+        previousProviderId: poolResult.previousProviderId,
+        providerId: selectedProfileId,
+      },
+      'Clearing Claude session after switching providers',
+    );
+    // deleteSession removes the whole sessions row, including the provider_id
+    // binding trySelectPoolProvider just wrote. Re-bind the freshly-selected
+    // provider so the next turn stays sticky to it instead of degrading to a
+    // fresh pool pick.
+    deleteSession(group.folder, input.agentId);
+    if (selectedProfileId) {
+      setSessionProviderId(group.folder, input.agentId, selectedProfileId);
+    }
+    input = { ...input, sessionId: undefined };
+  }
 
   try {
     // Determine if this is an admin home container (full privileges)
@@ -490,7 +956,7 @@ export async function runContainerAgent(
       ? `-${input.agentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
       : '';
     const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
-    const containerArgs = buildContainerArgs(mounts, containerName);
+    const containerArgs = buildContainerArgs(mounts, containerName, TIMEZONE);
 
     logger.debug(
       {
@@ -523,7 +989,7 @@ export async function runContainerAgent(
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
-      onProcess(container, containerName);
+      onProcess(container, containerName, selectedProfileId);
 
       const stdoutState = createStdoutParserState();
       const stderrState = createStderrState();
@@ -536,7 +1002,27 @@ export async function runContainerAgent(
         );
         container.kill();
       });
-      container.stdin.write(JSON.stringify(input));
+      // Derive a new input with docker-runtime plugins injected; never mutate
+      // the caller's `input` object (queue/log/retry paths reuse the same ref).
+      const dockerInput: ContainerInput = {
+        ...input,
+        plugins: group.created_by
+          ? loadUserPlugins(group.created_by, { runtime: 'docker' })
+          : [],
+        contextAudit: buildClaudeContextPlan({
+          executionMode: 'container',
+          group,
+          ownerHomeFolder,
+          externalClaudeDir: getEffectiveExternalDir(),
+          projectRoot: process.cwd(),
+          dataDir: DATA_DIR,
+          groupSessionsDir: input.agentId
+            ? path.join(DATA_DIR, 'sessions', group.folder, 'agents', input.agentId, '.claude')
+            : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
+          mountUserSkills: shouldMountUserSkills,
+        }).audit,
+      };
+      container.stdin.write(JSON.stringify(dockerInput));
       container.stdin.end();
 
       let timedOut = false;
@@ -571,12 +1057,41 @@ export async function runContainerAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
+      const handleOutput = onOutput
+        ? async (output: ContainerOutput): Promise<void> => {
+            await onOutput(output);
+            if (output.providerFailure && selectedProfileId) {
+              if (!providerFailureReported) {
+                providerFailureReported = true;
+                providerPool.reportFailure(selectedProfileId, true);
+                logger.warn(
+                  {
+                    group: group.name,
+                    containerName,
+                    providerId: selectedProfileId,
+                    result: output.result,
+                  },
+                  'Provider failure detected from streamed output, stopping container',
+                );
+              }
+              exec(`docker stop ${containerName}`, (err) => {
+                if (err) {
+                  logger.warn(
+                    { group: group.name, containerName, err },
+                    'Failed to stop container after provider failure',
+                  );
+                  container.kill('SIGTERM');
+                }
+              });
+            }
+          }
+        : undefined;
 
       // Attach stdout/stderr handlers using shared parser
       attachStdoutHandler(container.stdout, stdoutState, {
         groupName: group.name,
         label: 'Container',
-        onOutput,
+        onOutput: handleOutput,
         resetTimeout,
       });
       attachStderrHandler(container.stderr, stderrState, group.name, {
@@ -644,7 +1159,11 @@ export async function runContainerAgent(
 
     // ─── Provider Pool health reporting ───
     if (selectedProfileId) {
-      if (result.status === 'success' || result.status === 'closed') {
+      if (result.providerFailure) {
+        if (!providerFailureReported) {
+          providerPool.reportFailure(selectedProfileId, true);
+        }
+      } else if (result.status === 'success' || result.status === 'closed') {
         providerPool.reportSuccess(selectedProfileId);
       } else if (result.status === 'error' && isApiError(result.error || '')) {
         providerPool.reportFailure(selectedProfileId);
@@ -766,7 +1285,7 @@ export function killProcessTree(
 export async function runHostAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, identifier: string) => void,
+  onProcess: (proc: ChildProcess, identifier: string, selectedProviderId: string | null) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
@@ -858,7 +1377,9 @@ export async function runHostAgent(
     }
   }
 
-  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+  // Always store logs in data/groups/{folder}/logs/, not in customCwd
+  const logsBaseDir = path.join(defaultGroupDir, 'logs');
+  fs.mkdirSync(logsBaseDir, { recursive: true });
   fs.mkdirSync(path.join(DATA_DIR, 'memory', group.folder), {
     recursive: true,
   });
@@ -901,72 +1422,75 @@ export async function runHostAgent(
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
+  // Symlink .claude.json 到宿主机 ~/.claude.json，确保 deviceId 一致
+  const localJson = path.join(groupSessionsDir, '.claude.json');
+  ensureSymlinkTo(localJson, ensureHostClaudeJson());
+
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
   ensureSettingsJson(settingsFile, hostMcpServers);
 
-  // 4. Skills 自动链接到 session 目录
-  // 链接顺序：项目级 → 用户级(覆盖同名项目级)
-  // 用户的所有 skills 在所有工作区中生效
-  try {
-    const skillsDir = path.join(groupSessionsDir, 'skills');
-    fs.mkdirSync(skillsDir, { recursive: true });
-    // 清空已有符号链接
-    for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
-      const entryPath = path.join(skillsDir, entry.name);
-      try {
-        if (entry.isSymbolicLink() || entry.isDirectory()) {
-          fs.rmSync(entryPath, { recursive: true, force: true });
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    const linkSkillEntries = (sourceDir: string) => {
-      if (!fs.existsSync(sourceDir)) return;
-      for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
-        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-        const linkPath = path.join(skillsDir, entry.name);
-        try {
-          // 移除已有符号链接（高优先级覆盖低优先级）
-          if (fs.existsSync(linkPath)) {
-            fs.rmSync(linkPath, { recursive: true, force: true });
-          }
-          fs.symlinkSync(path.join(sourceDir, entry.name), linkPath);
-        } catch {
-          /* ignore */
-        }
-      }
-    };
-
-    // 项目级 skills
-    const projectRoot = process.cwd();
-    linkSkillEntries(path.join(projectRoot, 'container', 'skills'));
-    // 用户级 skills（覆盖同名项目级）
-    const ownerId = group.created_by;
-    if (ownerId) {
-      linkSkillEntries(path.join(DATA_DIR, 'skills', ownerId));
-    }
-  } catch (err) {
-    logger.warn(
-      { folder: group.folder, err },
-      '宿主机模式 skills 符号链接失败',
-    );
-  }
+  // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
+  const hostClaudeContextPlan = buildClaudeContextPlan({
+    executionMode: 'host',
+    group,
+    ownerHomeFolder,
+    externalClaudeDir: getEffectiveExternalDir(),
+    projectRoot: process.cwd(),
+    dataDir: DATA_DIR,
+    groupSessionsDir,
+  });
+  const hostClaudeContextSync = syncHostClaudeContext(
+    hostClaudeContextPlan,
+    groupSessionsDir,
+  );
+  hostClaudeContextPlan.audit.claudeMd.status = hostClaudeContextSync.claudeMdStatus;
+  hostClaudeContextPlan.audit.warnings = hostClaudeContextSync.warnings;
 
   // 5. 构建环境变量
   const hostEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
   };
 
+  // Strip macOS launch-context vars that must not be inherited by child
+  // processes. When happyclaw is started by a background process manager
+  // (pm2 / launchd / ssh / cron) outside a normal login session, XPC_FLAGS=0x2
+  // leaks into the environment. The bundled bun/CFNetwork-based claude CLI then
+  // can't reach mDNSResponder/securityd through XPC, so DNS resolution and the
+  // system CA store fail and every model request dies with FailedToOpenSocket.
+  // Plain Node uses its own resolver/TLS stack and is unaffected, which is why
+  // this only breaks the host agent. The var is meaningless to a child spawned
+  // in a different way, so dropping it restores normal name resolution. No-op
+  // on non-macOS hosts (the var does not exist there).
+  delete hostEnv['XPC_FLAGS'];
+
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
-  const hostPoolResult = trySelectPoolProvider(group.folder);
+  const hostPoolResult = trySelectPoolProvider(group.folder, input.agentId);
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
+  let hostProviderFailureReported = false;
+  if (hostPoolResult?.resetSession && input.sessionId) {
+    logger.info(
+      {
+        groupFolder: group.folder,
+        agentId: input.agentId || null,
+        previousProviderId: hostPoolResult.previousProviderId,
+        providerId: hostSelectedProfileId,
+      },
+      'Clearing Claude session after switching providers',
+    );
+    // deleteSession removes the whole sessions row, including the provider_id
+    // binding trySelectPoolProvider just wrote. Re-bind so the next turn stays
+    // sticky to the freshly-selected provider (mirrors the container path).
+    deleteSession(group.folder, input.agentId);
+    if (hostSelectedProfileId) {
+      setSessionProviderId(group.folder, input.agentId, hostSelectedProfileId);
+    }
+    input = { ...input, sessionId: undefined };
+  }
 
   try {
     // 配置层环境变量
@@ -975,10 +1499,55 @@ export async function runHostAgent(
       containerOverride,
       hostPoolResult?.resolved.customEnv,
     );
+    const injectsAnthropicAuthToken = envLines.some((line) =>
+      line.startsWith('ANTHROPIC_AUTH_TOKEN='),
+    );
     for (const line of envLines) {
       const eqIdx = line.indexOf('=');
       if (eqIdx > 0) {
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
+      }
+    }
+
+    // Third-party provider: unless this provider explicitly injects
+    // ANTHROPIC_AUTH_TOKEN (Bearer proxy mode), remove any inherited host token
+    // so API-key mode can take effect.
+    if (hostEnv['ANTHROPIC_BASE_URL']) {
+      if (!injectsAnthropicAuthToken) {
+        delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
+      }
+
+      // Also strip oauthAccount from session .claude.json: the SDK detects
+      // OAuth credentials in .claude.json and takes the OAuth code path even
+      // when ANTHROPIC_AUTH_TOKEN is absent. This causes the same 404 on
+      // third-party endpoints. Remove the symlink and write a standalone
+      // .claude.json without oauthAccount so the SDK falls back to API key mode.
+      try {
+        const sessionClaudeJson = path.join(groupSessionsDir, '.claude.json');
+        try { fs.unlinkSync(sessionClaudeJson); } catch { /* ignore */ }
+        let claudeJson: Record<string, unknown> = {};
+        try {
+          claudeJson = JSON.parse(fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'));
+        } catch { /* ignore */ }
+        delete claudeJson.oauthAccount;
+        fs.writeFileSync(sessionClaudeJson, JSON.stringify(claudeJson, null, 2) + '\n', { mode: 0o600 });
+      } catch (err) {
+        logger.warn(
+          { folder: group.folder, err },
+          'Failed to strip oauthAccount from session .claude.json',
+        );
+      }
+
+      // Also remove .credentials.json: it contains valid OAuth tokens that the
+      // SDK uses regardless of env vars, forcing the OAuth auth path.
+      try {
+        const credsPath = path.join(groupSessionsDir, '.credentials.json');
+        if (fs.existsSync(credsPath)) fs.unlinkSync(credsPath);
+      } catch (err) {
+        logger.warn(
+          { folder: group.folder, err },
+          'Failed to remove .credentials.json for third-party provider',
+        );
       }
     }
 
@@ -995,35 +1564,102 @@ export async function runHostAgent(
       }
     }
 
+    // SystemSettings.autoCompactWindow > 0 时注入到 host 进程，agent-runner 通过 query() settings 传给 SDK
+    const hostSysSettings = getSystemSettings();
+    if (hostSysSettings.autoCompactWindow > 0) {
+      hostEnv['AUTO_COMPACT_WINDOW'] = String(hostSysSettings.autoCompactWindow);
+    }
+    // SubAgent 模型：仅非默认 'inherit' 时注入，避免覆盖 customEnv 同名值。
+    if (hostSysSettings.subagentModel && hostSysSettings.subagentModel !== 'inherit') {
+      hostEnv['SUBAGENT_MODEL'] = hostSysSettings.subagentModel;
+    }
+
+    // admin 主容器 + 系统设置 disableMemoryLayerForAdminHost 时禁用 HappyClaw 记忆层：
+    // 不注入 memory MCP 工具 / WORKSPACE_GLOBAL/MEMORY env / 记忆提示，
+    // 三件套仍通过同步后的 session .claude 生效，避免 externalClaudeDir 漂移。
+    // 仅作用于 admin 主容器（is_home=1, folder=main），不影响 admin 创建的其他子群组。
+    const isCreatorAdmin = ownerHomeFolder === 'main';
+    const disableMemoryLayer =
+      isCreatorAdmin &&
+      !!group.is_home &&
+      getSystemSettings().disableMemoryLayerForAdminHost;
+
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
-    // Per-user global memory
-    const ownerId = group.created_by;
-    if (ownerId) {
-      const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
-      fs.mkdirSync(userGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
-    } else {
-      const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
-      fs.mkdirSync(legacyGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
-    }
-    const memoryFolder = group.is_home
-      ? group.folder
-      : ownerHomeFolder || group.folder;
-    hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
-      DATA_DIR,
-      'memory',
-      memoryFolder,
-    );
     hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
-    hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+
+    if (!disableMemoryLayer) {
+      // Per-user global memory（HappyClaw 自带 memory 层）
+      const ownerId = group.created_by;
+      if (ownerId) {
+        const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
+        fs.mkdirSync(userGlobalDir, { recursive: true });
+        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
+      } else {
+        const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
+        fs.mkdirSync(legacyGlobalDir, { recursive: true });
+        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
+      }
+      const memoryFolder = group.is_home
+        ? group.folder
+        : ownerHomeFolder || group.folder;
+      hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
+        DATA_DIR,
+        'memory',
+        memoryFolder,
+      );
+    }
+
+    // Resolve symlinks so CLAUDE_CONFIG_DIR ends up as the real on-disk path.
+    // Host mode also goes through the synchronized session .claude directory so
+    // explicit externalClaudeDir is authoritative for CLAUDE.md/rules/skills.
+    let resolvedSessionsDir = groupSessionsDir;
+    try {
+      resolvedSessionsDir = fs.realpathSync(groupSessionsDir);
+    } catch {
+      // Path may not exist yet on first spawn; fall back to the literal path.
+    }
+    hostEnv['CLAUDE_CONFIG_DIR'] = resolvedSessionsDir;
+
+    if (disableMemoryLayer) {
+      hostEnv['HAPPYCLAW_DISABLE_MEMORY_LAYER'] = 'true';
+      // 直接注入到进程 env，SDK 按 process.env 读，避免 settings.json 合并差异影响必需项。
+      for (const [key, value] of Object.entries(REQUIRED_SETTINGS_ENV)) {
+        hostEnv[key] = value;
+      }
+      // 同样，per-user MCP servers 通过 env 透传，agent-runner 合并进 SDK mcpServers 参数。
+      if (hostMcpServers && Object.keys(hostMcpServers).length > 0) {
+        hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'] =
+          JSON.stringify(hostMcpServers);
+      }
+    }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
-    // CLI 禁止 root 用户使用 --dangerously-skip-permissions，
-    // 通过 IS_SANDBOX 标记告知 CLI 当前运行在受控环境中以绕过此限制
-    if (typeof process.getuid === 'function' && process.getuid() === 0) {
-      hostEnv['IS_SANDBOX'] = '1';
+    // Claude Code 2.1.114+ 禁止 root 使用 --dangerously-skip-permissions，
+    // IS_SANDBOX=1 告知 CLI 当前运行在受控环境中以绕过此限制。
+    // host 模式由 happyclaw 主进程托管（见 permissionMode: 'bypassPermissions'），
+    // 相当于显式沙箱，故无条件声明而不再仅限 root —— 非 root 部署也保留语义对齐。
+    hostEnv['IS_SANDBOX'] = '1';
+
+    // 5b. Host capability preflight — detect external tools & inject env vars
+    const capResult = await checkHostCapabilities();
+    logCapabilityPreflight(group.name, capResult);
+    for (const [key, value] of Object.entries(capResult.envVars)) {
+      if (!hostEnv[key]) hostEnv[key] = value;
+    }
+
+    // Prepend the resolved claude binary directory to PATH so SDK subprocesses
+    // (which look up `claude` via PATH) hit the correct binary first. agent-capabilities
+    // prefers the SDK-bundled binary over `which` to avoid third-party wrappers
+    // (e.g. cmux) that hijack `claude` in PATH and break subprocess invocation.
+    if (capResult.resolvedPaths['claude']) {
+      const resolvedClaudeDir = path.dirname(capResult.resolvedPaths['claude']);
+      const currentPath = hostEnv['PATH'] || process.env.PATH || '';
+      hostEnv['PATH'] = `${resolvedClaudeDir}:${currentPath}`;
+      logger.info(
+        { group: group.name, resolvedClaudeDir, resolvedPath: capResult.resolvedPaths['claude'] },
+        'Host preflight: claude binary resolved',
+      );
     }
 
     // 6. 编译检查
@@ -1101,7 +1737,7 @@ export async function runHostAgent(
       'Spawning host agent',
     );
 
-    const logsDir = path.join(groupDir, 'logs');
+    const logsDir = logsBaseDir;
 
     const hostResult = await new Promise<ContainerOutput>((resolve) => {
       let settled = false;
@@ -1112,7 +1748,10 @@ export async function runHostAgent(
       };
 
       // 7. 启动进程
-      const proc = spawn('node', [agentRunnerDist], {
+      // Resolve absolute node path: bare 'node' fails with ENOENT under
+      // PM2 / launchd / GUI launchers where PATH lacks nvm/fnm dirs.
+      const hostNodeBinary = resolveHostNodeBinary(hostEnv);
+      const proc = spawn(hostNodeBinary, [agentRunnerDist], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: hostEnv,
         cwd: groupDir,
@@ -1120,7 +1759,7 @@ export async function runHostAgent(
       });
 
       const processId = `host-${group.folder}-${Date.now()}`;
-      onProcess(proc, processId);
+      onProcess(proc, processId, hostSelectedProfileId);
 
       const stdoutState = createStdoutParserState();
       const stderrState = createStderrState();
@@ -1133,7 +1772,17 @@ export async function runHostAgent(
         );
         killProcessTree(proc);
       });
-      proc.stdin.write(JSON.stringify(input));
+      // Derive a new input with host-runtime plugins injected; never mutate
+      // the caller's `input` object (queue/log/retry paths reuse the same ref).
+      // prepareHostPlugins mirrors the docker path's pre-spawn materialize so
+      // a freshly-enabled v2 user (no runtime/ on disk yet) doesn't see 0
+      // plugins.
+      const hostInput: ContainerInput = {
+        ...input,
+        plugins: prepareHostPlugins(group.created_by),
+        contextAudit: hostClaudeContextPlan.audit,
+      };
+      proc.stdin.write(JSON.stringify(hostInput));
       proc.stdin.end();
 
       // 9. 超时管理
@@ -1163,12 +1812,33 @@ export async function runHostAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
+      const handleOutput = onOutput
+        ? async (output: ContainerOutput): Promise<void> => {
+            await onOutput(output);
+            if (output.providerFailure && hostSelectedProfileId) {
+              if (!hostProviderFailureReported) {
+                hostProviderFailureReported = true;
+                providerPool.reportFailure(hostSelectedProfileId, true);
+                logger.warn(
+                  {
+                    group: group.name,
+                    processId,
+                    providerId: hostSelectedProfileId,
+                    result: output.result,
+                  },
+                  'Provider failure detected from streamed output, stopping host agent',
+                );
+              }
+              killProcessTree(proc, 'SIGTERM');
+            }
+          }
+        : undefined;
 
       // 10. stdout/stderr 解析
       attachStdoutHandler(proc.stdout, stdoutState, {
         groupName: group.name,
         label: 'Host agent',
-        onOutput,
+        onOutput: handleOutput,
         resetTimeout,
       });
       attachStderrHandler(proc.stderr, stderrState, group.name, {
@@ -1232,7 +1902,14 @@ export async function runHostAgent(
 
     // ─── Provider Pool health reporting (host mode) ───
     if (hostSelectedProfileId) {
-      if (hostResult.status === 'success' || hostResult.status === 'closed') {
+      if (hostResult.providerFailure) {
+        if (!hostProviderFailureReported) {
+          providerPool.reportFailure(hostSelectedProfileId, true);
+        }
+      } else if (
+        hostResult.status === 'success' ||
+        hostResult.status === 'closed'
+      ) {
         providerPool.reportSuccess(hostSelectedProfileId);
       } else if (
         hostResult.status === 'error' &&

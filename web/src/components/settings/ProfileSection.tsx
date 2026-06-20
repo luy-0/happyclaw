@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Loader2, Upload, Trash2, User, Bot, Lock, Palette, Sun, Moon, Monitor } from 'lucide-react';
+import { Loader2, Upload, Trash2, User, Bot, Lock, Palette, Sun, Moon, Monitor, Bell, BellOff, CheckCircle2, RotateCcw, MessagesSquare } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { useAuthStore } from '../../stores/auth';
@@ -7,9 +7,11 @@ import { useTheme, type Theme, type ColorScheme, type FontStyle } from '../../ho
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
 import { EmojiAvatar } from '@/components/common/EmojiAvatar';
 import { EmojiPicker } from '@/components/common/EmojiPicker';
 import { ColorPicker } from '@/components/common/ColorPicker';
+import { isRouteRestoreEnabled, setRouteRestoreEnabled } from '../../utils/routeRestore';
 import { getErrorMessage } from './types';
 import { SettingsCard as Section } from './SettingsCard';
 
@@ -52,6 +54,81 @@ function OptionButton({ active, onClick, children, className = '' }: {
   );
 }
 
+/* ── Desktop Notification Section ─────────────────────────── */
+
+function DesktopNotificationSection() {
+  const supported = typeof Notification !== 'undefined';
+  const [permission, setPermission] = useState<NotificationPermission>(
+    supported ? Notification.permission : 'denied',
+  );
+
+  const handleRequest = async () => {
+    if (!supported) return;
+    const result = await Notification.requestPermission();
+    setPermission(result);
+  };
+
+  return (
+    <Section icon={Bell} title="桌面通知" desc="对话任务完成时通过浏览器弹窗提醒你">
+      {!supported ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <BellOff className="size-4 flex-shrink-0" />
+          当前浏览器不支持桌面通知
+        </div>
+      ) : permission === 'granted' ? (
+        <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
+          <CheckCircle2 className="size-4 flex-shrink-0" />
+          桌面通知已开启，对话完成时将弹窗提醒
+        </div>
+      ) : permission === 'denied' ? (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400">
+            <BellOff className="size-4 flex-shrink-0" />
+            浏览器已拒绝通知权限
+          </div>
+          <p className="text-xs text-muted-foreground">
+            请点击地址栏左侧的锁图标，将「通知」权限改为「允许」，然后刷新页面。
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-sm text-muted-foreground">
+            开启后，当页面切到后台或切换到其他对话时，任务完成会弹出系统通知。
+          </p>
+          <Button type="button" size="sm" variant="outline" onClick={handleRequest}>
+            <Bell className="size-3.5" />
+            开启桌面通知
+          </Button>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+/* ── PWA Route Restore Section ────────────────────────────── */
+
+function PwaRouteRestoreSection() {
+  const [enabled, setEnabled] = useState(() => isRouteRestoreEnabled());
+
+  const handleChange = (next: boolean) => {
+    setEnabled(next);
+    setRouteRestoreEnabled(next);
+  };
+
+  return (
+    <Section
+      icon={RotateCcw}
+      title="重启时恢复上次页面"
+      desc="安装为 PWA 后，从后台被系统回收再次打开时回到上次访问的页面，而非默认主页"
+    >
+      <div className="flex items-center justify-between">
+        <Label className="text-sm text-foreground">启用恢复</Label>
+        <Switch checked={enabled} onCheckedChange={handleChange} aria-label="启用 PWA 重启路由恢复" />
+      </div>
+    </Section>
+  );
+}
+
 /* ── Main component ───────────────────────────────────────── */
 
 export function ProfileSection() {
@@ -77,6 +154,10 @@ export function ProfileSection() {
   const [avatarUploading, setAvatarUploading] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
 
+  // IM defaults — only affects NEW auto-registered IM groups
+  const [defaultRequireMention, setDefaultRequireMention] = useState(false);
+  const [imDefaultsSaving, setImDefaultsSaving] = useState(false);
+
   // Password
   const [currentPwd, setCurrentPwd] = useState('');
   const [newPwd, setNewPwd] = useState('');
@@ -92,7 +173,8 @@ export function ProfileSection() {
     setAiAvatarEmoji(currentUser?.ai_avatar_emoji ?? null);
     setAiAvatarColor(currentUser?.ai_avatar_color ?? null);
     setAiAvatarUrl(currentUser?.ai_avatar_url ?? null);
-  }, [currentUser?.username, currentUser?.display_name, currentUser?.avatar_emoji, currentUser?.avatar_color, currentUser?.avatar_url, currentUser?.ai_name, currentUser?.ai_avatar_emoji, currentUser?.ai_avatar_color, currentUser?.ai_avatar_url]);
+    setDefaultRequireMention(currentUser?.default_require_mention ?? false);
+  }, [currentUser?.username, currentUser?.display_name, currentUser?.avatar_emoji, currentUser?.avatar_color, currentUser?.avatar_url, currentUser?.ai_name, currentUser?.ai_avatar_emoji, currentUser?.ai_avatar_color, currentUser?.ai_avatar_url, currentUser?.default_require_mention]);
 
   const handleUpdateProfile = async () => {
     setProfileSaving(true);
@@ -201,6 +283,21 @@ export function ProfileSection() {
     }
   };
 
+  const handleToggleDefaultRequireMention = async (next: boolean) => {
+    const prev = defaultRequireMention;
+    setDefaultRequireMention(next);
+    setImDefaultsSaving(true);
+    try {
+      await updateProfile({ default_require_mention: next });
+      toast.success(next ? '新群默认需要 @机器人' : '新群默认响应所有消息');
+    } catch (err) {
+      setDefaultRequireMention(prev);
+      toast.error(getErrorMessage(err, '保存失败'));
+    } finally {
+      setImDefaultsSaving(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {/* ── 1. Theme & Appearance ── */}
@@ -257,7 +354,13 @@ export function ProfileSection() {
         </div>
       </Section>
 
-      {/* ── 2. Account Info ── */}
+      {/* ── 2. Desktop Notifications ── */}
+      <DesktopNotificationSection />
+
+      {/* ── 2.5 PWA Route Restore ── */}
+      <PwaRouteRestoreSection />
+
+      {/* ── 3. Account Info ── */}
       <Section icon={User} title="账户信息">
         <div className="flex items-center gap-4">
           <EmojiAvatar imageUrl={avatarUrl} emoji={avatarEmoji} color={avatarColor} fallbackChar={displayName || username} size="lg" />
@@ -363,6 +466,28 @@ export function ProfileSection() {
           {aiAppearanceSaving && <Loader2 className="size-4 animate-spin" />}
           保存
         </Button>
+      </Section>
+
+      {/* ── 3.5 IM Group Defaults ── */}
+      <Section
+        icon={MessagesSquare}
+        title="IM 群聊默认行为"
+        desc="影响新自动注册的飞书 / Telegram 群聊。已有群聊保持原设置不变；可在每个群里用 /require_mention 命令单独切换。"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <Label className="text-sm text-foreground">新群默认需要 @机器人</Label>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              开启后，机器人加入新群后只对 @它的消息回复；关闭则响应群里你发送的所有消息。
+            </p>
+          </div>
+          <Switch
+            checked={defaultRequireMention}
+            disabled={imDefaultsSaving}
+            onCheckedChange={handleToggleDefaultRequireMention}
+            aria-label="新群默认需要 @机器人"
+          />
+        </div>
       </Section>
 
       {/* ── 4. Password ── */}

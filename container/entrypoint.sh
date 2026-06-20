@@ -11,7 +11,13 @@ umask 0000
 # rootless podman where uid remapping causes EACCES on bind mounts.
 # Running as root here so chown works regardless of host uid.
 chown -R node:node /home/node/.claude 2>/dev/null || true
+chown -R node:node /home/node/.feishu-cli 2>/dev/null || true
 chown -R node:node /workspace/group /workspace/global /workspace/memory /workspace/ipc 2>/dev/null || true
+
+# Mark mounted directories as safe for git (CVE-2022-24765 ownership check).
+# Host uid may differ from container node user, causing git to refuse operations.
+# 使用通配符 '*' 因为挂载路径动态（extra mounts、customCwd），无法枚举具体目录。
+git config --global --add safe.directory '*' 2>/dev/null || true
 
 # Source environment variables from mounted env file
 if [ -f /workspace/env-dir/env ]; then
@@ -20,11 +26,48 @@ if [ -f /workspace/env-dir/env ]; then
   set +a
 fi
 
+# Prepend agent-runner 的本地 node_modules/.bin 到 PATH。
+# agent-runner/package.json 声明了 @anthropic-ai/claude-code 依赖，npm install
+# 会在 /app/node_modules/.bin/claude 生成 shim。但若不把该目录加入 PATH，
+# agent-runner 内 `which claude` 找不到 CLI，SDK 会 fallback 到空的 native
+# binary optionalDependency（@anthropic-ai/claude-agent-sdk-linux-x64 等）
+# 导致 "Native CLI binary for linux-x64 not found" 启动失败。
+export PATH="/app/node_modules/.bin:${PATH}"
+
+# CLAUDE_CONFIG_DIR: CLI 默认用 $HOME/.claude.json 作为身份文件，但该文件被
+# readonly 挂载（避免容器篡改宿主机配置）。CLI 启动时尝试写入（更新 numStartups
+# 等计数器），readonly 导致静默失败 → query() 返回 0 messages。
+# 显式设 CLAUDE_CONFIG_DIR 让 CLI 改读写 /home/node/.claude/.claude.json（session
+# 目录，可写），与宿主机模式的 hostEnv['CLAUDE_CONFIG_DIR'] 保持一致。
+export CLAUDE_CONFIG_DIR=/home/node/.claude
+
+# IS_SANDBOX: Claude Code 2.1.114+ 要求 IS_SANDBOX=1 才允许 --dangerously-skip-permissions。
+# 与宿主机模式的 hostEnv['IS_SANDBOX'] = '1' 保持一致。
+export IS_SANDBOX=1
+
+# Persist Agent's `npm install -g <pkg>` to per-user mounted extra dir.
+# 容器是 docker run --rm 模式，每次结束销毁。如果 Agent 在容器里跑
+# `npm install -g lark-cli`、`@fanfanv5/feishu-cli`、各类 MCP server 包等，
+# 默认会装到镜像内层 /usr/local/lib/node_modules，下次新容器又得重装。
+# 把 npm prefix 指向已挂载的 /workspace/extra/.npm-global（host 端
+# data/extra/{folder}/.npm-global/，per-user 隔离）即可让全局包持久化。
+NPM_GLOBAL_DIR=/workspace/extra/.npm-global
+mkdir -p "$NPM_GLOBAL_DIR/bin" "$NPM_GLOBAL_DIR/lib"
+chown -R node:node "$NPM_GLOBAL_DIR" 2>/dev/null || true
+# 写到 node user 的 ~/.npmrc 让 npm 全局命令默认走该 prefix。
+# 镜像每次启动重置 /home/node，所以 entrypoint 每次都重写一遍是稳妥做法。
+cat > /home/node/.npmrc <<EOF
+prefix=$NPM_GLOBAL_DIR
+EOF
+chown node:node /home/node/.npmrc 2>/dev/null || true
+# 注意：append 而非 prepend，避免持久化的 npm shim 屏蔽 /app/node_modules/.bin 中 SDK 自带的 claude CLI（见上方第 28-33 行注释）
+export PATH="$PATH:$NPM_GLOBAL_DIR/bin"
+
 # Discover and link skills (builtin → project → user, higher priority overwrites)
 # Only remove entries that conflict with mounted skills (non-symlink with same name),
 # preserving any skills the agent created directly in .claude/skills/.
 mkdir -p /home/node/.claude/skills
-for dir in /opt/builtin-skills /workspace/project-skills /workspace/user-skills; do
+for dir in /opt/builtin-skills /workspace/external-skills /workspace/project-skills /workspace/user-skills; do
   if [ -d "$dir" ]; then
     for skill in "$dir"/*/; do
       if [ -d "$skill" ]; then

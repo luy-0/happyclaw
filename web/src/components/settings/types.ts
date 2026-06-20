@@ -97,16 +97,40 @@ export interface SystemSettings {
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
   scriptTimeout: number;
-  skillAutoSyncEnabled: boolean;
-  skillAutoSyncIntervalMinutes: number;
   billingEnabled: boolean;
   billingMode: 'wallet_first';
   billingMinStartBalanceUsd: number;
   billingCurrency: string;
   billingCurrencyRate: number;
+  externalClaudeDir: string;
+  autoCompactWindow: number;
+  subagentModel: string;
+  disableMemoryLayerForAdminHost: boolean;
+  pluginAutoScan: boolean;
+  taskBackfillGraceMs: number;
 }
 
-export type SettingsTab = 'claude' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
+// ─── OAuth Usage ────────────────────────────────────────────
+
+export interface OAuthUsageBucket {
+  utilization: number;
+  resets_at: string;
+}
+
+export interface OAuthUsageResponse {
+  five_hour: OAuthUsageBucket | null;
+  seven_day: OAuthUsageBucket | null;
+  seven_day_opus: OAuthUsageBucket | null;
+  seven_day_sonnet: OAuthUsageBucket | null;
+}
+
+export interface CachedOAuthUsage {
+  data: OAuthUsageResponse;
+  fetchedAt: number;
+  error?: string;
+}
+
+export type SettingsTab = 'claude' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'plugins' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

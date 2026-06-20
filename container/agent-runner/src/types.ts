@@ -6,7 +6,7 @@
 
 // Streaming event types (canonical source: shared/stream-event.ts)
 export type { StreamEventType, StreamEvent } from './stream-event.types.js';
-import type { StreamEvent } from './stream-event.types.js';
+import type { ClaudeContextAudit, StreamEvent } from './stream-event.types.js';
 
 export interface ContainerInput {
   prompt: string;
@@ -14,6 +14,10 @@ export interface ContainerInput {
   turnId?: string;
   groupFolder: string;
   chatJid: string;
+  /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
+   * Used by per-channel MCP tools (discord_*, etc.) to identify the current
+   * incoming chat. Undefined when chatJid already encodes the IM source. */
+  currentSourceJid?: string;
   /** @deprecated Use isHome + isAdminHome instead. Kept for backward compatibility with older host processes. */
   isMain?: boolean;
   /** Whether this is the user's home container (admin or member). */
@@ -21,9 +25,22 @@ export interface ContainerInput {
   /** Whether this is the admin's home container (full privileges). */
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
+  /** If the last unprocessed message was emitted by a scheduled task prompt,
+   * this is that task's ID; used to tag MCP send_message outputs so the host
+   * routes results to the task's configured chat_jid / notify channels. */
+  messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;
+  /**
+   * Claude Code plugins to load for this session, passed straight to
+   * SDK `options.plugins`. Each `path` must be an absolute path (already
+   * runtime-translated by container-runner: container-internal for Docker,
+   * host absolute path for host mode).
+   */
+  plugins?: Array<{ type: 'local'; path: string }>;
+  /** Runtime context audit bootstrap from the host/container launcher. */
+  contextAudit?: ClaudeContextAudit;
 }
 
 export interface ContainerOutput {

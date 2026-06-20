@@ -13,9 +13,10 @@ import {
   canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
-import { getRegisteredGroup, getRouterState, hasContainerModeGroups } from '../db.js';
+import { getAllRegisteredGroups, getRegisteredGroup, getRouterState, getUserById, hasContainerModeGroups } from '../db.js';
 import { CONTAINER_IMAGE } from '../config.js';
-import { getSystemSettings } from '../runtime-config.js';
+import { getSystemSettings, getProviders } from '../runtime-config.js';
+import { setProviderOverride } from '../container-runner.js';
 import { logger } from '../logger.js';
 
 const execFileAsync = promisify(execFile);
@@ -67,18 +68,10 @@ async function getLatestClaudeCodeVersion(): Promise<string | null> {
   }
 }
 
-/** Get host Claude Code version by running SDK's built-in cli.js --version */
+/** Get host Claude Code version via global `claude --version` CLI */
 async function getHostClaudeCodeVersion(): Promise<string | null> {
   try {
-    const cliPath = path.resolve(
-      process.cwd(),
-      'container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/cli.js',
-    );
-    const { stdout } = await execFileAsync(
-      'node',
-      ['-e', `process.argv = ['node', 'claude', '--version']; require('${cliPath}')`],
-      { timeout: 10000 },
-    );
+    const { stdout } = await execFileAsync('claude', ['--version'], { timeout: 10000 });
     return stdout.trim() || null;
   } catch {
     return null;
@@ -98,15 +91,14 @@ async function getDockerImageId(): Promise<string | null> {
   }
 }
 
-/** Get container Claude Code version from SDK's cli.js inside Docker image */
+/** Get container Claude Code version from Docker image */
 async function getContainerClaudeCodeVersion(): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       'docker',
       [
-        'run', '--rm', '--entrypoint', 'node',
-        CONTAINER_IMAGE, '-e',
-        `process.argv = ['node', 'claude', '--version']; require('/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js')`,
+        'run', '--rm', '--entrypoint', '/app/node_modules/.bin/claude',
+        CONTAINER_IMAGE, '--version',
       ],
       { timeout: 30000 },
     );
@@ -268,6 +260,36 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     }).length;
   }
 
+  // Enrich groups with provider name and owner username (batch lookups)
+  const providers = getProviders();
+  const providerNameMap = new Map(providers.map((p) => [p.id, p.name]));
+  const allRegistered = getAllRegisteredGroups();
+
+  // Collect unique creator IDs, then batch-resolve usernames
+  const creatorIds = new Set<string>();
+  for (const g of filteredGroups) {
+    const baseJid = g.jid.includes('#agent:') ? g.jid.split('#agent:')[0] : g.jid;
+    const reg = allRegistered[baseJid];
+    if (reg?.created_by) creatorIds.add(reg.created_by);
+  }
+  const userNameMap = new Map<string, string>();
+  for (const uid of creatorIds) {
+    const user = getUserById(uid);
+    if (user?.username) userNameMap.set(uid, user.username);
+  }
+
+  const enrichedGroups = filteredGroups.map((g) => {
+    const baseJid = g.jid.includes('#agent:') ? g.jid.split('#agent:')[0] : g.jid;
+    const reg = allRegistered[baseJid];
+    return {
+      ...g,
+      ownerUsername: reg?.created_by ? userNameMap.get(reg.created_by) ?? null : null,
+      selectedProviderName: g.selectedProviderId
+        ? providerNameMap.get(g.selectedProviderId) ?? null
+        : null,
+    };
+  });
+
   return c.json({
     activeContainers,
     activeHostProcesses: isAdmin
@@ -280,7 +302,7 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
       : undefined,
     queueLength,
     uptime: Math.floor(process.uptime()),
-    groups: filteredGroups,
+    groups: enrichedGroups,
     dockerImageExists,
     dockerBuildInProgress: buildState.building,
     claudeCodeVersions: isAdmin ? await getClaudeCodeVersions() : undefined,
@@ -289,6 +311,72 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     dockerBuildResult: isAdmin ? buildState.result : undefined,
   });
 });
+
+// POST /api/status/groups/:folder/switch-provider — 一次性切换 provider + 优雅重启
+monitorRoutes.post(
+  '/status/groups/:folder/switch-provider',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const deps = getWebDeps();
+    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+    const folder = c.req.param('folder');
+    let body: { providerId?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+    if (typeof body.providerId !== 'string' || !body.providerId) {
+      return c.json({ error: 'providerId (string) is required' }, 400);
+    }
+    const providerId = body.providerId;
+
+    // Validate provider exists and is enabled
+    const providers = getProviders();
+    const target = providers.find((p) => p.id === providerId);
+    if (!target) {
+      return c.json({ error: 'Provider not found' }, 404);
+    }
+    if (!target.enabled) {
+      return c.json({ error: 'Provider is disabled' }, 400);
+    }
+
+    // Find active group for this folder
+    const queueStatus = deps.queue.getStatus();
+    const activeGroup = queueStatus.groups.find(
+      (g) => g.groupFolder === folder && g.active,
+    );
+
+    // Set one-time override (consumed on next container start)
+    setProviderOverride(folder, providerId);
+
+    if (!activeGroup) {
+      return c.json({
+        ok: true,
+        providerId,
+        providerName: target.name,
+        restarted: false,
+        pending: true,
+      });
+    }
+
+    const restarted = deps.queue.requestGracefulRestart(activeGroup.jid);
+
+    logger.info(
+      { folder, providerId, restarted },
+      'Provider switch requested',
+    );
+
+    return c.json({
+      ok: true,
+      providerId,
+      providerName: target.name,
+      restarted,
+    });
+  },
+);
 
 // POST /api/docker/build - 构建 Docker 镜像（仅 admin，异步启动 + WS 推送进度）
 monitorRoutes.post(
